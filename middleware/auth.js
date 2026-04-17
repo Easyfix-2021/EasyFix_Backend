@@ -10,10 +10,23 @@ const { verifyToken } = require('../utils/jwt');
 const { findUserById } = require('../services/auth.service');
 const { modernError } = require('../utils/response');
 
+/*
+ * Bearer-header only. We intentionally do NOT fall back to the `token` cookie.
+ * Why:
+ *   - Browsers auto-attach cookies to any request to the same origin (including
+ *     a user typing the URL into the address bar) → direct visits to the API
+ *     would return authenticated data without any JS involvement.
+ *   - Worse, any third-party site could POST to our API with `credentials:
+ *     include`; the cookie rides along and the server thinks the real user
+ *     authored the request — classic CSRF.
+ * Bearer-in-Authorization can only be set by our own JS (it reads the JWT from
+ * localStorage), so it doubles as a same-origin proof. The cookie remains in
+ * the browser as a convenience (set by the login endpoint for possible future
+ * server-rendered pages) but is no longer a valid credential on its own.
+ */
 function extractToken(req) {
   const auth = req.headers.authorization;
   if (auth && auth.startsWith('Bearer ')) return auth.slice('Bearer '.length);
-  if (req.cookies && req.cookies.token) return req.cookies.token;
   return null;
 }
 

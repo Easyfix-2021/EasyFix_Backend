@@ -57,8 +57,15 @@ async function send({ to, subject, text, html, cc, bcc, category }) {
 
   try {
     if (!transporter) transporter = buildTransporter();
-    // Annotate the subject in test mode so inbox-side it's clear what was intended.
-    const finalSubject = redirected ? `[TEST→${Array.isArray(originalTo) ? originalTo.join(',') : originalTo}] ${subject}` : subject;
+    // Leave the subject alone even in test mode — the old "[TEST→foo@…]" prefix
+    // looked synthetic to spam classifiers (non-word characters, arrow glyph,
+    // literal email in subject). We instead inject a small banner at the top of
+    // the body so the tester can still see the intended recipient, without
+    // poisoning the subject for deliverability tests.
+    const finalSubject = subject;
+    const testBanner = redirected
+      ? `[Test redirect — originally addressed to ${Array.isArray(originalTo) ? originalTo.join(', ') : originalTo}]`
+      : null;
     // Deliverability hygiene:
     //  - Named From ("EasyFix <...@easyfix.in>") beats bare address for spam filters.
     //  - Reply-To lets recipients actually reach a human instead of the bot account.
@@ -70,6 +77,10 @@ async function send({ to, subject, text, html, cc, bcc, category }) {
     const htmlBody    = html || (text
       ? `<p>${String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</p>`
       : undefined);
+    const finalText = testBanner && text ? `${testBanner}\n\n${text}` : text;
+    const finalHtml = testBanner && htmlBody
+      ? `<div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:6px;padding:8px 12px;margin:0 0 12px 0;font-family:sans-serif;font-size:12px;color:#92400e;">${testBanner}</div>${htmlBody}`
+      : htmlBody;
     // Extra headers that help transactional mail clear spam filters:
     //  - List-Unsubscribe: required by Gmail/Yahoo for bulk; harmless for transactional.
     //  - List-Unsubscribe-Post: RFC 8058 one-click, further boosts trust.
@@ -92,8 +103,8 @@ async function send({ to, subject, text, html, cc, bcc, category }) {
       to: Array.isArray(to) ? to.join(',') : to,
       replyTo,
       subject: finalSubject,
-      text,
-      html: htmlBody,
+      text: finalText,
+      html: finalHtml,
       headers: extraHeaders,
       cc: cc ? (Array.isArray(cc) ? cc.join(',') : cc) : undefined,
       bcc: bcc ? (Array.isArray(bcc) ? bcc.join(',') : bcc) : undefined,

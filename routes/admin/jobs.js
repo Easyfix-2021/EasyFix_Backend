@@ -17,6 +17,21 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * GET /api/admin/jobs/counts
+ * Returns status-bucket totals + grand total in ONE query. Replaces the
+ * dashboard's 6 parallel list-with-limit-1 calls (which each spent 2 DB
+ * connections on COUNT + data queries — ~12 concurrent connections just for
+ * stats, enough to saturate a 20-connection pool when combined with /auth/me
+ * and recent-jobs on the same page load). Single GROUP BY = 1 connection.
+ */
+router.get('/counts', async (_req, res, next) => {
+  try {
+    const counts = await job.getStatusCounts();
+    modernOk(res, counts);
+  } catch (e) { next(e); }
+});
+
 router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
   try {
     const row = await job.getById(req.params.id);
