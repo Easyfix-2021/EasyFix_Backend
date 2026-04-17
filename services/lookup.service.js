@@ -135,6 +135,37 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
   return rows;
 }
 
+// ─── Easyfixers (technician picker) ─────────────────────────────────
+/*
+ * Compact projection — just what a picker dropdown needs. Full list is ~4,254
+ * active rows; at ~60 bytes per row that's <300 KB, well within a cacheable
+ * single lookup response. Search by name / mobile / email for typeahead.
+ */
+async function easyfixers({ q, limit = 5000, includeInactive = false } = {}) {
+  const clauses = [];
+  const params = [];
+  if (!includeInactive) clauses.push('e.efr_status = 1');
+  if (q) {
+    clauses.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_email LIKE ?)');
+    const like = `%${q}%`;
+    params.push(like, like, like);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  params.push(Number(limit));
+  const [rows] = await pool.query(
+    `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
+            e.efr_cityId, c.city_name,
+            e.is_technician_verified, e.efr_status
+       FROM tbl_easyfixer e
+       LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
+      ${where}
+      ORDER BY e.efr_name ASC
+      LIMIT ?`,
+    params
+  );
+  return rows;
+}
+
 // ─── Small lookups ──────────────────────────────────────────────────
 async function cancelReasons() {
   const [rows] = await pool.query(
@@ -185,6 +216,7 @@ module.exports = {
   clients,
   clientServices,
   users,
+  easyfixers,
   cancelReasons,
   rescheduleReasons,
   banks,

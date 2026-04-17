@@ -69,4 +69,10 @@ router.get('/users',            role(['admin']), validate(usersQuery, 'query'), 
   try { modernOk(res, await lookup.users(req.query)); } catch (e) { next(e); }
 });
 
+// Compact easyfixer picker for "Assign Technician" dropdowns. Admin-only: client
+// SPOCs and technicians themselves have no business enumerating the full bench.
+router.get('/easyfixers',       role(['admin']),                                          async (req, res, next) => {
+  try { modernOk(res, await lookup.easyfixers(req.query)); } catch (e) { next(e); }
+});
+
 module.exports = router;
