@@ -135,6 +135,24 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
   return rows;
 }
 
+// ─── Sidebar menus (tbl_menu) ───────────────────────────────────────
+/*
+ * Returns the active menu tree as a flat list sorted by sequence. Frontend
+ * rebuilds the nest from parent_menu FKs. `url='javascript:;'` rows are
+ * parent-only nodes (children provide the actual navigation). We don't encode
+ * per-role visibility at the DB level — consumer applies a hardcoded allowlist
+ * after fetching (see Sidebar.tsx) so role changes don't need a SQL migration.
+ */
+async function menus() {
+  const [rows] = await pool.query(
+    `SELECT menu_id, menu_name, parent_menu, menu_depth, has_child, url, icons, sequence
+       FROM tbl_menu
+      WHERE menu_status = 1
+      ORDER BY COALESCE(sequence, 999) ASC, menu_id ASC`
+  );
+  return rows;
+}
+
 // ─── Easyfixers (technician picker) ─────────────────────────────────
 /*
  * Compact projection — just what a picker dropdown needs. Full list is ~4,254
@@ -217,6 +235,7 @@ module.exports = {
   clientServices,
   users,
   easyfixers,
+  menus,
   cancelReasons,
   rescheduleReasons,
   banks,

@@ -309,6 +309,30 @@ async function create(input, actor) {
     }
 
     await conn.commit();
+
+    /*
+     * Flag-based auto-assignment on job creation.
+     *
+     * Setting: tbl_autoallocation_setting.running_frequency (per-client via
+     * tbl_client_setting). Values:
+     *   'instant'  → run the 3-layer pipeline now, assign the top candidate
+     *   'schedule' (default) → do nothing; a daily batch picks it up instead
+     *
+     * Fire-and-forget via setImmediate so the create API returns the new
+     * job row immediately — auto-assign happens in the background and
+     * the subsequent assign() call takes care of status bump + scheduling
+     * history + TechAssigned webhook + FCM push to the chosen technician.
+     *
+     * Errors are logged, not bubbled: a failed auto-assign should never
+     * roll back a successfully-created job.
+     */
+    setImmediate(() => {
+      tryAutoAssignOnCreate(jobId, input.fk_client_id, actor).catch((err) => {
+        const logger = require('../logger');
+        logger.warn(`Auto-assign on create failed for job ${jobId}: ${err.message}`);
+      });
+    });
+
     return getById(jobId);
   } catch (e) {
     await conn.rollback();
@@ -539,8 +563,109 @@ async function changeOwner(jobId, { newOwnerId, reason }, actor) {
   return getById(jobId);
 }
 
+/*
+ * Invoked from create() via setImmediate when a new job is committed.
+ * Reads tbl_autoallocation_setting.running_frequency (with per-client override
+ * in tbl_client_setting) and, if 'instant', runs the auto-assign pipeline.
+ * The actual assignment (including TechAssigned webhook + FCM push to the
+ * chosen tech) is handled by auto-assign.service.js::assignTopCandidate(),
+ * which calls our assign() above — so the full lifecycle (status bump,
+ * scheduling_history row, notification fan-out) fires identically to a manual
+ * assign by a human operator.
+ */
+async function tryAutoAssignOnCreate(jobId, clientId, actor) {
+  const logger = require('../logger');
+  const { getClientSetting } = require('./settings.service');
+  const freq = await getClientSetting(clientId, 'running_frequency');
+  if (freq !== 'instant') {
+    logger.debug(`Auto-assign skipped for job ${jobId} — running_frequency=${freq ?? 'unset'}`);
+    return;
+  }
+  const { assignTopCandidate } = require('./auto-assign.service');
+  try {
+    const result = await assignTopCandidate(jobId, actor);
+    // A truthy `result.chosen` means `jobService.assign()` already committed
+    // the transaction, so the job + scheduling_history row are safely persisted.
+    // No email needed — downstream fan-out (webhook + FCM) is fire-and-forget
+    // and has its own retry/DLQ plumbing. Per product: "Once auto assigned in
+    // DB and status is saved, it's fine."
+    if (result?.chosen) {
+      logger.ready(`Auto-assigned job ${jobId} → ${result.chosen.efr_name} (efr_id=${result.chosen.efr_id}, score=${result.chosen.score})`);
+      return;
+    }
+    // Defensive branch — assignTopCandidate should throw 422 on no-candidates
+    // rather than return an empty result, but belt-and-braces.
+    logger.warn(`Auto-assign found no eligible candidates for job ${jobId} — manual assignment required`);
+    await notifyAutoAssignFailure(jobId, clientId, 'No eligible technician was found for this job.');
+  } catch (err) {
+    /*
+     * Classify failures so the ops email conveys WHY nothing got assigned.
+     * Categories we surface:
+     *   422 → No eligible candidate (L1/L2 rejected everyone).
+     *   404 → Job vanished between create + auto-assign (extremely rare).
+     *   409 → Someone else assigned the job in the interval (manual operator
+     *          won the race). This is NOT a failure — just log and skip email.
+     *   other → DB save error, inactive efr, unexpected exception. Ops need
+     *           to act because the job is still BOOKED with no tech.
+     */
+    if (err.status === 409) {
+      logger.info(`Auto-assign skipped for job ${jobId} — already assigned (likely manual race): ${err.message}`);
+      return;
+    }
+    const reason =
+      err.status === 422 ? 'No eligible technician was found for this job.' :
+      err.status === 404 ? `Job could not be resolved (${err.message}).` :
+      `Auto-assignment errored before the technician could be saved: ${err.message}`;
+    logger.warn(`Auto-assign failed for job ${jobId}: ${err.message} (status=${err.status ?? 'unknown'})`);
+    await notifyAutoAssignFailure(jobId, clientId, reason);
+  }
+}
+
+/*
+ * Sends an ops-style email when auto-assignment couldn't fulfil a job so a
+ * human can pick up the slack. Email recipient is a configurable setting
+ * (auto_assign_failure_email) with per-client override — same EAV plumbing
+ * as running_frequency. If no email is configured, the notification is
+ * silently skipped (ops can always check the job list for unassigned BOOKED
+ * rows). Never throws — failure email failures are just logged.
+ */
+async function notifyAutoAssignFailure(jobId, clientId, reason) {
+  const logger = require('../logger');
+  try {
+    const { getClientSetting } = require('./settings.service');
+    const to = await getClientSetting(clientId, 'auto_assign_failure_email');
+    if (!to) { logger.debug(`Auto-assign failure notification skipped — no email configured (job ${jobId})`); return; }
+
+    const job = await getById(jobId);
+    const lines = [
+      `Auto-assignment did not complete for job #${jobId} — the job has NOT been assigned to a technician.`,
+      `Reason: ${reason}`,
+      '',
+      `Client: ${job?.client_name ?? 'unknown'}`,
+      `Customer: ${job?.customer_name ?? 'unknown'} · ${job?.customer_mob_no ?? ''}`,
+      `City: ${job?.city_name ?? 'unknown'}`,
+      `Type: ${job?.job_type ?? ''}`,
+      `Requested: ${job?.requested_date_time ?? ''}`,
+      '',
+      `The job is currently in BOOKED status and needs manual assignment.`,
+    ].join('\n');
+
+    const { send } = require('./email.service');
+    await send({
+      to,
+      subject: `[Auto-assign] Job #${jobId} not assigned — manual action needed`,
+      text: lines,
+      category: 'transactional',
+    });
+    logger.info(`Auto-assign failure notification sent to ${to} for job ${jobId}`);
+  } catch (err) {
+    logger.warn(`Failed to send auto-assign failure email for job ${jobId}: ${err.message}`);
+  }
+}
+
 module.exports = {
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
   list, getById, getStatusCounts, create, update, setStatus, assign, changeOwner,
+  tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
 };

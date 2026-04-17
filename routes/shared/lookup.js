@@ -75,4 +75,10 @@ router.get('/easyfixers',       role(['admin']),                                
   try { modernOk(res, await lookup.easyfixers(req.query)); } catch (e) { next(e); }
 });
 
+// Sidebar menu tree — any authenticated principal gets the full tree; the
+// frontend filters per-role after the fact (no role column on tbl_menu).
+router.get('/menus',                                                                       async (_req, res, next) => {
+  try { modernOk(res, await lookup.menus()); } catch (e) { next(e); }
+});
+
 module.exports = router;

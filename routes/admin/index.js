@@ -14,8 +14,10 @@ const { role } = require('../../middleware/role');
 router.use(requireAuth);
 router.use(role(['admin']));
 
-router.use('/easyfixers',    require('./easyfixers'));
-router.use('/zones',         require('./zones'));
+router.use('/easyfixers',      require('./easyfixers'));
+router.use('/zones',           require('./zones'));
+router.use('/deep-skills',     require('./deep-skills'));
+router.use('/auto-allocation', require('./auto-allocation'));
 router.use('/jobs',          require('./jobs'));
 router.use('/auto-assign',   require('./auto-assign'));
 router.use('/notifications', require('./notifications'));
