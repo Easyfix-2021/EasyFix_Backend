@@ -1,0 +1,93 @@
+const Joi = require('joi');
+
+const mobile = Joi.string().pattern(/^[0-9]{10}$/);
+const gpsPair = Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/);
+const aadhaar = Joi.string().pattern(/^[0-9]{12}$/);
+const pan     = Joi.string().pattern(/^[A-Z]{5}[0-9]{4}[A-Z]$/i);
+
+/*
+ * Column names below intentionally match the DB schema (snake_case,
+ * `lisence` typo preserved). Validator keys = SQL column names so the
+ * service layer can copy straight from req.body without renaming.
+ */
+
+const listQuery = Joi.object({
+  q: Joi.string().min(1).max(100).optional(),
+  cityId: Joi.number().integer().positive().optional(),
+  serviceCategory: Joi.string().min(1).max(100).optional(),
+  isVerified: Joi.boolean().optional(),
+  status: Joi.number().integer().valid(0, 1).optional(),
+  includeInactive: Joi.boolean().default(false),
+  limit: Joi.number().integer().min(1).max(500).default(50),
+  offset: Joi.number().integer().min(0).default(0),
+});
+
+const createBody = Joi.object({
+  efr_name:             Joi.string().max(255).required(),
+  efr_first_name:       Joi.string().max(100).optional(),
+  efr_last_name:        Joi.string().max(100).optional(),
+  efr_no:               mobile.required(),
+  efr_alt_no:           mobile.optional(),
+  efr_email:            Joi.string().email().max(255).optional(),
+
+  efr_address:          Joi.string().max(500).optional(),
+  efr_address_res:      Joi.string().max(500).optional(),
+  efr_building:         Joi.string().max(255).optional(),
+  efr_landmark:         Joi.string().max(255).optional(),
+  efr_pin_no:           Joi.string().pattern(/^[0-9]{6}$/).optional(),
+  efr_cityId:           Joi.number().integer().positive().required(),
+  efr_zone_city_id:     Joi.number().integer().positive().optional(),
+
+  efr_base_gps:         gpsPair.optional(),
+  efr_current_gps:      gpsPair.optional(),
+
+  efr_type:             Joi.string().max(100).optional(),
+  efr_service_category: Joi.string().max(255).required(),
+  efr_service_type:     Joi.string().max(255).required(),
+
+  efr_manager_id:       Joi.number().integer().positive().optional(),
+  efr_marital_status:   Joi.string().valid('Single', 'Married', 'Divorced', 'Widowed').optional(),
+  efr_children:         Joi.number().integer().min(0).max(20).optional(),
+  efr_age:              Joi.number().integer().min(16).max(90).optional(),
+
+  efr_profile_img:      Joi.string().max(500).optional(),
+  about_yourself:       Joi.string().max(1000).optional(),
+
+  adhaar_card_number:   aadhaar.optional(),
+  pan_card_number:      pan.optional(),
+  date_of_birth:        Joi.date().iso().optional(),
+
+  efr_tools:            Joi.string().max(500).optional(),
+  skill:                Joi.number().integer().optional(),
+  skill_rating:         Joi.number().integer().min(0).max(5).optional(),
+  tool_rating:          Joi.number().integer().min(0).max(5).optional(),
+
+  health_insurance:     Joi.boolean().optional(),
+  accidental_insurance: Joi.boolean().optional(),
+  have_driving_lisence: Joi.boolean().optional(),  // legacy typo preserved to match DB
+  have_bike:            Joi.boolean().optional(),
+  use_whatsapp:         Joi.boolean().optional(),
+
+  is_technician_verified: Joi.boolean().optional(),
+  is_email_verified:      Joi.boolean().optional(),
+
+  experience_id:        Joi.number().integer().positive().optional(),
+  user_id:              Joi.number().integer().positive().optional(),
+});
+
+const updateBody = createBody.fork(
+  ['efr_name', 'efr_no', 'efr_cityId', 'efr_service_category', 'efr_service_type'],
+  (schema) => schema.optional()
+).min(1); // require at least one field
+
+const statusBody = Joi.object({
+  active:    Joi.boolean().required(),
+  reasonId:  Joi.number().integer().positive().when('active', { is: false, then: Joi.optional(), otherwise: Joi.forbidden() }),
+  comment:   Joi.string().max(500).when('active',  { is: false, then: Joi.optional(), otherwise: Joi.forbidden() }),
+});
+
+const idParam = Joi.object({
+  id: Joi.number().integer().positive().required(),
+});
+
+module.exports = { listQuery, createBody, updateBody, statusBody, idParam };
