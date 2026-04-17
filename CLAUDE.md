@@ -10,7 +10,7 @@ Unified Node.js/Express backend. Replaces 5 legacy services: CRM, Dropwizard :80
 - `mysql2/promise` — raw parameterised SQL, **no ORM**
 - JWT via `jsonwebtoken` — for /api/admin, /api/client, /api/mobile
 - **HTTP Basic Auth** — for /api/integration/v1/* only (legacy client contract)
-- Joi for validation, Pino for logging
+- Joi for validation, custom human-readable logger (see `logger.js` + `middleware/http-log.js`)
 - Shared DB: `easyfix_core` on port 3306 — **never alter schema, never add tables**
 
 ## Route groups and their response contracts

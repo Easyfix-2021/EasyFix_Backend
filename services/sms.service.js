@@ -30,7 +30,7 @@ async function send({ to, message }) {
   if (!message) return { delivered: false, error: 'message is empty' };
 
   if (disabled()) {
-    logger.info({ channel: 'sms', to: originalMobile, len: message.length }, 'notification DISABLED');
+    logger.test(`SMS suppressed (NOTIFICATIONS_DISABLE) · to=${originalMobile} · ${message.length} chars`);
     return { delivered: false, disabled: true };
   }
 
@@ -49,8 +49,7 @@ async function send({ to, message }) {
     if (test) { mobile = test; redirected = true; }
   }
   if (redirected) {
-    logger.warn({ channel: 'sms', intendedTo: originalMobile, redirectedTo: mobile },
-      'TEST_MODE: SMS redirected');
+    logger.test(`SMS redirected from ${originalMobile} → ${mobile} (TEST_MOBILE)`);
   }
 
   const body = new URLSearchParams({
@@ -71,10 +70,16 @@ async function send({ to, message }) {
     });
     const text = await res.text();
     const delivered = res.ok && !/error|fail/i.test(text);
-    logger.info({ channel: 'sms', to: mobile, status: res.status, response: text.slice(0, 100), redirected, intendedTo: redirected ? originalMobile : undefined }, 'sms sent');
+    const who = redirected ? `${mobile} (was ${originalMobile})` : mobile;
+    // Log the provider body on both paths. A 200 OK with a silent-drop message
+    // (e.g. DLT mismatch) is how operator-side rejection surfaces; without this
+    // line, "200 but OTP never arrived" is indistinguishable from real success.
+    const providerSnippet = text.replace(/\s+/g, ' ').slice(0, 200);
+    if (delivered) logger.sms(`sent to ${who} · status=${res.status} · provider="${providerSnippet}"`);
+    else           logger.warn(`SMS rejected · to=${who} · status=${res.status} · provider="${providerSnippet}"`);
     return { delivered, providerResponse: text, httpStatus: res.status, redirected, intendedTo: redirected ? originalMobile : undefined };
   } catch (err) {
-    logger.warn({ channel: 'sms', to: mobile, err: err.message }, 'sms error');
+    logger.error(`SMS error · to=${mobile} · ${err.message}`);
     return { delivered: false, error: err.message };
   }
 }

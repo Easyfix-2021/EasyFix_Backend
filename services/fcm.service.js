@@ -40,7 +40,7 @@ async function sendPush({ token, title, body, data = {}, keyOverride }) {
   if (!title && !body) return { delivered: false, error: 'title or body required' };
 
   if (disabled()) {
-    logger.info({ channel: 'fcm', token: token.slice(0, 12) + '…', title }, 'notification DISABLED');
+    logger.test(`Push suppressed (NOTIFICATIONS_DISABLE) · token=${token.slice(0, 12)}… · "${title}"`);
     return { delivered: false, disabled: true };
   }
 
@@ -57,11 +57,9 @@ async function sendPush({ token, title, body, data = {}, keyOverride }) {
     if (process.env.TEST_FCM_TOKEN) {
       token = process.env.TEST_FCM_TOKEN;
       redirected = true;
-      logger.warn({ channel: 'fcm', intendedTo: originalToken.slice(0, 12) + '…', redirectedTo: token.slice(0, 12) + '…' },
-        'TEST_MODE: FCM redirected');
+      logger.test(`Push redirected from ${originalToken.slice(0, 12)}… → ${token.slice(0, 12)}… (TEST_FCM_TOKEN)`);
     } else {
-      logger.warn({ channel: 'fcm', intendedTo: originalToken.slice(0, 12) + '…', title },
-        'TEST_MODE: FCM skipped (TEST_FCM_TOKEN not set)');
+      logger.test(`Push skipped · intended=${originalToken.slice(0, 12)}… · "${title}" · set TEST_FCM_TOKEN to allow`);
       return { delivered: false, testSkipped: true, intendedTo: originalToken };
     }
   }
@@ -80,10 +78,12 @@ async function sendPush({ token, title, body, data = {}, keyOverride }) {
     });
     const text = await res.text();
     const delivered = res.ok && !/error/i.test(text);
-    logger.info({ channel: 'fcm', status: res.status, redirected }, delivered ? 'fcm sent' : 'fcm failed');
+    const tail = redirected ? `${token.slice(0, 12)}… (was ${originalToken.slice(0, 12)}…)` : `${token.slice(0, 12)}…`;
+    if (delivered) logger.push(`sent · token=${tail} · "${title || ''}"`);
+    else           logger.warn(`Push rejected · token=${tail} · status=${res.status} · ${text.slice(0, 120)}`);
     return { delivered, providerResponse: text, httpStatus: res.status, redirected, intendedTo: redirected ? originalToken : undefined };
   } catch (err) {
-    logger.warn({ channel: 'fcm', err: err.message }, 'fcm error');
+    logger.error(`Push error · token=${token.slice(0, 12)}… · ${err.message}`);
     return { delivered: false, error: err.message };
   }
 }

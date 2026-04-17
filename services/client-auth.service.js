@@ -34,14 +34,35 @@ async function createLoginOtp(identifier) {
   const otp = generateOtp();
   const now = new Date();
   const expires = otpExpiryDate(now);
+  // Retire any still-live prior SPOC Login OTPs for this SPOC first, so a stale
+  // OTP from an earlier request can't outrank the one we're about to issue.
+  await pool.query(
+    `UPDATE otp_details SET is_expired = 1
+      WHERE otp_type = 'SPOC Login'
+        AND (user_email = ? OR user_mobile_no = ?)
+        AND is_expired = 0`,
+    [spoc.contact_email, spoc.contact_no]
+  );
   await pool.query(
     `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
      VALUES (?, 'SPOC Login', ?, ?, ?, ?, 0, 1)`,
     [otp, spoc.contact_email, spoc.contact_no, now, expires]
   );
   if (process.env.NODE_ENV !== 'production') {
-    logger.warn({ spocId: spoc.id, otp, email: spoc.contact_email }, 'DEV SPOC OTP issued');
+    logger.event('🔑', 'cyan',
+      `OTP for ${spoc.contact_email || spoc.contact_no}: ${otp}  (client SPOC id=${spoc.id}, valid 5 min) — dev only`);
   }
+
+  const { deliverOtp } = require('./otp-delivery.service');
+  await deliverOtp({
+    identifier,
+    email: spoc.contact_email,
+    mobile: spoc.contact_no,
+    name: spoc.contact_name,
+    otp,
+    contextLabel: 'spoc',
+  });
+
   return { found: true, expiresAt: expires };
 }
 

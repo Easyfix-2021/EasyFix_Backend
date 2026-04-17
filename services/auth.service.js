@@ -47,19 +47,56 @@ async function createLoginOtp(identifier) {
   const now = new Date();
   const expires = otpExpiryDate(now);
 
+  // Retire any still-live prior OTPs for this user BEFORE issuing the new one.
+  // Without this, a user who re-requested OTP would have multiple valid rows in
+  // otp_details; verify picks the latest by id DESC, so entering the OTP from an
+  // older SMS silently fails with OTP_MISMATCH — confusing and hard to diagnose.
   await pool.query(
+    `UPDATE otp_details SET is_expired = 1
+      WHERE otp_type = 'Login Otp'
+        AND (user_email = ? OR user_mobile_no = ?)
+        AND is_expired = 0`,
+    [user.official_email, user.mobile_no]
+  );
+
+  // Persist the OTP FIRST, then send. If the INSERT throws, we bail before
+  // any SMS/email goes out — otherwise the user would get a code that isn't
+  // in the DB and verify would always fail, looking like a server bug. Only
+  // after the row is written do we hand off to deliverOtp below.
+  const [insertResult] = await pool.query(
     `INSERT INTO otp_details
        (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
      VALUES (?, ?, ?, ?, ?, ?, 0, 1)`,
     [otp, 'Login Otp', user.official_email, user.mobile_no, now, expires]
   );
+  if (!insertResult?.insertId) {
+    // Should be impossible given MySQL's AUTO_INCREMENT on otp_details.id, but
+    // fail closed rather than send a code the user can't verify.
+    throw new Error('Failed to persist OTP row before dispatch');
+  }
 
   // DEV ONLY: log the OTP so developers can test without an SMS/email gateway.
   // Step 11 will deliver via SMSCountry + Gmail; at that point remove this log line
   // and send via the notification services instead.
   if (process.env.NODE_ENV !== 'production') {
-    logger.warn({ userId: user.user_id, otp, email: user.official_email }, 'DEV OTP issued (do not log in prod)');
+    logger.event('🔑', 'cyan',
+      `OTP for ${user.official_email || user.mobile_no}: ${otp}  (staff user_id=${user.user_id}, valid 5 min) — dev only`);
   }
+
+  // Channel-preference delivery:
+  //   email identifier → Email first, WhatsApp fallback
+  //   mobile identifier → WhatsApp first, SMS fallback
+  // TEST_EMAILS / TEST_MOBILE redirections inside each provider service keep
+  // dev traffic from reaching real users.
+  const { deliverOtp } = require('./otp-delivery.service');
+  await deliverOtp({
+    identifier,
+    email: user.official_email,
+    mobile: user.mobile_no,
+    name: user.user_name,
+    otp,
+    contextLabel: 'staff',
+  });
 
   return { found: true, userId: user.user_id, email: user.official_email, expiresAt: expires };
 }

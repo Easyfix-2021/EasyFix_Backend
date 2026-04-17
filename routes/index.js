@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { pool } = require('../db');
+const { pool, getPoolStats } = require('../db');
 const { modernOk, modernError } = require('../utils/response');
 const integrationRouter = require('./integration');
 
@@ -8,11 +8,17 @@ router.get('/health', (_req, res) => {
 });
 
 router.get('/health/db', async (_req, res) => {
+  const started = Date.now();
   try {
     const [rows] = await pool.query('SELECT 1 AS ok, DATABASE() AS db, NOW() AS ts');
-    return modernOk(res, { db: rows[0].db, ts: rows[0].ts });
+    return modernOk(res, {
+      db: rows[0].db,
+      ts: rows[0].ts,
+      latencyMs: Date.now() - started,
+      pool: getPoolStats(),
+    });
   } catch (err) {
-    return modernError(res, 503, 'database unavailable', { code: err.code });
+    return modernError(res, 503, 'database unavailable', { code: err.code, pool: getPoolStats() });
   }
 });
 

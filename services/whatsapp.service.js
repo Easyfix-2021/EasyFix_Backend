@@ -48,7 +48,7 @@ async function sendTemplate({
   if (!templateName) return { delivered: false, error: 'templateName required' };
 
   if (disabled()) {
-    logger.info({ channel: 'whatsapp', to: originalPhone, templateName }, 'notification DISABLED');
+    logger.test(`WhatsApp suppressed (NOTIFICATIONS_DISABLE) · to=${originalPhone} · template=${templateName}`);
     return { delivered: false, disabled: true };
   }
 
@@ -68,8 +68,7 @@ async function sendTemplate({
     if (test) { phone = test; redirected = true; }
   }
   if (redirected) {
-    logger.warn({ channel: 'whatsapp', intendedTo: originalPhone, redirectedTo: phone, templateName },
-      'TEST_MODE: WhatsApp redirected');
+    logger.test(`WhatsApp redirected from ${originalPhone} → ${phone} (TEST_MOBILE) · template=${templateName}`);
   }
 
   const template = { templateName, bodyValues };
@@ -91,10 +90,12 @@ async function sendTemplate({
     });
     const text = await res.text();
     const delivered = res.ok;
-    logger.info({ channel: 'whatsapp', to: phone, templateName, status: res.status, redirected }, delivered ? 'whatsapp sent' : 'whatsapp failed');
+    const who = redirected ? `${phone} (was ${originalPhone})` : phone;
+    if (delivered) logger.whatsapp(`sent to ${who} · template=${templateName}`);
+    else           logger.warn(`WhatsApp rejected · to=${who} · template=${templateName} · status=${res.status} · ${text.slice(0, 120)}`);
     return { delivered, providerResponse: text, httpStatus: res.status, redirected, intendedTo: redirected ? originalPhone : undefined };
   } catch (err) {
-    logger.warn({ channel: 'whatsapp', to: phone, templateName, err: err.message }, 'whatsapp error');
+    logger.error(`WhatsApp error · to=${phone} · template=${templateName} · ${err.message}`);
     return { delivered: false, error: err.message };
   }
 }

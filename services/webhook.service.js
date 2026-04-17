@@ -291,7 +291,9 @@ async function deliverWithRetry(context, attempt = 1) {
       signal: AbortSignal.timeout(15_000),
     });
     const ok = res.ok;
-    logger.info({ webhookId: mapping.id, clientId: mapping.client_id, event: event.name, jobId, attempt, status: res.status }, ok ? 'webhook delivered' : 'webhook non-2xx');
+    const who = `client=${mapping.client_id} · event=${event.name} · job=${jobId} · attempt ${attempt}`;
+    if (ok) logger.webhook(`delivered · ${who} · status=${res.status}`);
+    else    logger.warn(`Webhook non-2xx · ${who} · status=${res.status}`);
     await logDelivery({
       clientId: mapping.client_id, eventId: event.id, jobId,
       callBackUrl: mapping.call_back_url,
@@ -303,7 +305,7 @@ async function deliverWithRetry(context, attempt = 1) {
       setTimeout(() => deliverWithRetry(context, attempt + 1), backoffMs(attempt + 1)).unref();
     }
   } catch (err) {
-    logger.warn({ webhookId: mapping.id, clientId: mapping.client_id, event: event.name, jobId, attempt, err: err.message }, 'webhook delivery error');
+    logger.error(`Webhook error · client=${mapping.client_id} · event=${event.name} · job=${jobId} · attempt ${attempt} · ${err.message}`);
     await logDelivery({
       clientId: mapping.client_id, eventId: event.id, jobId,
       callBackUrl: mapping.call_back_url,
@@ -324,19 +326,19 @@ async function deliverWithRetry(context, attempt = 1) {
  */
 async function dispatch({ eventName, jobId }) {
   if (String(process.env.WEBHOOKS_DISABLE).toLowerCase() === 'true') {
-    logger.info({ eventName, jobId }, 'webhook DISPATCH DISABLED by env');
+    logger.test(`Webhook suppressed (WEBHOOKS_DISABLE) · event=${eventName} · job=${jobId}`);
     return { disabled: true };
   }
 
   const event = await getEventByName(eventName);
   if (!event) {
-    logger.warn({ eventName, jobId }, 'webhook event not registered — skipping');
+    logger.warn(`Webhook skipped · unknown event "${eventName}" · job=${jobId}`);
     return { unknownEvent: true };
   }
 
   const payload = await buildJobPayload(jobId);
   if (!payload) {
-    logger.warn({ eventName, jobId }, 'webhook payload build failed — job not found');
+    logger.warn(`Webhook skipped · job ${jobId} not found · event=${eventName}`);
     return { jobMissing: true };
   }
   const clientId = payload._fk_client_id;

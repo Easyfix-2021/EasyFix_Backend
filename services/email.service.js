@@ -29,7 +29,7 @@ function buildTransporter() {
   });
 }
 
-async function send({ to, subject, text, html, cc, bcc }) {
+async function send({ to, subject, text, html, cc, bcc, category }) {
   const originalTo = to;
   const originalCc = cc;
   const originalBcc = bcc;
@@ -38,7 +38,7 @@ async function send({ to, subject, text, html, cc, bcc }) {
   if (!text && !html) return { delivered: false, error: 'text or html body required' };
 
   if (disabled()) {
-    logger.info({ channel: 'email', to, subject }, 'notification DISABLED');
+    logger.test(`Email suppressed (NOTIFICATIONS_DISABLE) · to=${to} · subject="${subject}"`);
     return { delivered: false, disabled: true };
   }
 
@@ -51,8 +51,7 @@ async function send({ to, subject, text, html, cc, bcc }) {
       cc = undefined;   // drop cc entirely — test mode doesn't replicate cc recipients
       bcc = undefined;
       redirected = true;
-      logger.warn({ channel: 'email', intendedTo: originalTo, intendedCc: originalCc, intendedBcc: originalBcc, redirectedTo: to },
-        'TEST_MODE: email redirected');
+      logger.test(`Email redirected from "${originalTo}" → "${to.join(',')}" (TEST_EMAILS) · cc/bcc dropped`);
     }
   }
 
@@ -60,19 +59,50 @@ async function send({ to, subject, text, html, cc, bcc }) {
     if (!transporter) transporter = buildTransporter();
     // Annotate the subject in test mode so inbox-side it's clear what was intended.
     const finalSubject = redirected ? `[TEST→${Array.isArray(originalTo) ? originalTo.join(',') : originalTo}] ${subject}` : subject;
+    // Deliverability hygiene:
+    //  - Named From ("EasyFix <...@easyfix.in>") beats bare address for spam filters.
+    //  - Reply-To lets recipients actually reach a human instead of the bot account.
+    //  - An HTML body alongside text signals a "real" multipart message, not a
+    //    scraper-style plain-text blast — Gmail in particular weights this.
+    const fromAddress = process.env.SMTP_USER;
+    const fromName    = process.env.SMTP_FROM_NAME || 'EasyFix';
+    const replyTo     = process.env.SMTP_REPLY_TO || fromAddress;
+    const htmlBody    = html || (text
+      ? `<p>${String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</p>`
+      : undefined);
+    // Extra headers that help transactional mail clear spam filters:
+    //  - List-Unsubscribe: required by Gmail/Yahoo for bulk; harmless for transactional.
+    //  - List-Unsubscribe-Post: RFC 8058 one-click, further boosts trust.
+    //  - X-Entity-Ref-ID: random ref gives each message a unique identity in Gmail
+    //    threading, avoiding "this looks like the same spam we saw before" clustering.
+    //  - Precedence: bulk → well-known hint that this is auto-generated not phishing.
+    const extraHeaders = {
+      'X-Entity-Ref-ID': `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      'X-Mailer': 'EasyFix-Backend/1.0',
+      ...(category === 'transactional' ? {
+        'X-Priority': '3',
+        'Auto-Submitted': 'auto-generated',
+        'List-Unsubscribe': `<mailto:${replyTo}?subject=unsubscribe>`,
+        'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+      } : {}),
+    };
+
     const info = await transporter.sendMail({
-      from: process.env.SMTP_USER,
+      from: `${fromName} <${fromAddress}>`,
       to: Array.isArray(to) ? to.join(',') : to,
+      replyTo,
       subject: finalSubject,
       text,
-      html,
+      html: htmlBody,
+      headers: extraHeaders,
       cc: cc ? (Array.isArray(cc) ? cc.join(',') : cc) : undefined,
       bcc: bcc ? (Array.isArray(bcc) ? bcc.join(',') : bcc) : undefined,
     });
-    logger.info({ channel: 'email', to, subject: finalSubject, messageId: info.messageId, redirected }, 'email sent');
+    const who = Array.isArray(to) ? to.join(',') : to;
+    logger.email(`sent to ${who} · "${finalSubject}"${redirected ? ` · was "${originalTo}"` : ''}`);
     return { delivered: true, messageId: info.messageId, response: info.response, redirected, intendedTo: redirected ? originalTo : undefined };
   } catch (err) {
-    logger.warn({ channel: 'email', to, err: err.message }, 'email error');
+    logger.error(`Email error · to=${to} · ${err.message}`);
     return { delivered: false, error: err.message };
   }
 }

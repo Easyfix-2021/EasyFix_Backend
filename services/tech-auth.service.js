@@ -29,13 +29,34 @@ async function createLoginOtp(mobile) {
   const otp = generateOtp();
   const now = new Date();
   const expires = otpExpiryDate(now);
+  // Retire any still-live prior Tech Login OTPs for this mobile first, so the
+  // user can't accidentally type an older one (verify picks the newest).
+  await pool.query(
+    `UPDATE otp_details SET is_expired = 1
+      WHERE otp_type = 'Tech Login' AND user_mobile_no = ? AND is_expired = 0`,
+    [mobile]);
   await pool.query(
     `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
      VALUES (?, 'Tech Login', ?, ?, ?, ?, 0, 1)`,
     [otp, tech.efr_email, mobile, now, expires]);
   if (process.env.NODE_ENV !== 'production') {
-    logger.warn({ efrId: tech.efr_id, otp, mobile }, 'DEV TECH OTP issued');
+    logger.event('🔑', 'cyan',
+      `OTP for ${mobile}: ${otp}  (technician efr_id=${tech.efr_id}, valid 5 min) — dev only`);
   }
+
+  // Technicians always log in with a mobile number, so the default branch
+  // (WhatsApp first, SMS fallback) applies — email is only used if they have
+  // one on file and prefer email templates (rare).
+  const { deliverOtp } = require('./otp-delivery.service');
+  await deliverOtp({
+    identifier: mobile,
+    email: tech.efr_email,
+    mobile,
+    name: tech.efr_name,
+    otp,
+    contextLabel: 'technician',
+  });
+
   return { found: true, expiresAt: expires };
 }
 
