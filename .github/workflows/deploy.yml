@@ -1,0 +1,183 @@
+# EasyFix_Backend — auto-deploy to AWS EC2
+#
+# Triggers
+#   push → QA          → deploy to QA EC2
+#   push → Production  → deploy to Production EC2
+#   manual workflow_dispatch (with environment picker)
+#
+# Pipeline per push:
+#   1. Checkout the pushed commit
+#   2. Set up Node 20 + cache npm
+#   3. npm ci + node --check on key services (catch syntax errors BEFORE we touch the server)
+#   4. SSH to the right EC2, git pull, npm ci, smoke-test DB, pm2 reload
+#   5. Hit /api/health + /api/health/db; fail the job if either is non-2xx
+#
+# Secrets required (Settings → Secrets and variables → Actions):
+#   QA_HOST, QA_USER, QA_SSH_KEY
+#   PROD_HOST, PROD_USER, PROD_SSH_KEY
+#   MAIL_USERNAME, MAIL_PASSWORD       (Gmail SMTP for failure notifications)
+#
+# See docs/AWS_DEPLOYMENT_GUIDE.md and docs/GITHUB_SECRETS.md for the full setup.
+
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [QA, Production]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Which environment to deploy'
+        required: true
+        type: choice
+        options: [qa, production]
+
+# One in-flight deploy per branch — newer commits supersede older ones.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Lint & syntax check
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax-check critical services
+        # Backend has no compile step (plain JS), so we sanity-check the entry
+        # points + the most-changed services. A real syntax error here fails
+        # the deploy immediately rather than after we've touched the server.
+        run: |
+          node --check server/index.js
+          node --check services/auto-assign.service.js
+          node --check services/job.service.js
+          node --check services/settings.service.js
+          node --check services/webhook.service.js || true   # newer file may not exist on older branches
+
+      - name: Lint (best-effort)
+        # If eslint isn't configured the script no-ops; don't fail the job on
+        # lint warnings — node --check above is the load-bearing gate.
+        run: npm run lint --if-present || true
+
+  deploy:
+    name: Deploy to ${{ (github.event.inputs.target || (github.ref_name == 'Production' && 'production') || 'qa') }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ENV_NAME: ${{ (github.event.inputs.target || (github.ref_name == 'Production' && 'production') || 'qa') }}
+    steps:
+      - name: Resolve target host
+        id: target
+        # base_url uses the EC2 EIP + raw app port (5100) — public DNS
+        # `qa.api.easyfix.in` / `api.easyfix.in` still routes to the legacy
+        # Dropwizard service during the coexistence window. After cutover,
+        # swap base_url back to the HTTPS domain.
+        run: |
+          if [[ "${ENV_NAME}" == "production" ]]; then
+            echo "host=${{ secrets.PROD_HOST }}"          >> "$GITHUB_OUTPUT"
+            echo "user=${{ secrets.PROD_USER }}"          >> "$GITHUB_OUTPUT"
+            echo "branch=Production"                       >> "$GITHUB_OUTPUT"
+            echo "base_url=http://${{ secrets.PROD_HOST }}:5100" >> "$GITHUB_OUTPUT"
+          else
+            echo "host=${{ secrets.QA_HOST }}"            >> "$GITHUB_OUTPUT"
+            echo "user=${{ secrets.QA_USER }}"            >> "$GITHUB_OUTPUT"
+            echo "branch=QA"                               >> "$GITHUB_OUTPUT"
+            echo "base_url=http://${{ secrets.QA_HOST }}:5100"   >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          if [[ "${ENV_NAME}" == "production" ]]; then
+            echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/deploy_key
+          else
+            echo "${{ secrets.QA_SSH_KEY }}" > ~/.ssh/deploy_key
+          fi
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ steps.target.outputs.host }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy via SSH
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              ${{ steps.target.outputs.user }}@${{ steps.target.outputs.host }} \
+              bash -se <<'REMOTE'
+          set -euo pipefail
+
+          cd ~/EasyFix_Backend
+
+          echo "▶ Fetching latest from origin/${{ steps.target.outputs.branch }}"
+          git fetch --all --prune
+          git checkout ${{ steps.target.outputs.branch }}
+          git reset --hard origin/${{ steps.target.outputs.branch }}
+
+          echo "▶ Installing dependencies (production deps only)"
+          npm ci --omit=dev
+
+          echo "▶ Verifying DB connectivity BEFORE swapping traffic"
+          npm run test:db
+
+          echo "▶ Reloading PM2 (zero-downtime)"
+          pm2 reload easyfix-backend --update-env
+
+          # Belt-and-braces: pm2 reload should be in-place, but log proof
+          pm2 status easyfix-backend
+
+          echo "✓ Deployed $(git rev-parse --short HEAD) at $(date -u +%FT%TZ)"
+          REMOTE
+
+      - name: Smoke-test deployed API
+        run: |
+          BASE="${{ steps.target.outputs.base_url }}"
+          # Three independent endpoints — process up, DB up, integration shape OK.
+          for path in "/api/health" "/api/health/db" "/api/integration/_ping"; do
+            ok=0
+            for i in 1 2 3 4 5; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}${path}" || echo 000)
+              if [[ "$code" =~ ^2 ]]; then
+                echo "✓ ${BASE}${path} → $code"
+                ok=1
+                break
+              fi
+              echo "Attempt $i: ${BASE}${path} → $code, retrying in 5s…"
+              sleep 5
+            done
+            if [[ $ok -eq 0 ]]; then
+              echo "✗ ${BASE}${path} never returned 2xx"
+              exit 1
+            fi
+          done
+
+      - name: Notify by email on failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "[Deploy FAILED] EasyFix_Backend → ${{ env.ENV_NAME }} (${{ github.sha }})"
+          to: harshit@channelplay.in
+          from: ${{ secrets.MAIL_USERNAME }}
+          body: |
+            Backend deploy to ${{ env.ENV_NAME }} FAILED.
+
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Triggered by: ${{ github.actor }}
+            Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Open the Run URL above for the full job logs.
