@@ -1,0 +1,7 @@
+{
+  "_comment": "Watch .env too — default nodemon only tracks .js/.json/.mjs, so secret or config edits require a manual `rs`. Adding .env to the watch list means dotenv-backed changes (DB creds, notification providers, Graph credentials, feature flags) auto-reload the dev process. Production uses PM2, which re-reads .env via `pm2 reload --update-env` and isn't affected by this config.",
+  "watch": ["server.js", "server/", "services/", "routes/", "middleware/", "utils/", "validators/", ".env"],
+  "ext": "js,json,env",
+  "ignore": ["node_modules/", "uploads/", "logs/", "*.log"],
+  "delay": "300ms"
+}
