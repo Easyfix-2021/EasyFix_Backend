@@ -144,8 +144,11 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
  * after fetching (see Sidebar.tsx) so role changes don't need a SQL migration.
  */
 async function menus() {
+  // `menu_status` is also returned (even though we filter on it) so the
+  // frontend can re-assert the active-only contract defensively — protects
+  // the sidebar if a future caller forgets the WHERE clause.
   const [rows] = await pool.query(
-    `SELECT menu_id, menu_name, parent_menu, menu_depth, has_child, url, icons, sequence
+    `SELECT menu_id, menu_name, parent_menu, menu_depth, has_child, url, icons, sequence, menu_status
        FROM tbl_menu
       WHERE menu_status = 1
       ORDER BY COALESCE(sequence, 999) ASC, menu_id ASC`

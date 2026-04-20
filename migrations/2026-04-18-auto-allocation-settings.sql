@@ -30,14 +30,12 @@ SELECT 'auto_assign_top_candidates_count',
        'integer'
  WHERE NOT EXISTS (SELECT 1 FROM tbl_autoallocation_setting WHERE `key` = 'auto_assign_top_candidates_count');
 
--- 3. (Optional) Max travel distance override — L2 currently uses env var
---    MAX_TRAVEL_DISTANCE_KM. Moving to DB lets ops tune without deploy.
-INSERT INTO tbl_autoallocation_setting (`key`, default_value, description, data_type)
-SELECT 'max_travel_distance_km',
-       '15',
-       'L2 availability filter: reject technicians whose base GPS is further than this many km from the customer.',
-       'integer'
- WHERE NOT EXISTS (SELECT 1 FROM tbl_autoallocation_setting WHERE `key` = 'max_travel_distance_km');
+-- 3. (Was: max_travel_distance_km.) Removed 2026-04-20 — eligibility switched
+--    from haversine GPS distance to ZONE membership (tbl_zone_master via
+--    tbl_easyfixer.efr_zone_city_id). Distance is no longer a filter or a
+--    scoring dimension, so this setting key is intentionally not created.
+--    If a previous run of this file already inserted the row, run:
+--      DELETE FROM tbl_autoallocation_setting WHERE `key` = 'max_travel_distance_km';
 
 -- 4. (Optional) Max concurrent active jobs per technician — L2 filter.
 INSERT INTO tbl_autoallocation_setting (`key`, default_value, description, data_type)
@@ -71,10 +69,9 @@ SELECT 'Manage Auto Allocations', 13, 2, 0, 'manageAutoAllocations', 1, 9.0091, 
 --    WHERE `key` IN (
 --      'auto_assign_failure_email',
 --      'auto_assign_top_candidates_count',
---      'max_travel_distance_km',
 --      'max_concurrent_jobs'
 --    );
---   -- Expected: 4 rows.
+--   -- Expected: 3 rows.
 --
 --   SELECT menu_id, menu_name, url, parent_menu, sequence, menu_status
 --     FROM tbl_menu

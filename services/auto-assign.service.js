@@ -1,52 +1,162 @@
 const { pool } = require('../db');
 const logger = require('../logger');
-const { haversineKm } = require('../utils/haversine');
 const jobService = require('./job.service');
 
 /*
  * 3-layer auto-assignment pipeline (blueprint §5).
+ *
+ * NOTE (2026-04-20): Distance switched from haversine GPS to ZONE-based
+ * eligibility. Technicians work only in zones they're explicitly mapped to
+ * (via tbl_easyfixer.efr_zone_city_id → tbl_zone_city_mapping → tbl_zone_master).
+ * Customer pincode → zones is resolved through pincode_firefox_city_mapping.
+ * Distance scoring removed from L3 entirely; the weight previously held by
+ * distance (0.35) is redistributed across the remaining three dimensions.
  *
  * Layer 1 — SQL eligibility filter:
  *   - efr_service_category matches job's service category (LIKE '%…%')
  *   - efr_cityId == job's city
  *   - efr_status = 1
  *   - is_technician_verified = 1
- *   - efr_id is NOT in scheduling_history for this job with a non-null
- *     reschedule_reason (i.e. previously rescheduled off this job — don't offer again)
+ *   - efr_id NOT in scheduling_history for this job with a non-null
+ *     reschedule_reason (covers BOTH manual reschedules AND mobile rejections —
+ *     the reject endpoint writes the reason into the same column).
+ *   - efr_zone_city_id ∈ (city_zone rows whose zone covers the customer's
+ *     pincode). A tech with no zone mapping is excluded entirely.
  *
  * Layer 2 — code availability filter:
  *   - active jobs (status 0/1/2) < MAX_CONCURRENT_JOBS
- *   - distance from customer GPS to efr_base_gps < MAX_TRAVEL_DISTANCE_KM
- *     (IMPORTANT: use efr_base_gps, not efr_current_gps — see blueprint)
  *   - no overlapping time-slot booking on same date
+ *   (Distance check removed — zone match already encodes serviceability.)
  *
  * Layer 3 — weighted scoring (higher = better), stats from last 90 days:
- *   distance_score   = (MAX_DIST - distance) / MAX_DIST
  *   workload_score   = (MAX_JOBS - active_jobs) / MAX_JOBS
  *   rating_score     = avg_customer_rating / 5                  (default 3.0 if no ratings)
  *   completion_score = completed / (completed + cancelled)      (default 0.8 if no history)
- *   score = W_DIST·d + W_WORK·w + W_RATE·r + W_COMP·c
+ *   score = W_WORK·w + W_RATE·r + W_COMP·c
+ *   Default weights: 0.45 / 0.30 / 0.25 (formerly 0.30 / 0.20 / 0.15 with
+ *   distance taking 0.35; redistributed proportionally so the engine still
+ *   normalises around 1.0 even though one dimension is gone).
  */
 
 const CONFIG = {
-  get MAX_TRAVEL_DISTANCE_KM()    { return Number(process.env.MAX_TRAVEL_DISTANCE_KM || 15); },
   get MAX_CONCURRENT_JOBS()       { return Number(process.env.MAX_CONCURRENT_JOBS || 5); },
-  get W_DISTANCE()                { return Number(process.env.WEIGHT_DISTANCE || 0.35); },
-  get W_WORKLOAD()                { return Number(process.env.WEIGHT_WORKLOAD || 0.30); },
-  get W_RATING()                  { return Number(process.env.WEIGHT_RATING || 0.20); },
-  get W_COMPLETION()              { return Number(process.env.WEIGHT_COMPLETION || 0.15); },
+  get W_WORKLOAD()                { return Number(process.env.WEIGHT_WORKLOAD || 0.45); },
+  get W_RATING()                  { return Number(process.env.WEIGHT_RATING || 0.30); },
+  get W_COMPLETION()              { return Number(process.env.WEIGHT_COMPLETION || 0.25); },
   STATS_LOOKBACK_DAYS: 90,
   DEFAULT_RATING: 3.0,
   DEFAULT_COMPLETION: 0.8,
 };
 
-// ─── Layer 1: SQL eligibility ───────────────────────────────────────
+/*
+ * Weight model
+ * ────────────
+ *   3 DIMENSION weights — each ONE row in tbl_autoallocation_setting.
+ *   Workload + Rating + Completion must sum to 1.0 (validated client-side
+ *   in the CRM Settings page; engine still normalises defensively).
+ *
+ *   Within Completion only, 3 SUB-WEIGHT proportions split the dimension W
+ *   across the failure modes:
+ *     cancellation_weight + escalation_weight + estimate_rejection_weight = 1.0
+ *
+ *   Sub-weight contribution to final score = W_completion × proportion.
+ *
+ *   Per-failure-mode SCORING (e.g. computing each tech's cancellation rate
+ *   separately and weighting those) is not yet implemented — until it is,
+ *   the engine treats W_completion as a single signal. The sub-weight rows
+ *   are stored + surfaced in the UI so ops can configure them ahead of the
+ *   engine catching up; no runtime effect today.
+ *
+ *   Legacy `*_weight` rows (distance, tat, ota, sda, margin, phone_picked,
+ *   skill_matching, performance) are vestigial — not bucketed here and not
+ *   shown in the UI. Engine ignores them.
+ *
+ * This map MUST stay in sync with WEIGHT_CATEGORIES in
+ *   Easyfix_CRM_UI/src/app/(authed)/settings/auto-allocation/page.tsx
+ */
+const WEIGHT_BUCKETS = {
+  workload:   ['workload_weight'],
+  rating:     ['rating_weight'],
+  completion: ['completion_weight'],
+};
+// Reserved for the future per-failure-mode scoring expansion.
+// eslint-disable-next-line no-unused-vars
+const COMPLETION_SUB_WEIGHTS = ['cancellation_weight', 'escalation_weight', 'estimate_rejection_weight'];
+const KEY_TO_BUCKET = (() => {
+  const m = new Map();
+  for (const bucket of Object.keys(WEIGHT_BUCKETS)) {
+    for (const key of WEIGHT_BUCKETS[bucket]) m.set(key, bucket);
+  }
+  return m;
+})();
+
+/*
+ * Resolve the effective {W_workload, W_rating, W_completion} for a given
+ * client. Pulls every weight setting once via settingsService (which handles
+ * client-override → global-default → built-in fallback per key) and sums by
+ * bucket. Pure cost: ~1 DB roundtrip per scoring call (the bulk variant
+ * batches via the same path).
+ */
+async function effectiveWeights(clientId) {
+  const settings = require('./settings.service');
+  const out = { workload: 0, rating: 0, completion: 0 };
+  for (const [key, bucket] of KEY_TO_BUCKET.entries()) {
+    try {
+      const raw = await settings.getClientSetting(clientId, key);
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0) out[bucket] += n;
+    } catch { /* missing key — fine, bucket falls back to default */ }
+  }
+  // Fallback to the built-in default if a bucket has no contributing rows.
+  if (out.workload   === 0) out.workload   = CONFIG.W_WORKLOAD;
+  if (out.rating     === 0) out.rating     = CONFIG.W_RATING;
+  if (out.completion === 0) out.completion = CONFIG.W_COMPLETION;
+  return out;
+}
+
+// ─── Layer 1: SQL eligibility (city + zone + skill + history) ───────
+/*
+ * Customer pincode → set of zone_city_mapping rows (city_zone_id) that the
+ * tech's `efr_zone_city_id` must belong to.
+ *
+ * The chain (no FK between the two pincode tables — joined on city_name string,
+ * see services/zone.service.js for the shape rationale):
+ *   pincode → pincode_firefox_city_mapping.city_name
+ *           → tbl_city.city_name
+ *           → tbl_zone_city_mapping.city_id (gives city_zone_id + zone_id)
+ *           → tbl_zone_master.zone_id
+ *
+ * If the customer's pincode resolves to NO zones, returns [] — the engine
+ * surfaces this as "no L1 candidates" so ops know the address is out of
+ * coverage rather than that no tech happened to match.
+ */
 async function eligibleCandidates(job) {
   const serviceCategory = job.service_categories_dashboard || ''; // legacy field; fallback to empty match
-  // Prefer resolving from attached service types; if not available, use stored category.
+  const customerPincode = job.pin_code ?? null;
+
+  // Resolve customer pincode → set of city_zone_ids. Done as its own query so
+  // a missing/unmapped pincode is observable in logs and we can short-circuit.
+  let cityZoneIds = [];
+  if (customerPincode) {
+    const [zoneRows] = await pool.query(
+      `SELECT DISTINCT zcm.city_zone_id
+         FROM pincode_firefox_city_mapping p
+         JOIN tbl_city                  c   ON c.city_name      = p.city_name
+         JOIN tbl_zone_city_mapping     zcm ON zcm.city_id      = c.city_id
+        WHERE p.pincode = ?`,
+      [customerPincode]
+    );
+    cityZoneIds = zoneRows.map((r) => r.city_zone_id);
+  }
+  if (cityZoneIds.length === 0) {
+    logger.debug(`L1: customer pincode ${customerPincode ?? '(missing)'} resolves to no zones → empty candidate set`);
+    return [];
+  }
+
+  const placeholders = cityZoneIds.map(() => '?').join(',');
   const [rows] = await pool.query(
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
-            e.efr_base_gps, e.efr_current_gps,
+            e.efr_zone_city_id,
             e.efr_service_category, e.efr_cityId,
             e.is_technician_verified
        FROM tbl_easyfixer e
@@ -54,11 +164,12 @@ async function eligibleCandidates(job) {
         AND e.is_technician_verified = 1
         AND e.efr_cityId = ?
         AND (? = '' OR e.efr_service_category LIKE CONCAT('%', ?, '%'))
+        AND e.efr_zone_city_id IN (${placeholders})
         AND e.efr_id NOT IN (
           SELECT sh.easyfixer_id FROM scheduling_history sh
            WHERE sh.job_id = ? AND sh.reschedule_reason IS NOT NULL AND sh.reschedule_reason <> ''
         )`,
-    [job.city_id, serviceCategory, serviceCategory, job.job_id]
+    [job.city_id, serviceCategory, serviceCategory, ...cityZoneIds, job.job_id]
   );
   return rows;
 }
@@ -136,23 +247,53 @@ async function statsForCandidates(efrIds, jobRequestedTs, jobTimeSlot) {
   return out;
 }
 
-function score({ distance, activeJobs, rating, completion }) {
-  const MAX_D = CONFIG.MAX_TRAVEL_DISTANCE_KM;
+/*
+ * Normalise the 3 dimension weights so they sum to 1.0. Without this, ops
+ * editing sub-weights would push the *final* score outside [0, 1] and make
+ * cross-job comparisons meaningless. Normalisation only affects the absolute
+ * score — the relative RANK of candidates is unchanged, so the assignment
+ * decision is identical either way.
+ */
+function normaliseWeights(weights) {
+  const sum = weights.workload + weights.rating + weights.completion;
+  if (sum <= 0) {
+    // Pathological: every bucket is 0. Fall back to built-in defaults so we
+    // never produce NaN scores.
+    return {
+      workload:   CONFIG.W_WORKLOAD,
+      rating:     CONFIG.W_RATING,
+      completion: CONFIG.W_COMPLETION,
+      raw_sum:    sum,
+    };
+  }
+  return {
+    workload:   weights.workload   / sum,
+    rating:     weights.rating     / sum,
+    completion: weights.completion / sum,
+    raw_sum:    sum,
+  };
+}
+
+function score({ activeJobs, rating, completion }, weights) {
   const MAX_J = CONFIG.MAX_CONCURRENT_JOBS;
-  const dS = Math.max(0, (MAX_D - distance) / MAX_D);
   const wS = Math.max(0, (MAX_J - activeJobs) / MAX_J);
   const rS = Math.max(0, Math.min(1, rating / 5));
   const cS = Math.max(0, Math.min(1, completion));
   const total =
-    CONFIG.W_DISTANCE  * dS +
-    CONFIG.W_WORKLOAD  * wS +
-    CONFIG.W_RATING    * rS +
-    CONFIG.W_COMPLETION * cS;
-  return { total, breakdown: { distance: dS, workload: wS, rating: rS, completion: cS } };
+    weights.workload   * wS +
+    weights.rating     * rS +
+    weights.completion * cS;
+  return { total, breakdown: { workload: wS, rating: rS, completion: cS } };
 }
 
 // ─── Main candidates entrypoint ─────────────────────────────────────
-async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {}) {
+/*
+ * `ignoreDistance` is preserved as an accepted option for API compat (the
+ * preview endpoint still passes it through) but is now a no-op — there's no
+ * distance gate to bypass. We accept-and-ignore rather than 400'ing so old
+ * callers in the wild don't break.
+ */
+async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {}) { // eslint-disable-line no-unused-vars
   const job = await jobService.getById(jobId);
   if (!job) {
     const err = new Error('job not found'); err.status = 404; throw err;
@@ -166,45 +307,53 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
     };
   }
 
-  const customerGps = job.gps_location;
   const eligible = await eligibleCandidates(job);
   if (eligible.length === 0) {
-    return { job, alreadyAssigned: false, candidates: [], notes: ['no L1-eligible technicians for this city/category'] };
+    return {
+      job,
+      alreadyAssigned: false,
+      candidates: [],
+      l1Count: 0,
+      rejectedCount: 0,
+      notes: [job.pin_code
+        ? `pincode ${job.pin_code} may be outside any mapped zone, or no verified tech in the zone matches the service category`
+        : 'customer pincode missing on this job'],
+    };
   }
 
-  const stats = await statsForCandidates(
-    eligible.map((e) => e.efr_id),
-    job.requested_date_time,
-    job.time_slot
-  );
+  const [stats, rawWeights] = await Promise.all([
+    statsForCandidates(
+      eligible.map((e) => e.efr_id),
+      job.requested_date_time,
+      job.time_slot
+    ),
+    effectiveWeights(job.fk_client_id),
+  ]);
+  // Normalise once per request; the same normalised weights apply to every
+  // candidate scored in this pass.
+  const weights = normaliseWeights(rawWeights);
 
   const scored = [];
   const rejected = [];
   for (const e of eligible) {
     const s = stats.get(e.efr_id);
-    const distance = customerGps ? haversineKm(customerGps, e.efr_base_gps) : (ignoreDistance ? 0 : Infinity);
 
-    // L2 filters
+    // L2 filters (zone match already happened in L1 — only workload + slot conflict here)
     if (s.active_jobs >= CONFIG.MAX_CONCURRENT_JOBS) {
       rejected.push({ efr_id: e.efr_id, reason: `saturated (${s.active_jobs} active jobs)` }); continue;
-    }
-    if (!ignoreDistance && distance > CONFIG.MAX_TRAVEL_DISTANCE_KM) {
-      rejected.push({ efr_id: e.efr_id, reason: `too far (${distance.toFixed(1)} km > ${CONFIG.MAX_TRAVEL_DISTANCE_KM})` }); continue;
     }
     if (s.has_conflict) {
       rejected.push({ efr_id: e.efr_id, reason: 'time-slot conflict on requested date' }); continue;
     }
 
-    // L3 scoring
+    // L3 scoring (normalised weights → final score in [0, 1])
     const scoreObj = score({
-      distance, activeJobs: s.active_jobs, rating: s.avg_rating, completion: s.completion,
-    });
+      activeJobs: s.active_jobs, rating: s.avg_rating, completion: s.completion,
+    }, weights);
     scored.push({
       efr_id: e.efr_id,
       efr_name: e.efr_name,
       efr_no: e.efr_no,
-      efr_base_gps: e.efr_base_gps,
-      distance_km: distance,
       active_jobs: s.active_jobs,
       avg_rating: Number(s.avg_rating.toFixed(2)),
       completion_ratio: Number(s.completion.toFixed(2)),
@@ -222,16 +371,25 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
       time_slot: job.time_slot,
       city_id: job.city_id,
       city_name: job.city_name,
-      gps_location: job.gps_location,
+      pin_code: job.pin_code,
       service_category: job.service_categories_dashboard,
     },
     alreadyAssigned: false,
     config: {
-      MAX_TRAVEL_DISTANCE_KM: CONFIG.MAX_TRAVEL_DISTANCE_KM,
       MAX_CONCURRENT_JOBS: CONFIG.MAX_CONCURRENT_JOBS,
+      // `weights` is what the engine actually used (normalised, sum = 1.0)
+      // `weightsRaw` is the per-bucket sum BEFORE normalisation, so the UI
+      // can show ops both "what you set" and "what the engine ranked with".
       weights: {
-        distance: CONFIG.W_DISTANCE, workload: CONFIG.W_WORKLOAD,
-        rating: CONFIG.W_RATING, completion: CONFIG.W_COMPLETION,
+        workload:   Number(weights.workload.toFixed(3)),
+        rating:     Number(weights.rating.toFixed(3)),
+        completion: Number(weights.completion.toFixed(3)),
+      },
+      weightsRaw: {
+        workload:   Number(rawWeights.workload.toFixed(3)),
+        rating:     Number(rawWeights.rating.toFixed(3)),
+        completion: Number(rawWeights.completion.toFixed(3)),
+        sum:        Number((rawWeights.workload + rawWeights.rating + rawWeights.completion).toFixed(3)),
       },
     },
     l1Count: eligible.length,
