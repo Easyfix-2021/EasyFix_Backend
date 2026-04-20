@@ -15,12 +15,45 @@ const { pool } = require('../db');
  */
 
 // ─── Status glossary (blueprint §3) ─────────────────────────────────
+/*
+ * Canonical job_status codes (truth from legacy DB, documented 2026-04-20):
+ *
+ *   0  BOOKED          — default on create. Sub-states:
+ *                         • fk_easyfixter_id IS NULL  → "Pending for Scheduling"
+ *                         • fk_easyfixter_id NOT NULL → "Pending App Acknowledge"
+ *   1  SCHEDULED       — accepted by tech on app, pending check-in
+ *   2  IN_PROGRESS     — technician checked in on app
+ *   3  COMPLETED       — closed (QA path)
+ *   5  COMPLETED_ALT   — closed (legacy alternative completion)
+ *   6  CANCELLED       — cancelled by ops
+ *   7  ENQUIRY         — information request only (legacy; keep)
+ *   9  UNCONFIRMED     — job booked from website / API / dashboard / bulk
+ *                        upload, customer not yet confirmed
+ *  10  CLOSED_FROM_APP — closed from tech app / estimate approved or rejected
+ *  15  ESTIMATE_PENDING_APPROVAL — estimate sent, awaiting customer decision
+ *  20  IN_PROGRESS_ALT — second IN_PROGRESS state used by some app paths
+ *  21  ON_HOLD         — fulfilment on hold
+ *
+ * Kept existing NAMES (BOOKED / SCHEDULED / CALL_LATER / REVISIT) as aliases
+ * so the 20+ files referencing STATUS.CALL_LATER / STATUS.REVISIT keep
+ * compiling without a churn-wide rename. The new CANONICAL names live as
+ * separate properties — prefer them in new code.
+ */
 const STATUS = {
   BOOKED: 0, SCHEDULED: 1, IN_PROGRESS: 2,
   COMPLETED: 3, COMPLETED_ALT: 5, CANCELLED: 6,
   ENQUIRY: 7, CALL_LATER: 9, REVISIT: 10,
+  // Canonical additions (DB-truth per 2026-04-20):
+  UNCONFIRMED: 9,                 // alias for CALL_LATER
+  CLOSED_FROM_APP: 10,            // alias for REVISIT
+  ESTIMATE_PENDING_APPROVAL: 15,
+  IN_PROGRESS_ALT: 20,
+  ON_HOLD: 21,
 };
 const ALL_STATUS_VALUES = new Set(Object.values(STATUS));
+// Composite buckets for multi-status queries and UI tabs.
+const CHECKED_IN_STATES = new Set([STATUS.IN_PROGRESS, STATUS.IN_PROGRESS_ALT]);
+const CLOSED_STATES = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT]);
 
 // Terminal states — `setStatus` to these sets stamp timestamps
 const COMPLETED_STATES = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT]);
@@ -62,16 +95,38 @@ const DETAIL_JOIN = LIST_JOIN + `
 
 // ─── List ───────────────────────────────────────────────────────────
 async function list({
-  q, status, clientId, cityId, ownerId, easyfixerId,
+  q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
   startDate, endDate,
   limit = 50, offset = 0,
 } = {}) {
   const clauses = [];
   const params = [];
 
-  if (status != null) {
+  // `statuses` (array/CSV) takes priority over single `status` — supports UI
+  // tabs that bucket multiple codes (e.g. "Pending to Close" = 2 OR 20,
+  // "Audit & Complete" = 3 OR 5). Single `status` still works for backward
+  // compat with existing callers.
+  if (statuses != null) {
+    const arr = Array.isArray(statuses)
+      ? statuses
+      : String(statuses).split(',').map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (arr.length) {
+      clauses.push(`j.job_status IN (${arr.map(() => '?').join(',')})`);
+      params.push(...arr);
+    }
+  } else if (status != null) {
     clauses.push('j.job_status = ?');
     params.push(status);
+  }
+  /*
+   * `assigned` splits BOOKED (and any other status) by whether a technician
+   * is currently on the job. Used by the dashboard's Pending-for-Scheduling
+   * (assigned=false) vs Pending-App-Acknowledge (assigned=true) cards.
+   * Accepts boolean true/false or string "true"/"false" from query params.
+   */
+  if (assigned !== undefined && assigned !== null && assigned !== '') {
+    const wantAssigned = assigned === true || assigned === 'true' || assigned === 1 || assigned === '1';
+    clauses.push(wantAssigned ? 'j.fk_easyfixter_id IS NOT NULL' : 'j.fk_easyfixter_id IS NULL');
   }
   if (clientId != null)    { clauses.push('j.fk_client_id = ?');     params.push(clientId); }
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
@@ -189,16 +244,38 @@ async function getJobMeta(jobId) {
  * fussy and the row count is always tiny (≤ 10 status codes).
  */
 async function getStatusCounts() {
-  const [rows] = await pool.query(
-    'SELECT job_status, COUNT(*) AS c FROM tbl_job GROUP BY job_status'
-  );
+  /*
+   * Two queries run in parallel:
+   *   1. GROUP BY job_status — the raw count per code.
+   *   2. BOOKED split by fk_easyfixter_id IS NULL — gives the dashboard the
+   *      two derived buckets (Pending for Scheduling vs Pending App Ack) in
+   *      one round-trip instead of a follow-up COUNT. Cheap on tbl_job
+   *      because job_status is indexed and the filter is sargable.
+   * Client-side sum for the grand total — easier than WITH ROLLUP on MySQL 5.7.
+   */
+  const [statusRows, bookedSplitRows] = await Promise.all([
+    pool.query('SELECT job_status, COUNT(*) AS c FROM tbl_job GROUP BY job_status'),
+    pool.query(
+      `SELECT fk_easyfixter_id IS NULL AS unassigned, COUNT(*) AS c
+         FROM tbl_job WHERE job_status = ${STATUS.BOOKED}
+        GROUP BY unassigned`
+    ),
+  ]);
   const byStatus = {};
   let total = 0;
-  for (const r of rows) {
+  for (const r of statusRows[0]) {
     byStatus[String(r.job_status)] = Number(r.c);
     total += Number(r.c);
   }
-  return { total, byStatus };
+  let bookedUnassigned = 0;
+  let bookedAssigned = 0;
+  for (const r of bookedSplitRows[0]) {
+    // mysql2 returns the BIT(1) from `IS NULL` as 0/1 int here (no typeCast
+    // needed since it's a computed boolean, not a BIT column).
+    if (Number(r.unassigned) === 1) bookedUnassigned = Number(r.c);
+    else bookedAssigned = Number(r.c);
+  }
+  return { total, byStatus, bookedUnassigned, bookedAssigned };
 }
 
 // ─── Customer + Address helpers (used by create) ───────────────────

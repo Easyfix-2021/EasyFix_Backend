@@ -9,6 +9,20 @@ const gpsPair = Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/);
 const listQuery = Joi.object({
   q: Joi.string().min(1).max(100).optional(),
   status: Joi.number().integer().valid(...ALL_STATUS_VALUES).optional(),
+  /*
+   * `statuses` — multi-status filter for composite UI tabs (e.g. Pending to
+   * Close = 2 OR 20). Accepted as CSV string ("2,20") or array. Each value
+   * must be a known status code. If both `status` and `statuses` are passed,
+   * the service layer prefers `statuses`.
+   */
+  statuses: Joi.alternatives(
+    Joi.string().pattern(/^\d+(,\d+)*$/).max(100),
+    Joi.array().items(Joi.number().integer().valid(...ALL_STATUS_VALUES)).max(20),
+  ).optional(),
+  // `assigned` — true → only jobs with a technician; false → only jobs without.
+  // Used by the dashboard's BOOKED split. Accepts bool OR the string form that
+  // URLSearchParams produces.
+  assigned: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
   clientId: intId.optional(),
   cityId: intId.optional(),
   ownerId: intId.optional(),
