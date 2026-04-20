@@ -9,16 +9,34 @@ const { signUserToken } = require('../utils/jwt');
  *   - Legacy EasyFix_CRM also supports Microsoft Azure AD OAuth; that is not
  *     replicated here yet. /api/auth/login is stubbed 501 and will either be
  *     wired to Azure AD or dropped once the blueprint is updated.
+ *
+ * INTERNAL-ONLY GATE (added 2026-04-20):
+ *   - CRM access is restricted to rows where `tbl_user.user_type_id = 5`
+ *     (Internal users). Client SPOC, external partner, and other user types
+ *     use separate auth paths (/api/client/* + tbl_client_contacts, etc.)
+ *     and must never be issued a CRM JWT.
+ *   - Gate lives at the DB-query level rather than post-fetch filtering:
+ *       (a) non-internal users can't even TRIGGER an OTP (the query returns
+ *           no row → `createLoginOtp` returns {found: false}),
+ *       (b) verifyLoginOtp's re-query also returns null → USER_NOT_FOUND.
+ *     Single layer, no branch for "authenticated but forbidden" — exactly
+ *     the same response shape as an invalid identifier. Prevents enumeration
+ *     of which emails belong to non-internal user_type_ids.
+ *   - If the set of allowed user_type_ids grows (e.g. "Technology team" wants
+ *     a new type), change the WHERE clause to `user_type_id IN (?, ?)` and
+ *     update this comment — one place to edit, two SELECTs to stay in sync.
  */
 
 async function findActiveUserByIdentifier(identifier) {
   const isEmail = /@/.test(identifier);
   const column = isEmail ? 'official_email' : 'mobile_no';
   const [[user]] = await pool.query(
-    `SELECT user_id, user_code, user_name, official_email, user_role, city_id,
-            mobile_no, alternate_no, manage_clients, manage_cities, user_status
+    `SELECT user_id, user_code, user_name, official_email, user_role, user_type_id,
+            city_id, mobile_no, alternate_no, manage_clients, manage_cities, user_status
        FROM tbl_user
-      WHERE ${column} = ? AND user_status = 1
+      WHERE ${column} = ?
+        AND user_status = 1
+        AND user_type_id = 5
       LIMIT 1`,
     [identifier]
   );
@@ -27,10 +45,12 @@ async function findActiveUserByIdentifier(identifier) {
 
 async function findUserById(userId) {
   const [[user]] = await pool.query(
-    `SELECT user_id, user_code, user_name, official_email, user_role, city_id,
-            mobile_no, alternate_no, manage_clients, manage_cities, user_status
+    `SELECT user_id, user_code, user_name, official_email, user_role, user_type_id,
+            city_id, mobile_no, alternate_no, manage_clients, manage_cities, user_status
        FROM tbl_user
-      WHERE user_id = ? AND user_status = 1
+      WHERE user_id = ?
+        AND user_status = 1
+        AND user_type_id = 5
       LIMIT 1`,
     [userId]
   );
