@@ -243,7 +243,7 @@ async function getJobMeta(jobId) {
  * side sum — we use client-side sum because MySQL 5.7's WITH ROLLUP syntax is
  * fussy and the row count is always tiny (≤ 10 status codes).
  */
-async function getStatusCounts() {
+async function getStatusCounts({ ownerId } = {}) {
   /*
    * Two queries run in parallel:
    *   1. GROUP BY job_status — the raw count per code.
@@ -252,13 +252,22 @@ async function getStatusCounts() {
    *      one round-trip instead of a follow-up COUNT. Cheap on tbl_job
    *      because job_status is indexed and the filter is sargable.
    * Client-side sum for the grand total — easier than WITH ROLLUP on MySQL 5.7.
+   *
+   * `ownerId` (optional) scopes both queries to `job_owner = ?` — used by the
+   * My Orders sidebar flow to show "MY jobs by status" counts. Numeric guard
+   * in the route layer makes SQL injection impossible; we still parameterise.
    */
+  const ownerWhere = ownerId ? 'WHERE job_owner = ?' : '';
+  const ownerAnd   = ownerId ? 'AND job_owner = ?' : '';
+  const ownerBind  = ownerId ? [ownerId] : [];
+
   const [statusRows, bookedSplitRows] = await Promise.all([
-    pool.query('SELECT job_status, COUNT(*) AS c FROM tbl_job GROUP BY job_status'),
+    pool.query(`SELECT job_status, COUNT(*) AS c FROM tbl_job ${ownerWhere} GROUP BY job_status`, ownerBind),
     pool.query(
       `SELECT fk_easyfixter_id IS NULL AS unassigned, COUNT(*) AS c
-         FROM tbl_job WHERE job_status = ${STATUS.BOOKED}
-        GROUP BY unassigned`
+         FROM tbl_job WHERE job_status = ${STATUS.BOOKED} ${ownerAnd}
+        GROUP BY unassigned`,
+      ownerBind
     ),
   ]);
   const byStatus = {};
@@ -444,13 +453,100 @@ async function update(jobId, input, actor) {
       values.push(input[col]);
     }
   }
-  if (sets.length === 0) return existing;
 
-  sets.push('last_update_time = ?');
-  values.push(new Date());
-  values.push(jobId);
+  const hasServicesEdit = Array.isArray(input.services);
+  const hasCustomerEdit = input.customer && typeof input.customer === 'object' && Object.keys(input.customer).length > 0;
+  const hasAddressEdit  = input.address  && typeof input.address  === 'object' && Object.keys(input.address).length  > 0;
 
-  await pool.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, values);
+  // Early-exit only when NOTHING is being touched.
+  if (sets.length === 0 && !hasServicesEdit && !hasCustomerEdit && !hasAddressEdit) return existing;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    if (sets.length > 0) {
+      sets.push('last_update_time = ?');
+      const scalarValues = [...values, new Date(), jobId];
+      await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, scalarValues);
+    }
+
+    /*
+     * Customer update — resolves tbl_customer row from job.fk_customer_id.
+     * Only the editable fields (name, email) are accepted; mobile is the
+     * key and treated as immutable here (callers must use the dedicated
+     * customer swap flow if they truly need a different number).
+     */
+    if (hasCustomerEdit && existing.fk_customer_id) {
+      const custSets = [];
+      const custVals = [];
+      if (input.customer.customer_name  !== undefined) { custSets.push('customer_name = ?');  custVals.push(input.customer.customer_name); }
+      if (input.customer.customer_email !== undefined) { custSets.push('customer_email = ?'); custVals.push(input.customer.customer_email || null); }
+      if (custSets.length > 0) {
+        custVals.push(existing.fk_customer_id);
+        await conn.query(`UPDATE tbl_customer SET ${custSets.join(', ')} WHERE customer_id = ?`, custVals);
+      }
+    }
+
+    /*
+     * Address update — resolves tbl_address row from job.fk_address_id.
+     * Full field set (line, building, landmark, city, pin, GPS). For the
+     * Unconfirmed → Scheduled flow ops may clean up a bulk-imported address
+     * before confirming, so every column is editable here.
+     */
+    if (hasAddressEdit && existing.fk_address_id) {
+      const addrSets = [];
+      const addrVals = [];
+      if (input.address.address      !== undefined) { addrSets.push('address = ?');      addrVals.push(input.address.address); }
+      if (input.address.building     !== undefined) { addrSets.push('building = ?');     addrVals.push(input.address.building || null); }
+      if (input.address.landmark     !== undefined) { addrSets.push('landmark = ?');     addrVals.push(input.address.landmark || null); }
+      if (input.address.city_id      !== undefined) { addrSets.push('city_id = ?');      addrVals.push(input.address.city_id); }
+      if (input.address.pin_code     !== undefined) { addrSets.push('pin_code = ?');     addrVals.push(input.address.pin_code); }
+      if (input.address.gps_location !== undefined) { addrSets.push('gps_location = ?'); addrVals.push(input.address.gps_location || null); }
+      if (addrSets.length > 0) {
+        addrVals.push(existing.fk_address_id);
+        await conn.query(`UPDATE tbl_address SET ${addrSets.join(', ')} WHERE address_id = ?`, addrVals);
+      }
+    }
+
+    /*
+     * Services replacement: wipe & re-insert in the same transaction.
+     * Rationale: ops editing an Unconfirmed order may have added/removed
+     * products from the catalog; tracking row-level diffs in the UI is
+     * overkill for a low-volume flow. Full replacement matches legacy
+     * addEditJob behaviour (which re-submits the whole service list).
+     * Empty array == clear all services (legitimate for rollback edits).
+     */
+    if (hasServicesEdit) {
+      await conn.query('DELETE FROM tbl_job_services WHERE job_id = ?', [jobId]);
+      if (input.services.length > 0) {
+        const rows = input.services.map((svc) => [
+          jobId, svc.service_id, svc.quantity || 1,
+          svc.service_type_id || null, svc.service_category_id || null, 1,
+        ]);
+        await conn.query(
+          `INSERT INTO tbl_job_services
+             (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status)
+           VALUES ?`,
+          [rows]
+        );
+      }
+    }
+
+    // Touch last_update_time if only non-scalar edits happened (services,
+    // customer, address). Downstream consumers (webhooks, audit) see the
+    // nested edit as a meaningful change to the job record.
+    if (sets.length === 0 && (hasServicesEdit || hasCustomerEdit || hasAddressEdit)) {
+      await conn.query('UPDATE tbl_job SET last_update_time = ? WHERE job_id = ?', [new Date(), jobId]);
+    }
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
   return getById(jobId);
 }
 

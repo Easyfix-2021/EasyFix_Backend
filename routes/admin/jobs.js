@@ -25,9 +25,17 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
  * stats, enough to saturate a 20-connection pool when combined with /auth/me
  * and recent-jobs on the same page load). Single GROUP BY = 1 connection.
  */
-router.get('/counts', async (_req, res, next) => {
+/*
+ * Accepts optional `?ownerId=<user_id>` to scope the buckets to jobs owned
+ * by that user (drives the "My Orders" sidebar flow on the CRM). Invalid or
+ * missing ownerId falls through to org-wide counts — same response shape,
+ * different WHERE clause. Frontend passes `ownerId = currentUser.user_id`
+ * when it detects `?scope=mine` on the URL.
+ */
+router.get('/counts', async (req, res, next) => {
   try {
-    const counts = await job.getStatusCounts();
+    const ownerId = req.query.ownerId ? Number(req.query.ownerId) : undefined;
+    const counts = await job.getStatusCounts({ ownerId: Number.isFinite(ownerId) ? ownerId : undefined });
     modernOk(res, counts);
   } catch (e) { next(e); }
 });
@@ -48,12 +56,20 @@ router.post('/', validate(createBody), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.put('/:id', validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
+/*
+ * Update — exposed as BOTH PUT and PATCH to the same handler. The CRM_UI
+ * edit flow uses PATCH semantically (partial update) while some integration
+ * callers use PUT; both land on the same validator + service call so we
+ * don't fork behaviour.
+ */
+const updateHandler = async (req, res, next) => {
   try {
     const updated = await job.update(req.params.id, req.body, req.user);
     modernOk(res, updated, 'job updated');
   } catch (e) { next(e); }
-});
+};
+router.put('/:id',   validate(idParam, 'params'), validate(updateBody), updateHandler);
+router.patch('/:id', validate(idParam, 'params'), validate(updateBody), updateHandler);
 
 router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), async (req, res, next) => {
   try {

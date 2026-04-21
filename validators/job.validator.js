@@ -110,6 +110,25 @@ const updateBody = Joi.object({
   exp_tat: Joi.string().max(50).optional(),
   booking_cut_off_time: Joi.number().integer().optional(),
   booking_cut_off_time_slot: Joi.string().max(100).optional(),
+  // Services replacement — when present, tbl_job_services rows for this job
+  // are wiped and these inserted. Used by the Unconfirmed-order Confirm flow.
+  services: Joi.array().items(serviceItem).optional(),
+  // Nested edits for the Confirm & Schedule flow. Both blocks are optional;
+  // within each, every field is optional so the UI can send only what changed.
+  // IDs (customer_id, address_id) aren't needed — the service resolves them
+  // from the current job row.
+  customer: Joi.object({
+    customer_name: Joi.string().max(255).optional(),
+    customer_email: Joi.string().email().max(255).allow('').optional(),
+  }).optional(),
+  address: Joi.object({
+    address: Joi.string().max(2000).optional(),
+    building: Joi.string().max(500).allow('').optional(),
+    landmark: Joi.string().max(500).allow('').optional(),
+    city_id: intId.optional(),
+    pin_code: pinCode.optional(),
+    gps_location: gpsPair.allow('').optional(),
+  }).optional(),
 }).min(1);
 
 const statusBody = Joi.object({
