@@ -131,7 +131,6 @@ async function effectiveWeights(clientId) {
  * coverage rather than that no tech happened to match.
  */
 async function eligibleCandidates(job) {
-  const serviceCategory = job.service_categories_dashboard || ''; // legacy field; fallback to empty match
   const customerPincode = job.pin_code ?? null;
 
   // Resolve customer pincode → set of city_zone_ids. Done as its own query so
@@ -153,6 +152,42 @@ async function eligibleCandidates(job) {
     return [];
   }
 
+  /*
+   * Skill match — DEEP SKILL based (replaces the old efr_service_category
+   * LIKE substring match, which was a denormalised CSV with no FK integrity).
+   *
+   * The chain:
+   *   tbl_efr_deepskill_mapping  — (efr_id, deepskill_id) — what the tech is qualified for
+   *   tbl_deep_skill             — leaf rows (category_id, service_type_id, deepskill_name, status)
+   *
+   * A technician is eligible if at least one of their MAPPED deepskills aligns
+   * with what the job needs:
+   *   - If the job has both fk_service_catg_id and fk_service_type_id, both
+   *     must match on the SAME mapping row (most precise).
+   *   - If only category is set, the tech needs ANY active deep-skill in
+   *     that category.
+   *   - If neither is set on the job (legacy / partial data), skill match
+   *     is skipped — the zone + city + verification filters still run.
+   * Inactive deep-skills (tbl_deep_skill.status = 0) are excluded so
+   * deactivating a skill immediately stops auto-assign from offering it,
+   * even if old mapping rows still reference it.
+   */
+  const skillClauses = [];
+  const skillParams  = [];
+  if (job.fk_service_catg_id || job.fk_service_type_id) {
+    let predicate = `EXISTS (
+      SELECT 1
+        FROM tbl_efr_deepskill_mapping m
+        JOIN tbl_deep_skill ds ON ds.deepskill_id = m.deepskill_id
+       WHERE m.efr_id = e.efr_id
+         AND ds.status = 1`;
+    if (job.fk_service_catg_id) { predicate += ' AND ds.category_id = ?';     skillParams.push(job.fk_service_catg_id); }
+    if (job.fk_service_type_id) { predicate += ' AND ds.service_type_id = ?'; skillParams.push(job.fk_service_type_id); }
+    predicate += ')';
+    skillClauses.push(predicate);
+  }
+  const skillSql = skillClauses.length ? ` AND ${skillClauses.join(' AND ')}` : '';
+
   const placeholders = cityZoneIds.map(() => '?').join(',');
   const [rows] = await pool.query(
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
@@ -163,13 +198,13 @@ async function eligibleCandidates(job) {
       WHERE e.efr_status = 1
         AND e.is_technician_verified = 1
         AND e.efr_cityId = ?
-        AND (? = '' OR e.efr_service_category LIKE CONCAT('%', ?, '%'))
+        ${skillSql}
         AND e.efr_zone_city_id IN (${placeholders})
         AND e.efr_id NOT IN (
           SELECT sh.easyfixer_id FROM scheduling_history sh
            WHERE sh.job_id = ? AND sh.reschedule_reason IS NOT NULL AND sh.reschedule_reason <> ''
         )`,
-    [job.city_id, serviceCategory, serviceCategory, ...cityZoneIds, job.job_id]
+    [job.city_id, ...skillParams, ...cityZoneIds, job.job_id]
   );
   return rows;
 }
