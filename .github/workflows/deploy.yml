@@ -1,40 +1,37 @@
-# EasyFix_Backend — auto-deploy to AWS EC2
+# EasyFix_Backend — auto-deploy to AWS EC2 (Production only)
+#
+# QA was historically deployed to an AWS EC2 instance via this same workflow.
+# It now lives on the in-house server at 192.168.1.211 and is deployed via
+# .github/workflows/deploy-qa-inhouse.yml (self-hosted runner on the QA LAN).
+# This workflow therefore handles ONLY the Production target.
 #
 # Triggers
-#   push → QA          → deploy to QA EC2
 #   push → Production  → deploy to Production EC2
-#   manual workflow_dispatch (with environment picker)
+#   manual workflow_dispatch
 #
 # Pipeline per push:
 #   1. Checkout the pushed commit
 #   2. Set up Node 20 + cache npm
 #   3. npm ci + node --check on key services (catch syntax errors BEFORE we touch the server)
-#   4. SSH to the right EC2, git pull, npm ci, smoke-test DB, pm2 reload
+#   4. SSH to the Production EC2, git pull, npm ci, smoke-test DB, pm2 reload
 #   5. Hit /api/health + /api/health/db; fail the job if either is non-2xx
 #
 # Secrets required (Settings → Secrets and variables → Actions):
-#   QA_HOST, QA_USER, QA_SSH_KEY
 #   PROD_HOST, PROD_USER, PROD_SSH_KEY
 #   MAIL_USERNAME, MAIL_PASSWORD       (Gmail SMTP for failure notifications)
 #
-# See docs/AWS_DEPLOYMENT_GUIDE.md and docs/GITHUB_SECRETS.md for the full setup.
+# See docs/AWS_DEPLOYMENT_GUIDE.md and docs/GITHUB_SECRETS.md for setup.
 
-name: Deploy to AWS EC2
+name: Deploy to AWS EC2 (Production)
 
 on:
   push:
-    branches: [QA, Production]
-  workflow_dispatch:
-    inputs:
-      target:
-        description: 'Which environment to deploy'
-        required: true
-        type: choice
-        options: [qa, production]
+    branches: [Production]
+  workflow_dispatch: {}
 
-# One in-flight deploy per branch — newer commits supersede older ones.
+# One in-flight deploy at a time — newer commits supersede older ones.
 concurrency:
-  group: deploy-${{ github.ref }}
+  group: deploy-production
   cancel-in-progress: true
 
 jobs:
@@ -72,40 +69,27 @@ jobs:
         run: npm run lint --if-present || true
 
   deploy:
-    name: Deploy to ${{ (github.event.inputs.target || (github.ref_name == 'Production' && 'production') || 'qa') }}
+    name: Deploy to production
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      ENV_NAME: ${{ (github.event.inputs.target || (github.ref_name == 'Production' && 'production') || 'qa') }}
     steps:
       - name: Resolve target host
         id: target
         # base_url uses the EC2 EIP + raw app port (5100) — public DNS
-        # `qa.api.easyfix.in` / `api.easyfix.in` still routes to the legacy
-        # Dropwizard service during the coexistence window. After cutover,
-        # swap base_url back to the HTTPS domain.
+        # `api.easyfix.in` still routes to the legacy Dropwizard service
+        # during the coexistence window. After cutover, swap base_url back
+        # to the HTTPS domain.
         run: |
-          if [[ "${ENV_NAME}" == "production" ]]; then
-            echo "host=${{ secrets.PROD_HOST }}"          >> "$GITHUB_OUTPUT"
-            echo "user=${{ secrets.PROD_USER }}"          >> "$GITHUB_OUTPUT"
-            echo "branch=Production"                       >> "$GITHUB_OUTPUT"
-            echo "base_url=http://${{ secrets.PROD_HOST }}:5100" >> "$GITHUB_OUTPUT"
-          else
-            echo "host=${{ secrets.QA_HOST }}"            >> "$GITHUB_OUTPUT"
-            echo "user=${{ secrets.QA_USER }}"            >> "$GITHUB_OUTPUT"
-            echo "branch=QA"                               >> "$GITHUB_OUTPUT"
-            echo "base_url=http://${{ secrets.QA_HOST }}:5100"   >> "$GITHUB_OUTPUT"
-          fi
+          echo "host=${{ secrets.PROD_HOST }}"            >> "$GITHUB_OUTPUT"
+          echo "user=${{ secrets.PROD_USER }}"            >> "$GITHUB_OUTPUT"
+          echo "branch=Production"                         >> "$GITHUB_OUTPUT"
+          echo "base_url=http://${{ secrets.PROD_HOST }}:5100" >> "$GITHUB_OUTPUT"
 
       - name: Set up SSH key
         run: |
           mkdir -p ~/.ssh
-          if [[ "${ENV_NAME}" == "production" ]]; then
-            echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/deploy_key
-          else
-            echo "${{ secrets.QA_SSH_KEY }}" > ~/.ssh/deploy_key
-          fi
+          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ steps.target.outputs.host }}" >> ~/.ssh/known_hosts
 
@@ -169,11 +153,11 @@ jobs:
           secure: true
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "[Deploy FAILED] EasyFix_Backend → ${{ env.ENV_NAME }} (${{ github.sha }})"
+          subject: "[Deploy FAILED] EasyFix_Backend → production (${{ github.sha }})"
           to: harshit@channelplay.in
           from: ${{ secrets.MAIL_USERNAME }}
           body: |
-            Backend deploy to ${{ env.ENV_NAME }} FAILED.
+            Backend deploy to production FAILED.
 
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
