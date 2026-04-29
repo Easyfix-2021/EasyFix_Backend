@@ -116,15 +116,25 @@ jobs:
         # Two tags per build:
         #   qa-<sha>     immutable, audit-trail + rollback target
         #   qa-latest    moving, what /opt/easyfix/.env defaults to
-        # The compose file reads BACKEND_IMAGE from .env which the SSM
-        # step below sets to the SHA tag, so deploys are deterministic.
+        # Validate the ECR secrets are non-empty BEFORE we build a 250 MB
+        # image — otherwise the build silently produces an `image:tag`
+        # without a registry and fails downstream in confusing ways.
         run: |
           REGISTRY="${{ secrets.ECR_REGISTRY }}"
           REPO="${{ secrets.ECR_REPOSITORY_BACKEND }}"
           ENV_NAME="${{ steps.target.outputs.env_name }}"
-          SHA_TAG="${ENV_NAME}-${GITHUB_SHA::7}"
 
-          echo "image_uri=${REGISTRY}/${REPO}:${SHA_TAG}"        >> "$GITHUB_OUTPUT"
+          if [[ -z "$REGISTRY" ]]; then
+            echo "::error::ECR_REGISTRY secret is empty. Add it to the 'Organisation Level Secrets' environment with value 902810393464.dkr.ecr.ap-south-1.amazonaws.com"
+            exit 1
+          fi
+          if [[ -z "$REPO" ]]; then
+            echo "::error::ECR_REPOSITORY_BACKEND secret is empty. Add it to the 'Organisation Level Secrets' environment with value easyfix/backend"
+            exit 1
+          fi
+
+          SHA_TAG="${ENV_NAME}-${GITHUB_SHA::7}"
+          echo "image_uri=${REGISTRY}/${REPO}:${SHA_TAG}"          >> "$GITHUB_OUTPUT"
           echo "moving_uri=${REGISTRY}/${REPO}:${ENV_NAME}-latest" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
@@ -227,7 +237,12 @@ jobs:
           EOF
           )
 
-          PARAMS_JSON=$(jq -n --arg cmd "$REMOTE_SCRIPT" '{commands: [$cmd]}')
+          # AWS-RunShellScript runs each command via /bin/sh, which on
+          # Ubuntu/Debian is dash. Our script uses bash-isms ([[ ]],
+          # process substitution implied later, etc.). Wrap the whole
+          # thing in a `bash -c` invocation so it runs under bash.
+          # Fixes: "[[: not found" + "parameter not set" cascade errors.
+          PARAMS_JSON=$(jq -n --arg cmd "$REMOTE_SCRIPT" '{commands: ["bash -c \($cmd | @json)"]}')
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
@@ -265,18 +280,20 @@ jobs:
           set -euo pipefail
           INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
 
-          PARAMS_JSON=$(jq -n '{commands: [
-            "set -e",
-            "for path in /api/health /api/health/db /api/integration/_ping; do",
-            "  ok=0",
-            "  for i in 1 2 3 4 5; do",
-            "    code=$(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:5100${path} || echo 000)",
-            "    if [[ \"$code\" =~ ^2 ]]; then echo \"✓ ${path} → $code\"; ok=1; break; fi",
-            "    echo \"Attempt $i: ${path} → $code, retrying in 5s…\"; sleep 5",
-            "  done",
-            "  if [[ $ok -eq 0 ]]; then echo \"✗ ${path} never returned 2xx\"; exit 1; fi",
-            "done"
-          ]}')
+          # Build the bash script as a single string + wrap in `bash -c`
+          # for SSM (default shell is dash, doesn't support [[ or =~).
+          SMOKE_SCRIPT='set -e
+          for path in /api/health /api/health/db /api/integration/_ping; do
+            ok=0
+            for i in 1 2 3 4 5; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5100${path} || echo 000)
+              if [[ "$code" =~ ^2 ]]; then echo "✓ ${path} → $code"; ok=1; break; fi
+              echo "Attempt $i: ${path} → $code, retrying in 5s…"; sleep 5
+            done
+            if [[ $ok -eq 0 ]]; then echo "✗ ${path} never returned 2xx"; exit 1; fi
+          done'
+
+          PARAMS_JSON=$(jq -n --arg cmd "$SMOKE_SCRIPT" '{commands: ["bash -c \($cmd | @json)"]}')
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
