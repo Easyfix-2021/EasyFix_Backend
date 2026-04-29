@@ -243,7 +243,11 @@ jobs:
             echo "BACKEND_IMAGE=$IMAGE_URI" >> /opt/easyfix/.env
           fi
 
-          echo "▶ Pulling \$BACKEND_IMAGE"
+          # Use \$IMAGE_URI (substituted at heredoc-build time on the runner)
+          # instead of \$BACKEND_IMAGE — the latter only exists in the .env
+          # file consumed by docker compose, NOT as a shell variable, so
+          # \`set -u\` would trip on it.
+          echo "▶ Pulling $IMAGE_URI"
           docker compose pull backend
 
           echo "▶ Recreating backend container (crm-ui untouched)"
