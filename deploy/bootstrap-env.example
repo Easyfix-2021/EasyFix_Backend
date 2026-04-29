@@ -17,12 +17,20 @@
 
 
 # ────────────────────────────────────────────────────────────────────
-# /opt/easyfix/.env  (chmod 644, no real secrets, build-time / interpolation)
+# /opt/easyfix/.env  (chmod 644, no real secrets, compose interpolation)
 # ────────────────────────────────────────────────────────────────────
+# These two values are AUTO-MANAGED by the GitHub Actions deploy
+# workflows. Don't set them manually — each push to `QA` updates the
+# corresponding line. They're listed here so you know what to expect
+# when inspecting /opt/easyfix/.env on a running box.
+BACKEND_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/backend:qa-<sha>
+CRM_UI_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/crm-ui:qa-<sha>
 
-# Backend URL baked into the CRM-UI bundle at `docker compose build crm-ui`
-# time. Browsers loading the bundle hit this URL. Change → rebuild crm-ui.
-NEXT_PUBLIC_API_URL=http://10.30.2.30:5100/api
+# NEXT_PUBLIC_API_URL is no longer in this file. It's now a GitHub
+# secret (QA_API_URL) that the CRM-UI workflow passes to docker build
+# as a --build-arg. The value gets BAKED into the static JS chunks at
+# build time. To change it: update QA_API_URL in GitHub → re-run the
+# CRM-UI workflow.
 
 
 # ────────────────────────────────────────────────────────────────────

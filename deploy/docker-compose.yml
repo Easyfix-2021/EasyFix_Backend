@@ -1,37 +1,32 @@
 # EasyFix QA stack — runs on the EC2 at /opt/easyfix/docker-compose.yml.
 #
 # This file is the single source of truth for what's running. Both
-# services are defined here; their respective GitHub Actions workflows
-# update the source code on disk + run `docker compose build <service>`
-# followed by `docker compose up -d <service>` over SSM.
+# services pull pre-built images from AWS ECR; the GitHub Actions
+# workflows build + push, then SSM-tell this box to `compose pull`
+# the new tag and recreate the container.
 #
-# Build mode (current): images are built ON the EC2 from cloned repos.
-# Migration target: when ECR is set up later, switch each `build:` block
-# to `image:` and the workflows to docker push. See AWS_QA_BOOTSTRAP.md
-# §"Migrate to ECR (later)" for the recipe.
+# Image tags come from /opt/easyfix/.env (auto-loaded by docker compose):
+#   BACKEND_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/backend:qa-<sha>
+#   CRM_UI_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/crm-ui:qa-<sha>
 #
-# Repository layout assumed on the EC2 (created by bootstrap):
-#   /opt/easyfix/                     ← cwd for docker compose
-#     ├── docker-compose.yml          ← THIS FILE
-#     ├── .env                        ← compose-time vars (NEXT_PUBLIC_API_URL)
-#     ├── backend.env                 ← runtime secrets for the backend container
-#     └── repos/
-#         ├── EasyFix_Backend/        ← git clone, branch QA
-#         └── Easyfix_CRM_UI/         ← git clone, branch QA
+# The workflows update the relevant variable on each deploy via
+# `sed -i` over /opt/easyfix/.env — backend deploys never touch the
+# CRM_UI_IMAGE line and vice versa.
+#
+# ECR pull authenticates via the EC2 instance profile's
+# AmazonEC2ContainerRegistryReadOnly policy + the
+# amazon-ecr-credential-helper installed on the box. No `docker login`
+# is ever required.
 
 services:
   backend:
+    image: ${BACKEND_IMAGE}
     container_name: easyfix-backend
     restart: unless-stopped
-    build:
-      # Path is relative to this docker-compose.yml. The bootstrap clones
-      # the backend repo to /opt/easyfix/repos/EasyFix_Backend.
-      context: ./repos/EasyFix_Backend
-      dockerfile: Dockerfile
     env_file:
-      # Real secrets live HERE on the host filesystem (chmod 600), not
-      # in the image, not in GitHub. Bootstrap creates this from a
-      # template; deploys never touch it.
+      # Real secrets live HERE on the host filesystem (chmod 600).
+      # Managed via deploy/bootstrap-env.sh — never in any image, never
+      # in git, never in GitHub Secrets.
       - /opt/easyfix/backend.env
     ports:
       # host:5100 → container:5100. Tighten to 127.0.0.1:5100 if/when
@@ -52,17 +47,14 @@ services:
         max-file: "5"
 
   crm-ui:
+    image: ${CRM_UI_IMAGE}
     container_name: easyfix-crm-ui
     restart: unless-stopped
-    build:
-      context: ./repos/Easyfix_CRM_UI
-      dockerfile: Dockerfile
-      args:
-        # NEXT_PUBLIC_API_URL is BAKED INTO the static JS chunks at build
-        # time. Compose auto-loads /opt/easyfix/.env for variable
-        # interpolation, so this value comes from there. The Dockerfile
-        # fails the build if this is empty or the placeholder.
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    # NEXT_PUBLIC_API_URL is BAKED INTO the static JS chunks at build
+    # time (in CI, via --build-arg). The container itself doesn't need
+    # any runtime env vars beyond NODE_ENV / PORT, which are set by the
+    # Dockerfile. Don't add an env_file here unless server-side runtime
+    # secrets become a thing (they currently don't).
     environment:
       NODE_ENV: production
       PORT: "5180"
@@ -71,6 +63,8 @@ services:
     networks:
       - easyfix-net
     depends_on:
+      # Soft dep — compose starts backend FIRST so SSR fetches at boot
+      # don't 502.
       backend:
         condition: service_started
     healthcheck:

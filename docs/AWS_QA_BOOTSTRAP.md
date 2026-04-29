@@ -1,9 +1,9 @@
-# AWS QA EC2 — Empty-Box Bootstrap (build-on-EC2 via Docker + SSM)
+# AWS QA EC2 — Empty-Box Bootstrap (CI build → ECR → SSM pull)
 
-**Target host:** `10.30.2.30` — AWS EC2 (Easyfix-qa-appsrv-2)
+**Target host:** `10.30.2.30` — AWS EC2 (Easyfix-qa-appsrv-2, ARM64 Graviton)
 **Hosts:** EasyFix_Backend (port 5100) + Easyfix_CRM_UI (port 5180), both as Docker containers
 **Connectivity from CI:** AWS Systems Manager (SSM) Run-Command
-**Image build:** on the EC2 itself (no ECR for now — see "Migrate to ECR (later)" at the end)
+**Image registry:** AWS ECR — `902810393464.dkr.ecr.ap-south-1.amazonaws.com`
 
 ---
 
@@ -15,384 +15,238 @@ GitHub-hosted runner (public)             AWS                          EC2 (10.3
 git push origin QA
        │
        ▼
-typecheck / node --check (fail-fast)
+typecheck / lint (fail-fast on GH-hosted runner)
        │
        ▼
+docker buildx build (with GHA registry cache)
+       │  --build-arg NEXT_PUBLIC_API_URL=$QA_API_URL   (CRM-UI only)
+       ▼
+docker push ────────────────────────►  ┌──────────────┐
+                                       │     ECR      │
+                                       │  easyfix/    │
+                                       │   backend    │
+                                       │   crm-ui     │
+                                       └──────┬───────┘
+                                              │
 aws ssm send-command ─────────────────► SSM API ────► SSM Agent (long-poll)
                                                           │
                                                           ▼
-                                                  ┌─ git fetch + reset ───────────┐
-                                                  │  in /opt/easyfix/repos/<repo> │
-                                                  ├─ docker compose build <svc> ──┤
-                                                  ├─ docker compose up -d <svc> ──┤
-                                                  └─ wait for HEALTHY status ─────┘
+                                                    sed BACKEND_IMAGE in /opt/easyfix/.env
+                                                    docker compose pull <svc>
+                                                    docker compose up -d --no-deps <svc>
                                                           │
                                                           ▼
-                                                  smoke test via second SSM call
+                                                    ECR pull (auth via instance profile
+                                                              + amazon-ecr-credential-helper)
 ```
 
 **Key properties:**
-- No SSH, no public IP, no inbound port 22.
-- Source code is cloned ON the EC2 (under the deploy user's home), used as
-  the Docker build context. No ECR yet.
-- The two services share `/opt/easyfix/docker-compose.yml`. Each repo's
-  workflow rebuilds + restarts ONLY its own service.
-- App secrets stay on the EC2 in `/opt/easyfix/backend.env`. Never in
-  GitHub, never in the image.
+- **No source code on the EC2** — only the compose file + env files. Source lives in git, image lives in ECR.
+- **No git auth on the EC2** — workflow doesn't clone there. PATs / deploy keys not required.
+- **No inbound SSH** to 10.30.2.30. CI auth is AWS IAM only.
+- Each repo's workflow rebuilds + restarts ONLY its own service. Sibling untouched.
 
 ---
 
 ## Where every env var lives — read this first
 
-This is the model for all configuration. Get it right once, never think
-about it again.
+| Variable kind | Where | When read | Examples |
+|---|---|---|---|
+| Backend runtime secrets | `/opt/easyfix/backend.env` (chmod 600) on EC2 | At container startup, mounted via `env_file:` | `DB_PASSWORD`, `JWT_SECRET`, `MS_GRAPH_*`, `SUITE_URL`, `NOTIFICATIONS_DISABLE` |
+| Image-tag pointers | `/opt/easyfix/.env` (chmod 644) on EC2 | At `docker compose pull/up` time, interpolated by compose | `BACKEND_IMAGE`, `CRM_UI_IMAGE` (workflow-managed — don't edit by hand) |
+| CI build-args (CRM-UI bundle) | **GitHub Environment "Organisation Level Secrets"** | At CI build time, passed as `--build-arg` | `QA_API_URL` → baked into static JS chunks |
+| CI auth + targets | **GitHub Environment "Organisation Level Secrets"** | At CI runtime | `AWS_*`, `QA_INSTANCE_ID`, `ECR_REGISTRY`, `ECR_REPOSITORY_*`, `MAIL_*` |
 
-### Layer 1: GitHub repository secrets
-
-Used **only by the CI runner during the workflow**. Never reach the EC2.
-
-| Secret | Used by | Why it's in GitHub |
-|---|---|---|
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | `aws-actions/configure-aws-credentials` | Auth for `aws ssm send-command` — the CI runner needs this to talk to the SSM API |
-| `QA_INSTANCE_ID` / `PROD_INSTANCE_ID` | `aws ssm send-command --instance-ids` | Which EC2 to target |
-| `MAIL_USERNAME` / `MAIL_PASSWORD` | `dawidd6/action-send-mail` | Failure-alert SMTP credentials |
-
-**That's it.** No DB password, no JWT secret, no `NEXT_PUBLIC_API_URL`,
-no third-party API tokens. Anything an attacker breaching the GitHub
-repo could steal goes one layer down.
-
-### Layer 2: EC2 host filesystem at `/opt/easyfix/`
-
-Used by Docker Compose and the running containers. Never in any image,
-never in any git repo, never in GitHub Secrets.
-
-```
-/opt/easyfix/
-├── docker-compose.yml     ← copied verbatim from EasyFix_Backend/deploy/docker-compose.yml
-├── .env                   ← compose-time vars (auto-loaded by `docker compose`)
-├── backend.env            ← runtime secrets, mounted into the backend container
-└── repos/
-    ├── EasyFix_Backend/   ← git clone, branch QA, Dockerfile is the build context
-    └── Easyfix_CRM_UI/    ← git clone, branch QA, Dockerfile is the build context
-```
-
-**`/opt/easyfix/.env`** — read by `docker compose` for variable
-interpolation in the compose file. The CRM-UI Dockerfile receives
-`NEXT_PUBLIC_API_URL` from this file as a `--build-arg`:
-
-```bash
-# /opt/easyfix/.env  — chmod 644 (no secrets here, just env-specific URLs)
-NEXT_PUBLIC_API_URL=http://10.30.2.30:5100/api
-```
-
-**`/opt/easyfix/backend.env`** — referenced by the backend service via
-`env_file:` in `docker-compose.yml`. Mounted into the container at
-runtime — `dotenv` inside the Node app reads them via `process.env`.
-
-```bash
-# /opt/easyfix/backend.env — chmod 600 (REAL secrets)
-NODE_ENV=production
-PORT=5100
-
-# Database — shared QA easyfix_core
-DB_HOST=111.93.206.91
-DB_PORT=3306
-DB_USER=easyfix_qa
-DB_PASSWORD=...
-DB_NAME=easyfix_core
-
-# JWT — generate fresh, do NOT reuse "esyfixsecret"
-JWT_SECRET=<openssl rand -hex 32>
-JWT_EXPIRY=30d
-
-SUITE_URL=https://suite.1office.in
-
-# Microsoft Graph (email)
-MS_GRAPH_TENANT_ID=...
-MS_GRAPH_CLIENT_ID=...
-MS_GRAPH_CLIENT_SECRET=...
-MS_GRAPH_SENDER_EMAIL=ithelpdesk@easyfix.in
-
-# Provider feature flags (KEEP ON for QA until deliberate cutover)
-NOTIFICATIONS_DISABLE=true
-WEBHOOKS_DISABLE=true
-TEST_EMAILS=harshit@channelplay.in
-```
-
-To **rotate a DB password**: SSH/Session-Manager into the EC2, edit
-`backend.env`, run `docker compose up -d --force-recreate backend`.
-30 sec, no GitHub touched, no redeploy needed.
-
-To **change `NEXT_PUBLIC_API_URL`** (e.g. when DNS changes from IP to
-hostname): edit `/opt/easyfix/.env`, run `docker compose build crm-ui`
-+ `up -d crm-ui`. ~3 min for the rebuild.
-
-### Layer 3: Inside the container
-
-Read by the running app code. Never settable from outside the container
-once it's running.
-
-- **Backend**: `process.env.DB_HOST`, `process.env.JWT_SECRET`, etc. —
-  populated by Compose from `backend.env`.
-- **CRM-UI**: `process.env.NEXT_PUBLIC_API_URL` is BAKED into the static
-  JS chunks at build time. The container itself doesn't see it as a
-  runtime env — it's already inlined into `.next/static/chunks/*.js`.
+App secrets (DB, JWT, etc.) NEVER go into GitHub. CI auth secrets (AWS keys, etc.) NEVER go onto the EC2. Each surface owns one concern.
 
 ---
 
-## Prerequisites (one-time, AWS Console)
+## Prerequisites — already done by DevOps (recap)
 
-### 1. EC2 instance settings
+✅ ECR repos created:
+- `902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/backend`
+- `902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/crm-ui`
 
-| Setting | Value | Why |
+✅ EC2 instance profile policies attached:
+- `AmazonSSMManagedInstanceCore`
+- `AmazonEC2ContainerRegistryReadOnly`
+
+✅ IAM user `github-actions-deploy` policy includes:
+- `ssm:SendCommand`, `ssm:GetCommandInvocation` on the QA instance ARN
+- `ecr:GetAuthorizationToken` (resource: *)
+- `ecr:BatchCheckLayerAvailability`, `ecr:GetDownloadUrlForLayer`, `ecr:BatchGetImage`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage` on the two repo ARNs
+
+---
+
+## GitHub Environment "Organisation Level Secrets" — add secrets
+
+The current setup uses a **single org-level environment named
+"Organisation Level Secrets"** that both repos pull from. That works
+for now since only QA exists; when Production lands you can either
+(a) add a separate environment ("Production Level Secrets" or similar)
+or (b) keep one environment and prefix the secret names with `PROD_*`
+to disambiguate. Either model is compatible with the workflows below.
+
+Configure under: **Repo → Settings → Environments → Organisation Level
+Secrets → Add secret**.
+
+| Secret | Status | Value |
 |---|---|---|
-| AMI | Ubuntu 22.04 LTS or Amazon Linux 2023 | Both ship `ssm-agent` (or available via snap on Ubuntu) |
-| Instance type | `t3.medium` (2 vCPU, 4 GiB) | Building Next.js images peaks at ~1.5 GB |
-| Disk | 30 GiB gp3 | Docker layer cache + build cache + git history |
-| **IAM instance profile** | **`AmazonSSMManagedInstanceCore`** | Lets SSM agent register with AWS |
-| Security group, inbound | 5100/tcp + 5180/tcp from internal CIDR | VPN clients reach the apps |
-| Public IP / EIP | Not required | All CI traffic via SSM API |
+| `AWS_ACCESS_KEY_ID` | ✓ | from `github-actions-deploy` IAM user |
+| `AWS_SECRET_ACCESS_KEY` | ✓ | pair to above |
+| `AWS_REGION` | ✓ | `ap-south-1` |
+| `QA_INSTANCE_ID` | ✓ | `i-032aa9d2942305364` |
+| `ECR_REGISTRY` | **add** | `902810393464.dkr.ecr.ap-south-1.amazonaws.com` |
+| `ECR_REPOSITORY_BACKEND` | **add (backend repo only)** | `easyfix/backend` |
+| `ECR_REPOSITORY_CRM_UI` | **add (CRM-UI repo only)** | `easyfix/crm-ui` |
+| `QA_API_URL` | ✓ already there — keep it | `http://10.30.2.30:5100/api` (baked into the CRM-UI bundle at CI build time) |
+| `MAIL_USERNAME` | optional | Gmail address for failure-alert emails |
+| `MAIL_PASSWORD` | optional | Gmail app password |
 
-### 2. IAM user for GitHub Actions
-
-Create `github-actions-deploy` with this least-privilege policy.
-Replace `<region>`, `<acct>`, and the instance IDs:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "RunShellScriptOnDeployTargets",
-      "Effect": "Allow",
-      "Action": ["ssm:SendCommand"],
-      "Resource": [
-        "arn:aws:ec2:<region>:<acct>:instance/i-<qa-id>",
-        "arn:aws:ec2:<region>:<acct>:instance/i-<prod-id>",
-        "arn:aws:ssm:<region>:*:document/AWS-RunShellScript"
-      ]
-    },
-    {
-      "Sid": "ReadCommandResults",
-      "Effect": "Allow",
-      "Action": ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"],
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-Generate an access-key pair (IAM → Users → Security credentials →
-"Application running outside AWS"). Save the secret — only displays once.
-
-### 3. GitHub repository secrets (in BOTH repos)
-
-| Secret | Value |
-|---|---|
-| `AWS_ACCESS_KEY_ID` | from §2 |
-| `AWS_SECRET_ACCESS_KEY` | from §2 |
-| `AWS_REGION` | `ap-south-1` |
-| `QA_INSTANCE_ID` | `i-032aa9d2942305364` |
-| `PROD_INSTANCE_ID` | (when prod is provisioned) |
-| `MAIL_USERNAME` / `MAIL_PASSWORD` | Gmail SMTP for failure alerts |
-
-Notably **NOT** in GitHub Secrets:
-- DB password, JWT secret, MS Graph creds → `/opt/easyfix/backend.env`
-- `NEXT_PUBLIC_API_URL` → `/opt/easyfix/.env`
+`PROD_*` equivalents come later when prod EC2 is provisioned.
 
 ---
 
 ## One-time server bootstrap
 
-Connect via **AWS Console → EC2 → Instances → Connect → Session Manager
-→ Connect**. Browser-based root shell, no SSH key needed.
+Connect via **AWS Console → EC2 → Instances → select instance → Connect → Session Manager → Connect**. Browser-based root shell, no SSH key needed.
 
-### A. Confirm SSM agent
+### A. Confirm SSM agent and Docker
 
 ```bash
 sudo -i
 systemctl status snap.amazon-ssm-agent.amazon-ssm-agent.service | head -5
-# (or: systemctl status amazon-ssm-agent | head -5 if installed via .deb)
-```
-
-If missing: `snap install amazon-ssm-agent --classic`.
-
-Verify SSM has registered the box: AWS Console → Systems Manager →
-Fleet Manager — your instance shows green "Online".
-
-### B. Install Docker + Compose plugin + git
-
-Ubuntu 22.04:
-
-```bash
-apt-get update
-apt-get install -y ca-certificates curl git
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-chmod a+r /etc/apt/keyrings/docker.asc
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-  https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
-  > /etc/apt/sources.list.d/docker.list
-apt-get update
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-systemctl enable --now docker
 docker --version
 docker compose version
-git --version
 ```
 
-Amazon Linux 2023:
+All three should show "active" / version output. (If Docker isn't installed yet, see legacy install instructions in git history of this doc — should be done already.)
+
+### B. Install the ECR credential helper
+
+This lets `docker pull` from ECR using the EC2 instance profile credentials — no `docker login` required:
 
 ```bash
-dnf install -y docker git
-systemctl enable --now docker
-mkdir -p /usr/libexec/docker/cli-plugins
-curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m) \
-  -o /usr/libexec/docker/cli-plugins/docker-compose
-chmod +x /usr/libexec/docker/cli-plugins/docker-compose
-docker compose version
+apt-get install -y amazon-ecr-credential-helper
+
+mkdir -p /root/.docker
+cat > /root/.docker/config.json <<'EOF'
+{
+  "credHelpers": {
+    "902810393464.dkr.ecr.ap-south-1.amazonaws.com": "ecr-login"
+  }
+}
+EOF
+
+# Verify auth works (pulls a test image — should NOT prompt for credentials):
+docker pull 902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/backend:nonexistent 2>&1 | head -3
+# Expected: "manifest unknown" or "not found" — that means AUTH succeeded
+# but the tag doesn't exist yet (because no workflow has pushed). If you
+# get "no basic auth credentials" or "denied: ... no identity" instead,
+# the credential helper isn't wired up correctly.
 ```
 
-### C. Create the deploy user (no manual repo clone needed)
+### C. Create the deploy directory + bootstrap files
 
 ```bash
-# Deploy user — NOT in sudoers, minimal privilege. The workflow itself
-# clones the repos on first push (self-healing — see step F).
-useradd -m -s /bin/bash easyfix-deploy
-
-# Pre-create the directory the workflow will clone INTO.
-mkdir -p /opt/easyfix/repos
-chown -R easyfix-deploy:easyfix-deploy /opt/easyfix/repos
+mkdir -p /opt/easyfix
+cd /opt/easyfix
 ```
 
-If the repos are **private**, set up a fine-grained PAT once so future
-deploys can clone (and any subsequent `git fetch` works automatically).
-The token never appears in GitHub Actions logs — it lives only on the EC2.
+**Drop in the compose file** (one-time fetch from the repo):
 
 ```bash
-# Fine-grained PAT with read access to the org's repos. Generate at:
-# GitHub → Settings → Developer settings → Personal access tokens (fine-grained)
-# Permissions: Repository → Contents (Read-only) on the two repos.
-sudo -iu easyfix-deploy bash -c '
-  git config --global credential.helper store
-  echo "https://<github-user>:<github-pat>@github.com" > ~/.git-credentials
-  chmod 600 ~/.git-credentials
-'
+curl -fsSL \
+  https://raw.githubusercontent.com/Easyfix2021/EasyFix_Backend/QA/deploy/docker-compose.yml \
+  -o /opt/easyfix/docker-compose.yml
+chown root:root /opt/easyfix/docker-compose.yml
+chmod 644 /opt/easyfix/docker-compose.yml
 ```
 
-If repos are public, skip the PAT step entirely.
+(If the repo is private, prepend `-H "Authorization: Bearer <github-pat>"` to the curl. The PAT is only used for THIS one-time fetch — never again.)
 
-### D. Bootstrap env files via the interactive script
-
-The repo ships an interactive script that prompts for one env var at a
-time, figures out which file it belongs in (`.env` for build-args,
-`backend.env` for runtime secrets), and auto-restarts the affected
-Docker container after every change.
-
-**First-time setup** — until the GH Actions workflow has cloned the
-repo onto the EC2, fetch the script directly. Then run it once per
-expected env var (see `deploy/bootstrap-env.example` for the full list):
+**Create the bootstrap `.env`** with placeholder image tags so compose can parse the file before the first deploy populates real ones:
 
 ```bash
-# Fetch the script. Public repos:
+cat > /opt/easyfix/.env <<'EOF'
+# Auto-managed by GitHub Actions — do not edit manually.
+# First deploy from each repo overwrites the corresponding line with
+# the real qa-<sha> tag.
+BACKEND_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/backend:qa-latest
+CRM_UI_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/crm-ui:qa-latest
+EOF
+chmod 644 /opt/easyfix/.env
+```
+
+These point at `:qa-latest` initially. The first workflow push from each repo replaces them with `:qa-<sha>` for deterministic deploys.
+
+### D. Bootstrap backend runtime secrets
+
+Fetch the env-bootstrap script and run it interactively to populate `/opt/easyfix/backend.env`:
+
+```bash
 curl -fsSL \
   https://raw.githubusercontent.com/Easyfix2021/EasyFix_Backend/QA/deploy/bootstrap-env.sh \
   -o /tmp/bootstrap-env.sh
 
-# (Private repos: prepend  -H "Authorization: Bearer <github-pat>"  to the curl.)
-
-chmod +x /tmp/bootstrap-env.sh
-
-# Reference list of expected vars — fetch + read it for the full checklist:
-curl -fsSL \
-  https://raw.githubusercontent.com/Easyfix2021/EasyFix_Backend/QA/deploy/bootstrap-env.example \
-  | less
-
-# Run the interactive script ONCE PER VAR (prompts for key, file, value,
-# confirmation, then auto-restarts whichever container needs the change).
 sudo bash /tmp/bootstrap-env.sh
-
-# After the first GH Actions deploy clones the repo, run from the local
-# copy on every subsequent edit:
-sudo bash /opt/easyfix/repos/EasyFix_Backend/deploy/bootstrap-env.sh
 ```
 
-**Interactive flow example** (rotating the DB password):
+The script prompts for one var at a time. Reference list (matches `deploy/bootstrap-env.example`):
 
-```
-$ sudo bash /opt/easyfix/repos/EasyFix_Backend/deploy/bootstrap-env.sh
-
-EasyFix env-var manager
-
-  ● compose / build-args (.env)         /opt/easyfix/.env  (1 keys)
-  ● backend runtime secrets (backend.env)  /opt/easyfix/backend.env  (12 keys)
-
-Env var KEY: DB_PASSWORD
-
-'DB_PASSWORD' currently exists in:
-  • /opt/easyfix/backend.env       value: *** (24 chars, masked)
-
-What do you want to do?
-  1) Update its value in backend.env
-  2) Also add to .env
-  3) Cancel
-Choice [1]: 1
-
-New value for DB_PASSWORD (input hidden):
-Confirm value:
-
-About to update:
-  Key:   DB_PASSWORD
-  File:  /opt/easyfix/backend.env
-  Value: *** (28 chars, masked)
-
-Proceed? [y/N] y
-✓ Wrote DB_PASSWORD to /opt/easyfix/backend.env
-
-Refresh affected docker container(s) now? [y/N] y
-backend.env changed → recreating backend container
-[+] Running 1/1
- ✔ Container easyfix-backend  Started
-✓ Done
-```
-
-**What the script handles automatically:**
-
-| Change | Auto-action |
+| KEY | Value example |
 |---|---|
-| Edit any var in `backend.env` | `docker compose up -d --force-recreate backend` |
-| Edit `NEXT_PUBLIC_*` in `.env` | `docker compose build crm-ui && up -d crm-ui` (build-time bake) |
-| Edit other var in `.env` | Prompts which service(s) to refresh |
-| Add a brand-new var | Asks which file, then proceeds as above |
+| `DB_HOST` | `111.93.206.91` |
+| `DB_PORT` | `3306` |
+| `DB_USER` | `easyfix_qa` |
+| `DB_PASSWORD` | (the real password — input is masked) |
+| `DB_NAME` | `easyfix_core` |
+| `JWT_SECRET` | run `openssl rand -hex 32` to generate |
+| `JWT_EXPIRY` | `30d` |
+| `SUITE_URL` | `https://suite.1office.in` |
+| `MS_GRAPH_TENANT_ID` | (from Azure app reg) |
+| `MS_GRAPH_CLIENT_ID` | (from Azure app reg) |
+| `MS_GRAPH_CLIENT_SECRET` | (from Azure app reg) |
+| `MS_GRAPH_SENDER_EMAIL` | `ithelpdesk@easyfix.in` |
+| `NOTIFICATIONS_DISABLE` | `true` (KEEP for QA) |
+| `WEBHOOKS_DISABLE` | `true` (KEEP for QA) |
+| `TEST_EMAILS` | `harshit@channelplay.in` |
 
-**Permissions** are enforced automatically — `backend.env` stays at 600,
-`.env` at 644, both owned by root. Values for `backend.env` are entered
-masked (no echo to terminal); displayed values are also masked.
+Each one goes into `backend.env` (option 2 when prompted).
 
-For the **first-time bulk setup**, just run the script once per key from
-the reference list. Takes ~5 minutes for the ~12 backend.env keys + 1
-.env key.
+When the script asks "Apply refreshes now?" — **answer `n`**. The
+containers don't exist yet; the first GH Actions deploy creates them
+and they'll pick up `backend.env` at first start.
 
-### E. First deploy — kick it from GitHub
+### E. Push to GitHub — trigger first deploy
 
-The workflow handles everything else: clones the repos under
-`/opt/easyfix/repos/` (using the PAT from §C if private), drops the
-compose file into `/opt/easyfix/` if missing, builds the Docker image,
-and starts the container.
-
-On your laptop:
+On your laptop (do BACKEND first so the workflow doesn't try to update an image tag for a missing line):
 
 ```bash
-git checkout -b QA
-git push -u origin QA
+# Backend
+cd EasyFix_Backend
+git checkout QA && git push -u origin QA
+
+# Wait for that workflow to finish, then:
+
+# CRM-UI
+cd ../Easyfix_CRM_UI
+git checkout QA && git push -u origin QA
 ```
 
-Watch **GitHub → Actions → Deploy Backend (build-on-EC2 via SSM)**.
-The first push from each repo runs the typecheck on the GH runner, then
-SSM-runs the rebuild on the EC2 (~30 sec warm because the bootstrap
-already populated Docker's layer cache). On any failure, an email lands
-at `harshit@channelplay.in`.
+Watch each at **GitHub → Actions**.
+
+What happens for backend (~3 min cold, ~30 sec warm):
+1. GH-hosted runner: lints + node-checks (~30 sec).
+2. `docker buildx build` → tags `qa-<sha>` and `qa-latest` → pushes both to ECR.
+3. SSM-sends a script to `i-032aa9d2942305364`:
+   - Sets `BACKEND_IMAGE` in `/opt/easyfix/.env` to the new SHA tag.
+   - `docker compose pull backend` (auth via instance profile + cred helper).
+   - `docker compose up -d --no-deps --force-recreate backend`.
+   - Polls HEALTHCHECK until "healthy".
+4. Smoke test via second SSM call: `curl 127.0.0.1:5100/api/health`.
+
+CRM-UI flow is identical, ~5 min cold (the Next.js build dominates), but builds happen in CI now so the EC2 just pulls.
 
 ---
 
@@ -401,16 +255,16 @@ at `harshit@channelplay.in`.
 | Task | How |
 |---|---|
 | Deploy a change | `git push origin QA` |
-| Manually redeploy | GitHub → Actions → Run workflow → pick QA |
-| Tail backend logs | `docker logs -f easyfix-backend` (Session Manager into EC2 first) |
+| Manually redeploy without a commit | GitHub → Actions → Run workflow → pick QA |
+| Rollback to a specific image | Session Manager → `vi /opt/easyfix/.env` → set `BACKEND_IMAGE=...:qa-<old-sha>` → `docker compose up -d --force-recreate backend` |
+| Tail backend logs | Session Manager → `docker logs -f easyfix-backend` |
 | Tail CRM-UI logs | `docker logs -f easyfix-crm-ui` |
-| Rotate / update any env var (DB password, JWT, NEXT_PUBLIC_API_URL, anything) | `sudo bash /opt/easyfix/repos/EasyFix_Backend/deploy/bootstrap-env.sh` — prompts for key, takes new value (masked for secrets), auto-restarts affected container |
-| Add a brand-new env var | Same script — when the key isn't found, asks which file (`.env` or `backend.env`) it should go into |
-| Inspect what's currently set | `sudo bash /opt/easyfix/repos/EasyFix_Backend/deploy/bootstrap-env.sh` — top of output shows file paths + key counts. For a key-by-key list: `sudo grep -h '^[A-Z_].*=' /opt/easyfix/.env /opt/easyfix/backend.env \| cut -d= -f1` (keys only — won't print secrets) |
-| Roll back to a specific commit | `git -C /opt/easyfix/repos/EasyFix_Backend reset --hard <sha>` then `cd /opt/easyfix && docker compose up -d --build backend` |
-| Recover from a broken image | `docker compose down backend && docker compose up -d backend` (force a fresh build) |
-| Wipe stale build layers | `docker builder prune -af` (the workflow does this automatically with `--keep-storage 2GB`) |
-| See SSM history | AWS Console → Systems Manager → Run Command → Command history |
+| Rotate a backend secret | Run the env script: `sudo bash /tmp/bootstrap-env.sh` (or fetch fresh — see below). Pick KEY → enter new value → confirm → it auto-restarts the backend container |
+| Change `NEXT_PUBLIC_API_URL` (the only build-time UI var) | GitHub → Environment "Organisation Level Secrets" → edit `QA_API_URL` → re-run CRM-UI workflow. Editing `/opt/easyfix/.env` does NOTHING — value is already baked into the bundle |
+| List images in ECR | AWS Console → ECR → easyfix/backend (or crm-ui) → see all qa-* tags + their push dates |
+| Refetch the env-bootstrap script | `curl -fsSL https://raw.githubusercontent.com/Easyfix2021/EasyFix_Backend/QA/deploy/bootstrap-env.sh -o /tmp/bootstrap-env.sh && sudo bash /tmp/bootstrap-env.sh` |
+| See SSM history | AWS Console → Systems Manager → Run Command → Command history (filter by instance) |
+| Full audit log | CloudTrail — every `ssm:SendCommand`, every ECR push/pull |
 
 ---
 
@@ -418,53 +272,24 @@ at `harshit@channelplay.in`.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Workflow fails at "Configure AWS credentials" | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` missing | Re-create or paste the secrets correctly |
-| SSM command fails with `InvalidInstanceId` | EC2 instance profile missing `AmazonSSMManagedInstanceCore`, or agent not running | Attach the policy + restart `snap.amazon-ssm-agent.amazon-ssm-agent.service` |
-| `docker compose build` fails on the EC2 with permission denied | `docker.sock` access — `sudo` is needed (the workflow runs as root via SSM, so this is rare; only an issue if you try compose commands as `easyfix-deploy`) | The workflow runs as root deliberately. Manual commands need `sudo` |
-| CRM-UI builds but every API call goes to localhost | `NEXT_PUBLIC_API_URL` missing / wrong in `/opt/easyfix/.env` | Both the workflow AND the Dockerfile guard against empty values now. If it still slipped through, re-check the file and rebuild |
-| Smoke test "Connection refused" on 5100 | Container crashed on startup | `docker logs easyfix-backend` — usually a missing env var in `backend.env` |
-| Disk filling up with old build layers | Builder cache | Workflow runs `docker builder prune --keep-storage 2GB` automatically. Manual: `docker builder prune -af` |
-| `git fetch` fails with "Authentication failed" | Private repo, no PAT configured | See §C — set up `~/.git-credentials` for `easyfix-deploy` |
+| Workflow fails at "configure-aws-credentials" with `Input required and not supplied: aws-region` | The job is missing `environment: QA` (org-level secrets aren't reachable without it) | Already added in current workflow. Confirm the env name in GitHub is exactly `QA` (case-sensitive). |
+| Workflow fails at "Build & push to ECR" with `RepositoryNotFoundException` | ECR repo doesn't exist OR `ECR_REPOSITORY_*` secret has a typo | Verify repo names match exactly: `easyfix/backend`, `easyfix/crm-ui` |
+| `docker pull` on EC2 returns "no basic auth credentials" | Credential helper not installed or `~/.docker/config.json` wrong | See §B. Test with `docker pull <ecr-uri>:nonexistent`; should say "manifest unknown" not "no basic auth" |
+| `compose up` says "image not found" but ECR has the tag | Instance profile missing `AmazonEC2ContainerRegistryReadOnly` | AWS Console → EC2 → IAM role → Add policy |
+| CRM-UI loads but every API call goes to localhost | `QA_API_URL` empty when image was built — workflow's "Validate API URL" step should catch this; if it slipped through, image was built with placeholder | Set `QA_API_URL` correctly in GH → re-run CRM-UI workflow |
+| Smoke test fails: connection refused on 5100 | Container crashed on startup — usually a missing env var in `backend.env` | `docker logs easyfix-backend` |
+| Disk filling up | Old ECR-pulled images | Workflow auto-prunes (`docker image prune --filter "until=72h"`). Manual: `docker image prune -af` |
 
 ---
 
-## Migrate to ECR (later)
+## Why this architecture
 
-Once DevOps has provisioned ECR repositories and is ready to ship to a
-proper registry, the migration is small:
-
-1. **AWS side**: create `easyfix/backend` and `easyfix/crm-ui` ECR repos.
-   Attach `AmazonEC2ContainerRegistryReadOnly` to the EC2 instance profile.
-   Add `ecr:*` permissions to the deploy IAM user (see commit history of
-   this doc — `ecr` block lived in §2 before the build-on-EC2 pivot).
-
-2. **Workflows**: re-add the `Build & push to ECR` job. Switch the SSM
-   command from `docker compose build` → `docker compose pull`.
-
-3. **Compose file**: swap each `build:` block for `image: ${BACKEND_IMAGE}`
-   and `image: ${CRM_UI_IMAGE}`. Track the image tags via `BACKEND_IMAGE` /
-   `CRM_UI_IMAGE` entries in `/opt/easyfix/.env` that the workflow updates
-   on each deploy.
-
-4. **EC2**: install `amazon-ecr-credential-helper` so `docker pull` from
-   ECR works without explicit login.
-
-The Dockerfiles themselves don't change — they build the same way
-locally, on the EC2, or in CI. The migration takes ~30 minutes total.
-
----
-
-## Why this architecture (current vs ECR target)
-
-| Concern | Current (build-on-EC2) | After ECR migration |
-|---|---|---|
-| Source code on EC2 | Yes — needed as Docker build context | No — pulled image is enough |
-| Image registry cost | Zero | Small (ECR storage + transfer) |
-| CI build time | Lower (no push step) | Lower still (cache reuse across deploys) |
-| Audit trail | Git log on the EC2 | Git log + ECR image manifest history |
-| Multi-host scaling | Hard (each host re-builds) | Trivial (each host pulls the same image) |
-| Rollback | `git reset --hard <sha>` + rebuild | Update tag in `.env` + `compose pull` |
-
-For one EC2 with two services and a small team, build-on-EC2 is
-operationally simpler. ECR pays off when there are 2+ EC2s or a need
-for immutable, signed image artefacts.
+| Concern | Resolved by |
+|---|---|
+| Source code on EC2 | None — image-only deploy |
+| Build tools on EC2 | None — `docker pull` only, no node, no npm, no git |
+| Build cache | Lives in GH Actions registry cache; persists across runs |
+| Multi-host scaling later | Trivial — second EC2 just `docker compose pull`s the same image |
+| Audit | Git log + ECR image manifest history + CloudTrail SSM logs |
+| Rollback | Update `BACKEND_IMAGE` in `/opt/easyfix/.env` to an older `qa-<sha>` tag, run `compose up -d` — instant |
+| Image promotion to prod (future) | Re-tag the same QA image as `prod-<sha>` in ECR; prod EC2 pulls. No rebuild. |

@@ -188,6 +188,25 @@ one_round() {
     return 1
   fi
 
+  # Workflow-owned keys — refuse to manage them here.
+  # BACKEND_IMAGE / CRM_UI_IMAGE are bumped by the GitHub Actions deploy
+  # script on every push. NEXT_PUBLIC_API_URL is now a GitHub secret
+  # (QA_API_URL) baked into the CRM-UI bundle at CI build time — changing
+  # it on the box does nothing.
+  case "$KEY" in
+    BACKEND_IMAGE|CRM_UI_IMAGE)
+      err "$KEY is managed by the GitHub Actions deploy workflow — do not set manually."
+      err "  Each deploy from the corresponding repo updates this automatically."
+      return 1
+      ;;
+    NEXT_PUBLIC_API_URL)
+      err "$KEY is now baked into the CRM-UI bundle at CI build time."
+      err "  To change it: update the QA_API_URL secret in GitHub → re-run the CRM-UI workflow."
+      err "  Editing it on the EC2 has no effect — the bundle was built with the old value."
+      return 1
+      ;;
+  esac
+
   key_in_file "$KEY" "$ENV_PUBLIC" && EXISTING_FILES+=("$ENV_PUBLIC")
   key_in_file "$KEY" "$ENV_SECRET" && EXISTING_FILES+=("$ENV_SECRET")
 
