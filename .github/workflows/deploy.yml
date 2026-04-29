@@ -80,14 +80,15 @@ jobs:
     # `environment:` makes org-level environment secrets resolvable in
     # this job. Without it, `secrets.AWS_REGION` is empty.
     environment: 'Organisation Level Secrets'
-    # NOTE: we deliberately do NOT pass `instance_id` as a job output —
-    # GitHub Actions scrubs secret values from job-output strings as a
-    # safety feature, so the deploy job would receive an empty string.
-    # Instead, both jobs read `secrets.QA_INSTANCE_ID` directly. Each
-    # job already declares `environment:`, so the secret resolves in
-    # both. Only env_name (non-secret) is passed across.
+    # NOTE: we deliberately do NOT pass `instance_id` OR `image_uri` as
+    # job outputs — GitHub Actions scrubs ANY string that contains a
+    # secret value (here: ECR_REGISTRY, ECR_REPOSITORY_BACKEND) when it
+    # crosses a job boundary, even via outputs. Symptom: deploy job sees
+    # empty string. Workaround: pass only the non-secret pieces (env_name,
+    # image_tag) across. Each job declares `environment:`, so secrets
+    # resolve directly inside each job that needs them.
     outputs:
-      image_uri:   ${{ steps.meta.outputs.image_uri }}
+      image_tag:   ${{ steps.meta.outputs.image_tag }}
       env_name:    ${{ steps.target.outputs.env_name }}
     steps:
       - uses: actions/checkout@v4
@@ -134,6 +135,9 @@ jobs:
           fi
 
           SHA_TAG="${ENV_NAME}-${GITHUB_SHA::7}"
+          # image_tag is non-secret (just env name + sha) — safe to pass
+          # across jobs. Full URIs stay job-local to avoid secret scrubbing.
+          echo "image_tag=${SHA_TAG}"                              >> "$GITHUB_OUTPUT"
           echo "image_uri=${REGISTRY}/${REPO}:${SHA_TAG}"          >> "$GITHUB_OUTPUT"
           echo "moving_uri=${REGISTRY}/${REPO}:${ENV_NAME}-latest" >> "$GITHUB_OUTPUT"
 
@@ -205,8 +209,22 @@ jobs:
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
-          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
           ENV_NAME="${{ needs.build-and-push.outputs.env_name }}"
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+
+          # Reconstruct the full ECR URI from secrets HERE (in this job).
+          # We can't pass image_uri as a job output: GitHub scrubs any
+          # string that contains a secret value, so it would arrive empty.
+          # `environment:` on this job means the registry/repo secrets
+          # resolve directly. image_tag (env-name + sha) is non-secret and
+          # safe to inherit from the build job.
+          REGISTRY="${{ secrets.ECR_REGISTRY }}"
+          REPO="${{ secrets.ECR_REPOSITORY_BACKEND }}"
+          if [[ -z "$REGISTRY" || -z "$REPO" ]]; then
+            echo "::error::ECR secrets missing — confirm ECR_REGISTRY + ECR_REPOSITORY_BACKEND in the 'Organisation Level Secrets' environment"
+            exit 1
+          fi
+          IMAGE_URI="${REGISTRY}/${REPO}:${IMAGE_TAG}"
 
           if [[ -z "$INSTANCE_ID" ]]; then
             echo "::error::INSTANCE_ID secret missing for $ENV_NAME — confirm QA_INSTANCE_ID exists in the 'Organisation Level Secrets' environment"
@@ -368,7 +386,7 @@ jobs:
           body: |
             Backend deploy FAILED.
 
-            Image:    ${{ needs.build-and-push.outputs.image_uri }}
+            Image:    ${{ needs.build-and-push.outputs.image_tag }}
             Instance: ${{ steps.target.outputs.instance_id }}
             Branch:   ${{ github.ref_name }}
             Commit:   ${{ github.sha }}
