@@ -237,12 +237,15 @@ jobs:
           EOF
           )
 
-          # AWS-RunShellScript runs each command via /bin/sh, which on
-          # Ubuntu/Debian is dash. Our script uses bash-isms ([[ ]],
-          # process substitution implied later, etc.). Wrap the whole
-          # thing in a `bash -c` invocation so it runs under bash.
-          # Fixes: "[[: not found" + "parameter not set" cascade errors.
-          PARAMS_JSON=$(jq -n --arg cmd "$REMOTE_SCRIPT" '{commands: ["bash -c \($cmd | @json)"]}')
+          # AWS-RunShellScript runs commands via /bin/sh = dash on Ubuntu,
+          # which doesn't speak `[[ ]]`. We wrap in bash, but quoting a
+          # multi-line script through JSON → SSM agent → sh → bash mangles
+          # newlines (they arrive as literal `\n`, collapsing the whole
+          # script onto one line). Base64 transport avoids every escape
+          # layer: encode here, pipe through `base64 -d | bash` on the box.
+          SCRIPT_B64=$(printf '%s' "$REMOTE_SCRIPT" | base64 -w0)
+          PARAMS_JSON=$(jq -n --arg b64 "$SCRIPT_B64" \
+            '{commands: ["echo \($b64) | base64 -d | bash"]}')
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
@@ -293,7 +296,9 @@ jobs:
             if [[ $ok -eq 0 ]]; then echo "✗ ${path} never returned 2xx"; exit 1; fi
           done'
 
-          PARAMS_JSON=$(jq -n --arg cmd "$SMOKE_SCRIPT" '{commands: ["bash -c \($cmd | @json)"]}')
+          SCRIPT_B64=$(printf '%s' "$SMOKE_SCRIPT" | base64 -w0)
+          PARAMS_JSON=$(jq -n --arg b64 "$SCRIPT_B64" \
+            '{commands: ["echo \($b64) | base64 -d | bash"]}')
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
