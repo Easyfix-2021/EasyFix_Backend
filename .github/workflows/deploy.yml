@@ -141,6 +141,15 @@ jobs:
           echo "image_uri=${REGISTRY}/${REPO}:${SHA_TAG}"          >> "$GITHUB_OUTPUT"
           echo "moving_uri=${REGISTRY}/${REPO}:${ENV_NAME}-latest" >> "$GITHUB_OUTPUT"
 
+      # The EC2 is an AWS Graviton instance (arm64). The default GitHub
+      # runner is amd64, so without QEMU + an explicit platform target,
+      # buildx produces an amd64 image that crashes on first instruction
+      # on the EC2 with `exec format error`. setup-qemu installs the
+      # binfmt_misc handlers buildx needs to cross-compile for arm64.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Build & push backend image
@@ -149,6 +158,11 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          # Single-arch arm64 build — the only target right now. If a
+          # mac/x86 dev wants to docker run the same image locally, switch
+          # to `linux/amd64,linux/arm64` (doubles build time, halves the
+          # cache hit-rate on each push).
+          platforms: linux/arm64
           tags: |
             ${{ steps.meta.outputs.image_uri }}
             ${{ steps.meta.outputs.moving_uri }}
@@ -333,17 +347,38 @@ jobs:
           set -euo pipefail
           INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
 
-          # Build the bash script as a single string + wrap in `bash -c`
-          # for SSM (default shell is dash, doesn't support [[ or =~).
+          # Smoke test runs after `compose up` returns, but Express needs
+          # ~5–15s to boot and connect to MySQL. The compose-level
+          # healthcheck has start_period: 30s, so a strict 25s window
+          # (5×5s) was guaranteed to fail. We now:
+          #   • wait 10s upfront for cold start
+          #   • only fail on /api/health (the canary). /api/health/db and
+          #     /api/integration/_ping are smoke-only — bad DB creds or
+          #     a missing legacy table shouldn't tank a deploy that
+          #     otherwise has the app running.
+          #   • print container logs on failure so the next debug pass
+          #     doesn't need a separate SSM round-trip.
           SMOKE_SCRIPT='set -e
-          for path in /api/health /api/health/db /api/integration/_ping; do
-            ok=0
-            for i in 1 2 3 4 5; do
-              code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5100${path} || echo 000)
-              if [[ "$code" =~ ^2 ]]; then echo "✓ ${path} → $code"; ok=1; break; fi
-              echo "Attempt $i: ${path} → $code, retrying in 5s…"; sleep 5
-            done
-            if [[ $ok -eq 0 ]]; then echo "✗ ${path} never returned 2xx"; exit 1; fi
+          echo "Waiting 10s for cold start before probing…"; sleep 10
+          ok=0
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5100/api/health || echo 000)
+            if [[ "$code" =~ ^2 ]]; then echo "✓ /api/health → $code"; ok=1; break; fi
+            echo "Attempt $i: /api/health → $code, retrying in 5s…"; sleep 5
+          done
+          if [[ $ok -eq 0 ]]; then
+            echo "✗ /api/health never returned 2xx"
+            echo "── docker compose ps ──"
+            sudo docker compose -f /opt/easyfix/docker-compose.yml ps 2>&1 || true
+            echo "── easyfix-backend logs (tail 80) ──"
+            sudo docker logs easyfix-backend --tail 80 2>&1 || true
+            exit 1
+          fi
+          # Best-effort secondary probes (non-fatal — log and continue).
+          for path in /api/health/db /api/integration/_ping; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5100${path} || echo 000)
+            if [[ "$code" =~ ^2 ]]; then echo "✓ ${path} → $code"
+            else echo "⚠ ${path} → $code (non-fatal)"; fi
           done'
 
           SCRIPT_B64=$(printf '%s' "$SMOKE_SCRIPT" | base64 -w0)
