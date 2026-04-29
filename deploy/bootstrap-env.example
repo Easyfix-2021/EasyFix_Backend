@@ -1,0 +1,60 @@
+# ============================================================================
+# bootstrap-env.example — REFERENCE LIST of every env var the EasyFix
+# stack expects on the EC2.
+#
+# This file is NOT consumed by any script — it's documentation. To add /
+# update a value, run the interactive script:
+#
+#     sudo bash /opt/easyfix/repos/EasyFix_Backend/deploy/bootstrap-env.sh
+#
+# The script prompts for one key at a time, asks which file it belongs
+# in, takes the value (masked for secrets), then auto-restarts the
+# affected container.
+#
+# Use this file as a checklist: for a fresh EC2, run the script once
+# per key listed below.
+# ============================================================================
+
+
+# ────────────────────────────────────────────────────────────────────
+# /opt/easyfix/.env  (chmod 644, no real secrets, build-time / interpolation)
+# ────────────────────────────────────────────────────────────────────
+
+# Backend URL baked into the CRM-UI bundle at `docker compose build crm-ui`
+# time. Browsers loading the bundle hit this URL. Change → rebuild crm-ui.
+NEXT_PUBLIC_API_URL=http://10.30.2.30:5100/api
+
+
+# ────────────────────────────────────────────────────────────────────
+# /opt/easyfix/backend.env  (chmod 600, real secrets, runtime mount)
+# ────────────────────────────────────────────────────────────────────
+
+# Express runtime
+NODE_ENV=production
+PORT=5100
+
+# Database — shared QA easyfix_core
+DB_HOST=111.93.206.91
+DB_PORT=3306
+DB_USER=easyfix_qa
+DB_PASSWORD=<secret>
+DB_NAME=easyfix_core
+
+# JWT — generate fresh, do NOT reuse the legacy "esyfixsecret"
+#   openssl rand -hex 32
+JWT_SECRET=<secret>
+JWT_EXPIRY=30d
+
+# 1Office Suite SSO
+SUITE_URL=https://suite.1office.in
+
+# Microsoft Graph (transactional email)
+MS_GRAPH_TENANT_ID=<secret>
+MS_GRAPH_CLIENT_ID=<secret>
+MS_GRAPH_CLIENT_SECRET=<secret>
+MS_GRAPH_SENDER_EMAIL=ithelpdesk@easyfix.in
+
+# Provider feature flags — keep TRUE for QA until deliberate cutover
+NOTIFICATIONS_DISABLE=true
+WEBHOOKS_DISABLE=true
+TEST_EMAILS=harshit@channelplay.in

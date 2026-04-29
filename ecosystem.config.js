@@ -1,9 +1,9 @@
 /*
  * PM2 process definition for the EasyFix unified backend.
  *
- * Two deployment targets share this file:
- *   1. AWS EC2 (deploy.yml) — staging + production
- *   2. QA in-house server (deploy-qa-inhouse.yml) — single instance on the LAN
+ * One deployment target uses this file:
+ *   AWS EC2 (.github/workflows/deploy.yml) — branches QA → 10.30.2.30,
+ *                                            branches Production → PROD_HOST.
  *
  * Single-instance for now (no cluster mode):
  *   The app is stateless HTTP + a mysql2 pool, so cluster mode would scale

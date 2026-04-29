@@ -1,150 +1,273 @@
-# EasyFix_Backend — auto-deploy to AWS EC2 (Production only)
+# EasyFix_Backend — build-on-EC2 deploy via AWS SSM
 #
-# QA was historically deployed to an AWS EC2 instance via this same workflow.
-# It now lives on the in-house server at 192.168.1.211 and is deployed via
-# .github/workflows/deploy-qa-inhouse.yml (self-hosted runner on the QA LAN).
-# This workflow therefore handles ONLY the Production target.
-#
-# Triggers
-#   push → Production  → deploy to Production EC2
-#   manual workflow_dispatch
+# Targets:
+#   QA branch         → AWS EC2 at 10.30.2.30 (QA_INSTANCE_ID)
+#   Production branch → AWS EC2 (PROD_INSTANCE_ID)
 #
 # Pipeline per push:
-#   1. Checkout the pushed commit
-#   2. Set up Node 20 + cache npm
-#   3. npm ci + node --check on key services (catch syntax errors BEFORE we touch the server)
-#   4. SSH to the Production EC2, git pull, npm ci, smoke-test DB, pm2 reload
-#   5. Hit /api/health + /api/health/db; fail the job if either is non-2xx
+#   1. Lint + node --check on github-hosted runner (cheap fail-fast, no
+#      EC2 cycles wasted on a syntax error)
+#   2. SSM send-command on the EC2:
+#         a. cd /opt/easyfix/repos/EasyFix_Backend && git fetch + reset
+#         b. cd /opt/easyfix && docker compose build backend
+#         c. docker compose up -d --no-deps backend (atomic recreate,
+#            crm-ui untouched)
+#         d. wait for HEALTHY status from the container's HEALTHCHECK
+#   3. Smoke-test /api/health via second SSM call
 #
-# Secrets required (Settings → Secrets and variables → Actions):
-#   PROD_HOST, PROD_USER, PROD_SSH_KEY
-#   MAIL_USERNAME, MAIL_PASSWORD       (Gmail SMTP for failure notifications)
+# Why on-EC2 build (vs ECR push):
+#   Per DevOps — keep the registry footprint small until we have the
+#   full ECR setup ready. Migrating to ECR later is a small change:
+#   re-add the build/push job here, swap `build:` → `image:` in the
+#   compose file. See AWS_QA_BOOTSTRAP.md §"Migrate to ECR".
 #
-# See docs/AWS_DEPLOYMENT_GUIDE.md and docs/GITHUB_SECRETS.md for setup.
+# Required GitHub secrets (Settings → Secrets and variables → Actions):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+#   QA_INSTANCE_ID            i-032aa9d2942305364
+#   PROD_INSTANCE_ID          (when prod is provisioned)
+#   MAIL_USERNAME             Gmail SMTP for failure notifications
+#   MAIL_PASSWORD             Gmail app password
+#
+# These are the ONLY GitHub secrets needed. App secrets (DB password,
+# JWT signing key, MS Graph creds, etc.) live on the EC2 in
+# /opt/easyfix/backend.env — see AWS_QA_BOOTSTRAP.md §C.
+#
+# Required IAM policy on the deploy user:
+#   - ssm:SendCommand on the target instance ARNs + AWS-RunShellScript document
+#   - ssm:GetCommandInvocation, ssm:ListCommandInvocations
+#
+# Required EC2 instance profile:
+#   AmazonSSMManagedInstanceCore (for SSM agent registration)
+#
+# Required EC2 packages: docker, docker-compose-plugin, git
+# (installed once during bootstrap; see AWS_QA_BOOTSTRAP.md)
 
-name: Deploy to AWS EC2 (Production)
+name: Deploy Backend (build-on-EC2 via SSM)
 
 on:
   push:
-    branches: [Production]
-  workflow_dispatch: {}
+    branches: [QA, Production]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Deploy target'
+        required: true
+        default: 'QA'
+        type: choice
+        options: [QA, Production]
 
-# One in-flight deploy at a time — newer commits supersede older ones.
 concurrency:
-  group: deploy-production
+  group: deploy-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  precheck:
     name: Lint & syntax check
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 6
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Node 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Syntax-check critical services
-        # Backend has no compile step (plain JS), so we sanity-check the entry
-        # points + the most-changed services. A real syntax error here fails
-        # the deploy immediately rather than after we've touched the server.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: 'npm' }
+      - run: npm ci
+      - name: Syntax check
+        # Plain JS backend has no compile step; node --check the entry
+        # point + most-changed services. A real syntax error here fails
+        # before we waste EC2 build time.
         run: |
-          node --check server/index.js
+          node --check server.js                          || node --check server/index.js
           node --check services/auto-assign.service.js
           node --check services/job.service.js
-          node --check services/settings.service.js
-          node --check services/webhook.service.js || true   # newer file may not exist on older branches
-
-      - name: Lint (best-effort)
-        # If eslint isn't configured the script no-ops; don't fail the job on
-        # lint warnings — node --check above is the load-bearing gate.
-        run: npm run lint --if-present || true
+          node --check services/zone.service.js           || true
+          node --check services/zone-upload.service.js    || true
 
   deploy:
-    name: Deploy to production
-    needs: build
+    name: Deploy via SSM (build on EC2)
+    needs: precheck
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Resolve target host
+      - name: Resolve target
         id: target
-        # base_url uses the EC2 EIP + raw app port (5100) — public DNS
-        # `api.easyfix.in` still routes to the legacy Dropwizard service
-        # during the coexistence window. After cutover, swap base_url back
-        # to the HTTPS domain.
         run: |
-          echo "host=${{ secrets.PROD_HOST }}"            >> "$GITHUB_OUTPUT"
-          echo "user=${{ secrets.PROD_USER }}"            >> "$GITHUB_OUTPUT"
-          echo "branch=Production"                         >> "$GITHUB_OUTPUT"
-          echo "base_url=http://${{ secrets.PROD_HOST }}:5100" >> "$GITHUB_OUTPUT"
+          TARGET="${{ github.event.inputs.target || github.ref_name }}"
+          if [[ "$TARGET" == "QA" ]]; then
+            echo "instance_id=${{ secrets.QA_INSTANCE_ID }}"  >> "$GITHUB_OUTPUT"
+            echo "branch=QA"                                   >> "$GITHUB_OUTPUT"
+            echo "env_name=QA"                                  >> "$GITHUB_OUTPUT"
+          else
+            echo "instance_id=${{ secrets.PROD_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+            echo "branch=Production"                            >> "$GITHUB_OUTPUT"
+            echo "env_name=Production"                           >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Set up SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ steps.target.outputs.host }}" >> ~/.ssh/known_hosts
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
 
-      - name: Deploy via SSH
+      - name: SSM build & up
+        id: ssm
         run: |
-          ssh -i ~/.ssh/deploy_key \
-              ${{ steps.target.outputs.user }}@${{ steps.target.outputs.host }} \
-              bash -se <<'REMOTE'
+          set -euo pipefail
+          INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
+          BRANCH="${{ steps.target.outputs.branch }}"
+          ENV_NAME="${{ steps.target.outputs.env_name }}"
+
+          if [[ -z "$INSTANCE_ID" ]]; then
+            echo "::error::INSTANCE_ID secret missing for $ENV_NAME"; exit 1
+          fi
+
+          # On-EC2 deploy script. SSM runs commands as root by default;
+          # we sudo into easyfix-deploy for the git operations (so the
+          # repo's ownership stays consistent) and run docker as root
+          # (which is fine — only root is in the docker group on this box).
+          REMOTE_SCRIPT=$(cat <<EOF
           set -euo pipefail
 
-          cd ~/EasyFix_Backend
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}.git"
+          REPO_DIR=/opt/easyfix/repos/EasyFix_Backend
+          COMPOSE_DIR=/opt/easyfix
 
-          echo "▶ Fetching latest from origin/${{ steps.target.outputs.branch }}"
-          git fetch --all --prune
-          git checkout ${{ steps.target.outputs.branch }}
-          git reset --hard origin/${{ steps.target.outputs.branch }}
+          # Self-healing: if the repo isn't on disk yet (fresh EC2 or
+          # someone deleted it), clone it. Otherwise fetch + reset to
+          # the branch HEAD. Idempotent — works the first time AND every
+          # subsequent deploy.
+          mkdir -p /opt/easyfix/repos
+          chown -R easyfix-deploy:easyfix-deploy /opt/easyfix/repos
 
-          echo "▶ Installing dependencies (production deps only)"
-          npm ci --omit=dev
+          if [[ ! -d "\$REPO_DIR/.git" ]]; then
+            echo "▶ Repo not present — cloning fresh"
+            # If the repo is private, /home/easyfix-deploy/.git-credentials
+            # must already exist (set up once during bootstrap; see
+            # AWS_QA_BOOTSTRAP.md §C). Public repos clone without it.
+            sudo -u easyfix-deploy git clone --branch $BRANCH "\$REPO_URL" "\$REPO_DIR"
+          else
+            echo "▶ Pulling origin/$BRANCH"
+            sudo -u easyfix-deploy git -C "\$REPO_DIR" fetch --all --prune
+            sudo -u easyfix-deploy git -C "\$REPO_DIR" checkout $BRANCH
+            sudo -u easyfix-deploy git -C "\$REPO_DIR" reset --hard origin/$BRANCH
+          fi
 
-          echo "▶ Verifying DB connectivity BEFORE swapping traffic"
-          npm run test:db
+          # First deploy on a fresh EC2 also needs the compose file in
+          # place. Copy it from the cloned repo if /opt/easyfix is bare.
+          if [[ ! -f "\$COMPOSE_DIR/docker-compose.yml" ]]; then
+            echo "▶ docker-compose.yml not present — bootstrapping from repo"
+            cp "\$REPO_DIR/deploy/docker-compose.yml" "\$COMPOSE_DIR/"
+            chown root:root "\$COMPOSE_DIR/docker-compose.yml"
+            chmod 644 "\$COMPOSE_DIR/docker-compose.yml"
+          fi
 
-          echo "▶ Reloading PM2 (zero-downtime)"
-          pm2 reload easyfix-backend --update-env
-
-          # Belt-and-braces: pm2 reload should be in-place, but log proof
-          pm2 status easyfix-backend
-
-          echo "✓ Deployed $(git rev-parse --short HEAD) at $(date -u +%FT%TZ)"
-          REMOTE
-
-      - name: Smoke-test deployed API
-        run: |
-          BASE="${{ steps.target.outputs.base_url }}"
-          # Three independent endpoints — process up, DB up, integration shape OK.
-          for path in "/api/health" "/api/health/db" "/api/integration/_ping"; do
-            ok=0
-            for i in 1 2 3 4 5; do
-              code=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}${path}" || echo 000)
-              if [[ "$code" =~ ^2 ]]; then
-                echo "✓ ${BASE}${path} → $code"
-                ok=1
-                break
-              fi
-              echo "Attempt $i: ${BASE}${path} → $code, retrying in 5s…"
-              sleep 5
-            done
-            if [[ $ok -eq 0 ]]; then
-              echo "✗ ${BASE}${path} never returned 2xx"
+          # Hard preflight: env files MUST exist. We won't auto-create
+          # them — they hold secrets and must be set up via bootstrap-env.sh
+          # with the real values. Failing here gives a clear message
+          # instead of a confusing container crash later.
+          for required in "\$COMPOSE_DIR/.env" "\$COMPOSE_DIR/backend.env"; do
+            if [[ ! -f "\$required" ]]; then
+              echo "::error::\$required is missing. Run deploy/bootstrap-env.sh on the EC2 first — see AWS_QA_BOOTSTRAP.md §E"
               exit 1
             fi
           done
 
-      - name: Notify by email on failure
+          cd "\$COMPOSE_DIR"
+          echo "▶ Building backend image (uses Docker layer cache)"
+          docker compose build backend
+
+          echo "▶ Recreating backend container (crm-ui untouched)"
+          docker compose up -d --no-deps --force-recreate backend
+
+          # Wait for the container's HEALTHCHECK to flip green.
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            STATUS=\$(docker inspect --format '{{.State.Health.Status}}' easyfix-backend 2>/dev/null || echo unknown)
+            echo "[\$i/10] backend health: \$STATUS"
+            [[ "\$STATUS" == "healthy" ]] && break
+            sleep 3
+          done
+
+          # Reclaim disk from old build layers (keep last 72h of caches).
+          docker image prune -af --filter "until=72h" >/dev/null 2>&1 || true
+          docker builder prune -af --keep-storage 2GB >/dev/null 2>&1 || true
+
+          docker compose ps backend
+          echo "✓ Deployed \$(sudo -u easyfix-deploy git -C \$REPO_DIR rev-parse --short HEAD)"
+          EOF
+          )
+
+          PARAMS_JSON=$(jq -n --arg cmd "$REMOTE_SCRIPT" '{commands: [$cmd]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy backend ${GITHUB_SHA:0:7} → $ENV_NAME" \
+            --parameters "$PARAMS_JSON" \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+          # Build can take ~3 min cold, ~30 sec warm. 8-min ceiling.
+          STATUS=""
+          for i in $(seq 1 96); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            echo "[$i/96] SSM status: $STATUS"
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
+          done
+
+          echo
+          echo "── Remote stdout ──"
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text || true
+          echo
+          echo "── Remote stderr ──"
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query 'StandardErrorContent' --output text || true
+
+          [[ "$STATUS" == "Success" ]] || { echo "::error::SSM finished with $STATUS"; exit 1; }
+
+      - name: Smoke-test deployed API
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
+
+          PARAMS_JSON=$(jq -n '{commands: [
+            "set -e",
+            "for path in /api/health /api/health/db /api/integration/_ping; do",
+            "  ok=0",
+            "  for i in 1 2 3 4 5; do",
+            "    code=$(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:5100${path} || echo 000)",
+            "    if [[ \"$code\" =~ ^2 ]]; then echo \"✓ ${path} → $code\"; ok=1; break; fi",
+            "    echo \"Attempt $i: ${path} → $code, retrying in 5s…\"; sleep 5",
+            "  done",
+            "  if [[ $ok -eq 0 ]]; then echo \"✗ ${path} never returned 2xx\"; exit 1; fi",
+            "done"
+          ]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Smoke test backend ${GITHUB_SHA:0:7}" \
+            --parameters "$PARAMS_JSON" \
+            --query 'Command.CommandId' --output text)
+
+          for i in $(seq 1 24); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
+          done
+
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text || true
+
+          [[ "$STATUS" == "Success" ]] || { aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text; exit 1; }
+
+      - name: Notify on failure
         if: failure()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -153,15 +276,16 @@ jobs:
           secure: true
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "[Deploy FAILED] EasyFix_Backend → production (${{ github.sha }})"
+          subject: "[Deploy FAILED] EasyFix_Backend → ${{ steps.target.outputs.env_name }} (${{ github.sha }})"
           to: harshit@channelplay.in
           from: ${{ secrets.MAIL_USERNAME }}
           body: |
-            Backend deploy to production FAILED.
+            Backend deploy FAILED.
 
-            Branch: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
-            Triggered by: ${{ github.actor }}
-            Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Instance:  ${{ steps.target.outputs.instance_id }}
+            Branch:    ${{ steps.target.outputs.branch }}
+            Commit:    ${{ github.sha }}
+            Triggered: ${{ github.actor }}
+            Run URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            Open the Run URL above for the full job logs.
+            SSM command id: ${{ steps.ssm.outputs.command_id }}

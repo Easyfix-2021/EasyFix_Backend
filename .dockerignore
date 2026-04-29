@@ -1,0 +1,39 @@
+# Keep the Docker build context small — every file listed below is either
+# regenerated inside the image OR a secret that must not leak in.
+
+# Dependencies — installed fresh inside the image
+node_modules
+npm-debug.log*
+
+# Local + CI ephemera
+.git
+.github
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Editor / OS junk
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Test + dev-only
+coverage
+.nyc_output
+*.log
+
+# Build / runtime artefacts
+logs
+uploads
+tmp
+
+# Repo-only docs, scripts, migrations (the ones that need to be available
+# IN the image are explicitly named — keeping the rest out reduces context
+# size and image rebuild churn).
+docs
+*.md
+nodemon.json
+ecosystem.config.js
+deploy
