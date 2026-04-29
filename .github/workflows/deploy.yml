@@ -80,10 +80,15 @@ jobs:
     # `environment:` makes org-level environment secrets resolvable in
     # this job. Without it, `secrets.AWS_REGION` is empty.
     environment: 'Organisation Level Secrets'
+    # NOTE: we deliberately do NOT pass `instance_id` as a job output —
+    # GitHub Actions scrubs secret values from job-output strings as a
+    # safety feature, so the deploy job would receive an empty string.
+    # Instead, both jobs read `secrets.QA_INSTANCE_ID` directly. Each
+    # job already declares `environment:`, so the secret resolves in
+    # both. Only env_name (non-secret) is passed across.
     outputs:
       image_uri:   ${{ steps.meta.outputs.image_uri }}
       env_name:    ${{ steps.target.outputs.env_name }}
-      instance_id: ${{ steps.target.outputs.instance_id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -92,11 +97,9 @@ jobs:
         run: |
           TARGET="${{ github.event.inputs.target || github.ref_name }}"
           if [[ "$TARGET" == "QA" ]]; then
-            echo "instance_id=${{ secrets.QA_INSTANCE_ID }}"  >> "$GITHUB_OUTPUT"
-            echo "env_name=qa"                                  >> "$GITHUB_OUTPUT"
+            echo "env_name=qa"          >> "$GITHUB_OUTPUT"
           else
-            echo "instance_id=${{ secrets.PROD_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
-            echo "env_name=production"                          >> "$GITHUB_OUTPUT"
+            echo "env_name=production"  >> "$GITHUB_OUTPUT"
           fi
 
       - uses: aws-actions/configure-aws-credentials@v4
@@ -154,16 +157,31 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
+      - name: Resolve instance ID for this env
+        id: target
+        # Read INSTANCE_ID from secrets HERE (in this job) — it can't
+        # be inherited from build-and-push because GitHub scrubs secret
+        # values from cross-job outputs. `environment:` on this job
+        # makes secrets.QA_INSTANCE_ID resolvable.
+        run: |
+          ENV_NAME="${{ needs.build-and-push.outputs.env_name }}"
+          if [[ "$ENV_NAME" == "qa" ]]; then
+            echo "instance_id=${{ secrets.QA_INSTANCE_ID }}"  >> "$GITHUB_OUTPUT"
+          else
+            echo "instance_id=${{ secrets.PROD_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: SSM compose pull + up
         id: ssm
         run: |
           set -euo pipefail
-          INSTANCE_ID="${{ needs.build-and-push.outputs.instance_id }}"
+          INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
           ENV_NAME="${{ needs.build-and-push.outputs.env_name }}"
 
           if [[ -z "$INSTANCE_ID" ]]; then
-            echo "::error::INSTANCE_ID secret missing for $ENV_NAME"; exit 1
+            echo "::error::INSTANCE_ID secret missing for $ENV_NAME — confirm QA_INSTANCE_ID exists in the 'Organisation Level Secrets' environment"
+            exit 1
           fi
 
           # On the EC2: bump BACKEND_IMAGE in .env, pull the new image,
@@ -245,7 +263,7 @@ jobs:
       - name: Smoke-test deployed API
         run: |
           set -euo pipefail
-          INSTANCE_ID="${{ needs.build-and-push.outputs.instance_id }}"
+          INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
 
           PARAMS_JSON=$(jq -n '{commands: [
             "set -e",
@@ -297,7 +315,7 @@ jobs:
             Backend deploy FAILED.
 
             Image:    ${{ needs.build-and-push.outputs.image_uri }}
-            Instance: ${{ needs.build-and-push.outputs.instance_id }}
+            Instance: ${{ steps.target.outputs.instance_id }}
             Branch:   ${{ github.ref_name }}
             Commit:   ${{ github.sha }}
             Triggered: ${{ github.actor }}
