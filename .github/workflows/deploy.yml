@@ -161,6 +161,25 @@ jobs:
     timeout-minutes: 10
     environment: 'Organisation Level Secrets'   # required again so the SSM step's AWS creds resolve
     steps:
+      # Need the repo here so we can ship the latest deploy/docker-compose.yml
+      # to the EC2 on every deploy. Otherwise commits to that file never
+      # propagate (the workflow used to only sed-update BACKEND_IMAGE in
+      # /opt/easyfix/.env, leaving compose.yml frozen at first-bootstrap).
+      - uses: actions/checkout@v4
+
+      - name: Encode docker-compose.yml for transport
+        id: compose
+        # Base64 → SSM avoids every shell-escape layer; same trick we use
+        # for the bash script. Compose YAML has `:` and `${}` which would
+        # otherwise need careful quoting through JSON → sh → bash.
+        run: |
+          if [[ ! -f deploy/docker-compose.yml ]]; then
+            echo "::error::deploy/docker-compose.yml missing in the repo"
+            exit 1
+          fi
+          B64=$(base64 -w0 deploy/docker-compose.yml)
+          echo "compose_b64=$B64" >> "$GITHUB_OUTPUT"
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -194,14 +213,23 @@ jobs:
             exit 1
           fi
 
-          # On the EC2: bump BACKEND_IMAGE in .env, pull the new image,
-          # recreate the backend container ONLY (crm-ui untouched).
+          # On the EC2: refresh docker-compose.yml from the repo, bump
+          # BACKEND_IMAGE in .env, pull the new image, recreate the
+          # backend container ONLY (crm-ui untouched).
+          COMPOSE_B64="${{ steps.compose.outputs.compose_b64 }}"
           REMOTE_SCRIPT=$(cat <<EOF
           set -euo pipefail
           cd /opt/easyfix
 
+          # Sync docker-compose.yml from the repo on every deploy. Atomic
+          # rewrite via a temp file → mv so a half-written file never
+          # confuses a concurrent compose invocation.
+          echo "$COMPOSE_B64" | base64 -d > /opt/easyfix/.docker-compose.yml.new
+          mv /opt/easyfix/.docker-compose.yml.new /opt/easyfix/docker-compose.yml
+
           # Hard preflight — env files MUST exist (created by bootstrap-env.sh).
-          for required in /opt/easyfix/.env /opt/easyfix/backend.env /opt/easyfix/docker-compose.yml; do
+          # docker-compose.yml is no longer in this list — we just wrote it.
+          for required in /opt/easyfix/.env /opt/easyfix/backend.env; do
             if [[ ! -f "\$required" ]]; then
               echo "::error::\$required missing — see AWS_QA_BOOTSTRAP.md for one-time setup"
               exit 1
