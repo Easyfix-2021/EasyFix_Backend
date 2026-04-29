@@ -75,7 +75,12 @@ jobs:
   build-and-push:
     name: Build image & push to ECR
     needs: precheck
-    runs-on: ubuntu-latest
+    # Native arm64 runner — the EC2 target is Graviton (arm64), and
+    # building on an amd64 runner with QEMU emulation crashes Node's V8
+    # during `npm ci` with SIGILL (V8 generates ARM instructions QEMU
+    # doesn't emulate). ubuntu-24.04-arm is GA and ~37% cheaper than
+    # the default amd64 minutes — strict win for this workload.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 12
     # `environment:` makes org-level environment secrets resolvable in
     # this job. Without it, `secrets.AWS_REGION` is empty.
@@ -141,15 +146,11 @@ jobs:
           echo "image_uri=${REGISTRY}/${REPO}:${SHA_TAG}"          >> "$GITHUB_OUTPUT"
           echo "moving_uri=${REGISTRY}/${REPO}:${ENV_NAME}-latest" >> "$GITHUB_OUTPUT"
 
-      # The EC2 is an AWS Graviton instance (arm64). The default GitHub
-      # runner is amd64, so without QEMU + an explicit platform target,
-      # buildx produces an amd64 image that crashes on first instruction
-      # on the EC2 with `exec format error`. setup-qemu installs the
-      # binfmt_misc handlers buildx needs to cross-compile for arm64.
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
+      # No QEMU needed — the runner itself is arm64, so buildx produces
+      # native arm64 binaries directly. (When this job ran on amd64 +
+      # QEMU, V8's JIT crashed with SIGILL during `npm ci` because QEMU's
+      # user-mode emulation doesn't support every ARM instruction V8
+      # emits.)
       - uses: docker/setup-buildx-action@v3
 
       - name: Build & push backend image
