@@ -1,6 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
-const { generateOtp, otpExpiryDate } = require('../utils/otp');
+const { resolveLoginOtp, otpExpiryDate } = require('../utils/otp');
 const jwt = require('jsonwebtoken');
 
 /*
@@ -26,7 +26,10 @@ async function findById(id) {
 async function createLoginOtp(mobile) {
   const tech = await findByMobile(mobile);
   if (!tech) return { found: false };
-  const otp = generateOtp();
+  // Tech logins are always mobile-based, so resolveLoginOtp will return
+  // the last 4 digits of the mobile in QA mode (env QA_DETERMINISTIC_OTP=true).
+  // In prod the env var is unset → real random OTP. Same gate as auth-service.
+  const otp = resolveLoginOtp(mobile);
   const now = new Date();
   const expires = otpExpiryDate(now);
   // Retire any still-live prior Tech Login OTPs for this mobile first, so the

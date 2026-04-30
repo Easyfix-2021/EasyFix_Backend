@@ -1,6 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
-const { generateOtp, otpExpiryDate } = require('../utils/otp');
+const { resolveLoginOtp, otpExpiryDate } = require('../utils/otp');
 const { signUserToken } = require('../utils/jwt');
 
 /*
@@ -63,7 +63,12 @@ async function createLoginOtp(identifier) {
     return { found: false };
   }
 
-  const otp = generateOtp();
+  // resolveLoginOtp() returns a real random OTP in production. In QA,
+  // when QA_DETERMINISTIC_OTP=true is set in /opt/easyfix/backend.env,
+  // it returns a predictable value: 2468 for email logins, last 4 digits
+  // of the dialed number for mobile logins. The QA flag MUST never be
+  // set in prod — would be a complete auth bypass.
+  const otp = resolveLoginOtp(identifier);
   const now = new Date();
   const expires = otpExpiryDate(now);
 

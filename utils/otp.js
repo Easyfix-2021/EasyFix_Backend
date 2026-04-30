@@ -3,13 +3,71 @@ const crypto = require('crypto');
 const OTP_TTL_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 5;
 
+// QA convenience constant — fixed OTP for any email login when
+// QA_DETERMINISTIC_OTP=true. Mobile logins use last 4 digits of the
+// dialed number instead. NEVER set the env var in production — see
+// resolveLoginOtp() below for the gate.
+const QA_EMAIL_OTP = 2468;
+
 function generateOtp() {
-  // 4-digit to match legacy format stored as INT in otp_details.otp
+  // 4-digit random OTP, matches legacy otp_details.otp INT column.
+  // The default behavior — used by every flow except the QA login
+  // override (resolveLoginOtp).
   return 1000 + crypto.randomInt(0, 9000);
+}
+
+/**
+ * Pick the OTP value for a login attempt.
+ *
+ * Default (production): cryptographically random 4-digit code via
+ *   generateOtp(). Same as before — no behavior change.
+ *
+ * QA override: when QA_DETERMINISTIC_OTP=true, returns a predictable
+ *   OTP so the QA team can log in without hitting an SMS/email gateway:
+ *     • Email identifier → always 2468
+ *     • Mobile identifier → last 4 digits of the mobile number
+ *
+ * The env var must be unset (or any non-"true" value) on prod. Setting
+ * it on prod would let anyone log in as anyone with knowledge of the
+ * mobile number alone — a catastrophic auth bypass. The deploy
+ * pipelines do NOT inject this var; it must be set explicitly via
+ * bootstrap-env.sh on the QA EC2 only.
+ *
+ * @param {string} identifier  what the user typed in the login form
+ *                             (email like 'foo@x.com' or mobile like '9876543210')
+ * @returns {number}           4-digit OTP
+ */
+function resolveLoginOtp(identifier) {
+  if (process.env.QA_DETERMINISTIC_OTP !== 'true') {
+    return generateOtp();
+  }
+  // Heuristic identical to auth-service's identifier dispatch — '@' = email.
+  // Trim defensively; extra whitespace from form inputs would otherwise
+  // break the type detection and silently fall through to mobile-mode.
+  const trimmed = String(identifier || '').trim();
+  if (trimmed.includes('@')) {
+    return QA_EMAIL_OTP;
+  }
+  // Mobile path: take the last 4 digits. Strip non-digits first so a user
+  // typing '+91 98765 43210' still gets '3210', matching the mobile they
+  // see in their CRM profile.
+  const digits = trimmed.replace(/\D/g, '');
+  if (digits.length < 4) {
+    // Pathologically short identifier — fall back to random so we don't
+    // emit a 1-or-2-digit OTP that the INT column would right-pad.
+    return generateOtp();
+  }
+  return parseInt(digits.slice(-4), 10);
 }
 
 function otpExpiryDate(fromDate = new Date()) {
   return new Date(fromDate.getTime() + OTP_TTL_MINUTES * 60 * 1000);
 }
 
-module.exports = { generateOtp, otpExpiryDate, OTP_TTL_MINUTES, OTP_MAX_ATTEMPTS };
+module.exports = {
+  generateOtp,
+  resolveLoginOtp,
+  otpExpiryDate,
+  OTP_TTL_MINUTES,
+  OTP_MAX_ATTEMPTS,
+};

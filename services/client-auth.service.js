@@ -1,6 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
-const { generateOtp, otpExpiryDate } = require('../utils/otp');
+const { resolveLoginOtp, otpExpiryDate } = require('../utils/otp');
 const jwt = require('jsonwebtoken');
 
 /*
@@ -31,7 +31,10 @@ async function findSpocById(id) {
 async function createLoginOtp(identifier) {
   const spoc = await findSpoc(identifier);
   if (!spoc) return { found: false };
-  const otp = generateOtp();
+  // SPOC identifier can be email or mobile (we accept both via findSpoc).
+  // resolveLoginOtp picks 2468 for email or last 4 digits of mobile in QA;
+  // real random in prod.
+  const otp = resolveLoginOtp(identifier);
   const now = new Date();
   const expires = otpExpiryDate(now);
   // Retire any still-live prior SPOC Login OTPs for this SPOC first, so a stale
