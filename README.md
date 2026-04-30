@@ -22,3 +22,4 @@ npm run dev            # start on :5100 with hot reload
 | `GET /api/integration/_ping`   | Legacy-shape response canary |
 
 Everything else is stubbed in `routes/index.js` and will be implemented in subsequent steps per the blueprint.
+
