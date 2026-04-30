@@ -36,11 +36,11 @@ async function createLoginOtp(mobile) {
   // user can't accidentally type an older one (verify picks the newest).
   await pool.query(
     `UPDATE otp_details SET is_expired = 1
-      WHERE otp_type = 'Tech Login' AND user_mobile_no = ? AND is_expired = 0`,
+      WHERE otp_type = 'Mobile App Otp' AND user_mobile_no = ? AND is_expired = 0`,
     [mobile]);
   await pool.query(
     `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
-     VALUES (?, 'Tech Login', ?, ?, ?, ?, 0, 1)`,
+     VALUES (?, 'Mobile App Otp', ?, ?, ?, ?, 0, 1)`,
     [otp, tech.efr_email, mobile, now, expires]);
   if (process.env.NODE_ENV !== 'production') {
     logger.event('🔑', 'cyan',
@@ -68,7 +68,7 @@ async function verifyLoginOtp(mobile, otp) {
   if (!tech) return { ok: false, reason: 'USER_NOT_FOUND' };
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired FROM otp_details
-      WHERE user_mobile_no = ? AND otp_type = 'Tech Login' ORDER BY id DESC LIMIT 1`, [mobile]);
+      WHERE user_mobile_no = ? AND otp_type = 'Mobile App Otp' ORDER BY id DESC LIMIT 1`, [mobile]);
   if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
   if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);

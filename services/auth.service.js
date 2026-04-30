@@ -78,7 +78,7 @@ async function createLoginOtp(identifier) {
   // older SMS silently fails with OTP_MISMATCH — confusing and hard to diagnose.
   await pool.query(
     `UPDATE otp_details SET is_expired = 1
-      WHERE otp_type = 'Login Otp'
+      WHERE otp_type = 'crm_login'
         AND (user_email = ? OR user_mobile_no = ?)
         AND is_expired = 0`,
     [user.official_email, user.mobile_no]
@@ -92,7 +92,7 @@ async function createLoginOtp(identifier) {
     `INSERT INTO otp_details
        (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
      VALUES (?, ?, ?, ?, ?, ?, 0, 1)`,
-    [otp, 'Login Otp', user.official_email, user.mobile_no, now, expires]
+    [otp, 'crm_login', user.official_email, user.mobile_no, now, expires]
   );
   if (!insertResult?.insertId) {
     // Should be impossible given MySQL's AUTO_INCREMENT on otp_details.id, but
@@ -136,7 +136,7 @@ async function verifyLoginOtp(identifier, otp) {
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired
        FROM otp_details
-      WHERE ${column} = ? AND otp_type = 'Login Otp'
+      WHERE ${column} = ? AND otp_type = 'crm_login'
       ORDER BY id DESC
       LIMIT 1`,
     [identifier]

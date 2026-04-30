@@ -41,14 +41,14 @@ async function createLoginOtp(identifier) {
   // OTP from an earlier request can't outrank the one we're about to issue.
   await pool.query(
     `UPDATE otp_details SET is_expired = 1
-      WHERE otp_type = 'SPOC Login'
+      WHERE otp_type = 'Login Otp'
         AND (user_email = ? OR user_mobile_no = ?)
         AND is_expired = 0`,
     [spoc.contact_email, spoc.contact_no]
   );
   await pool.query(
     `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
-     VALUES (?, 'SPOC Login', ?, ?, ?, ?, 0, 1)`,
+     VALUES (?, 'Login Otp', ?, ?, ?, ?, 0, 1)`,
     [otp, spoc.contact_email, spoc.contact_no, now, expires]
   );
   if (process.env.NODE_ENV !== 'production') {
@@ -75,7 +75,7 @@ async function verifyLoginOtp(identifier, otp) {
   const col = /@/.test(identifier) ? 'user_email' : 'user_mobile_no';
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired FROM otp_details
-      WHERE ${col} = ? AND otp_type = 'SPOC Login' ORDER BY id DESC LIMIT 1`,
+      WHERE ${col} = ? AND otp_type = 'Login Otp' ORDER BY id DESC LIMIT 1`,
     [identifier]
   );
   if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
