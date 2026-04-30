@@ -289,6 +289,19 @@ jobs:
           echo "▶ Recreating backend container (crm-ui untouched)"
           docker compose up -d --no-deps --force-recreate backend
 
+          # Auxiliary services — bring up if defined in compose but not
+          # currently running. Idempotent: no-op when already up. Adding
+          # \`dozzle\` here makes "fresh EC2 → first deploy" automatically
+          # start the log viewer; existing running container is unaffected.
+          # \`|| true\` prevents an aux-service failure from blocking the
+          # main backend deploy.
+          for aux in dozzle; do
+            if docker compose config --services 2>/dev/null | grep -q "^\$aux\$"; then
+              echo "▶ Ensuring \$aux is up"
+              docker compose up -d --no-deps "\$aux" || true
+            fi
+          done
+
           # Wait for the container's HEALTHCHECK to flip green.
           for i in 1 2 3 4 5 6 7 8 9 10; do
             STATUS=\$(docker inspect --format '{{.State.Health.Status}}' easyfix-backend 2>/dev/null || echo unknown)
