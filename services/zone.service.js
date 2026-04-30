@@ -143,9 +143,110 @@ async function searchEasyfixersByPincode(pincode, { limit = 200 } = {}) {
   return rows;
 }
 
+// ─── Create / Update zone (admin CRUD) ───────────────────────────────
+/*
+ * The legacy schema stores tbl_zone_master with `zone_status` (BIT/0/1) but
+ * no audit columns — we don't add any. createdDate is auto-stamped by the
+ * existing default. Updates only touch zone_name + zone_status.
+ *
+ * 409 if a duplicate name is attempted (case-insensitive). The DB has no
+ * unique index on zone_name historically, so we enforce in app code.
+ */
+async function createZone({ zone_name }) {
+  const trimmed = String(zone_name || '').trim();
+  if (!trimmed) { const e = new Error('zone_name required'); e.status = 400; throw e; }
+
+  const [[dup]] = await pool.query(
+    'SELECT zone_id FROM tbl_zone_master WHERE LOWER(zone_name) = LOWER(?) LIMIT 1',
+    [trimmed]
+  );
+  if (dup) { const e = new Error(`zone "${trimmed}" already exists`); e.status = 409; throw e; }
+
+  const [r] = await pool.query(
+    'INSERT INTO tbl_zone_master (zone_name, zone_status, created_date) VALUES (?, 1, NOW())',
+    [trimmed]
+  );
+  return getZoneDetail(r.insertId);
+}
+
+async function updateZone(zoneId, { zone_name, zone_status }) {
+  const sets = [];
+  const vals = [];
+  if (zone_name !== undefined) {
+    const trimmed = String(zone_name).trim();
+    if (!trimmed) { const e = new Error('zone_name cannot be blank'); e.status = 400; throw e; }
+    // Reject rename collisions (excluding self).
+    const [[dup]] = await pool.query(
+      'SELECT zone_id FROM tbl_zone_master WHERE LOWER(zone_name) = LOWER(?) AND zone_id <> ? LIMIT 1',
+      [trimmed, zoneId]
+    );
+    if (dup) { const e = new Error(`another zone with name "${trimmed}" exists`); e.status = 409; throw e; }
+    sets.push('zone_name = ?'); vals.push(trimmed);
+  }
+  if (zone_status !== undefined) { sets.push('zone_status = ?'); vals.push(zone_status ? 1 : 0); }
+  if (sets.length === 0) return getZoneDetail(zoneId);
+
+  vals.push(zoneId);
+  await pool.query(`UPDATE tbl_zone_master SET ${sets.join(', ')} WHERE zone_id = ?`, vals);
+  return getZoneDetail(zoneId);
+}
+
+// ─── Replace the zone's city set ─────────────────────────────────────
+/*
+ * Wipe + re-insert in a transaction. Why full-replace vs diff?
+ *   - Easier to reason about ("the UI submitted N cities, the zone now has
+ *     exactly N cities") and matches the multi-select picker UX.
+ *   - The mapping table has no audit history we'd lose by re-inserting.
+ *
+ * Side-effect callers should be aware of: any tbl_easyfixer.efr_zone_city_id
+ * that pointed at a (zone, city) row we just deleted becomes a dangling
+ * reference. That's the same risk as the legacy CRM — we don't fix it
+ * here; we surface it via the response shape (`orphanedEasyfixerCount`)
+ * so the UI can warn before commit.
+ */
+async function setCityMapping(zoneId, cityIds) {
+  const ids = Array.from(new Set((cityIds || []).map(Number).filter(Number.isFinite)));
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Pre-flight: count easyfixers about to be orphaned (current rows minus
+    // incoming cityIds). Read-only; the UI uses this for a confirm prompt.
+    const [orphans] = await conn.query(
+      `SELECT COUNT(*) AS n
+         FROM tbl_easyfixer e
+         JOIN tbl_zone_city_mapping zcm ON zcm.city_zone_id = e.efr_zone_city_id
+        WHERE zcm.zone_id = ?
+          AND zcm.city_id NOT IN (?)
+          AND e.efr_status = 1`,
+      [zoneId, ids.length > 0 ? ids : [0]]
+    );
+    const orphanedEasyfixerCount = orphans[0].n;
+
+    await conn.query('DELETE FROM tbl_zone_city_mapping WHERE zone_id = ?', [zoneId]);
+    if (ids.length > 0) {
+      const rows = ids.map((cid) => [zoneId, cid]);
+      await conn.query('INSERT INTO tbl_zone_city_mapping (zone_id, city_id) VALUES ?', [rows]);
+    }
+    await conn.commit();
+
+    const detail = await getZoneDetail(zoneId);
+    return { ...detail, orphanedEasyfixerCount };
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
 module.exports = {
   listZones,
   getZoneDetail,
   searchEasyfixersInZone,
   searchEasyfixersByPincode,
+  createZone,
+  updateZone,
+  setCityMapping,
 };
