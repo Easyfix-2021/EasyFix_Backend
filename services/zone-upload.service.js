@@ -1,57 +1,63 @@
 const ExcelJS = require('exceljs');
+const XLSX    = require('xlsx');
 const { pool } = require('../db');
 
 /*
- * Zone bulk import/export — Excel template + upload parsing.
- *
- * Why ExcelJS (not the existing SheetJS `xlsx` package):
- *   We use SheetJS for parsing existing .xlsx files (it's already vetted +
- *   CDN-pinned for security) but its WRITE support for data validations and
- *   sheet protection is incomplete in the community build. ExcelJS's API for
- *   both is unambiguous and well-documented, so generation lives here.
+ * Bulk upload for spec-aligned Manage Zones.
  *
  * Workbook layout:
- *   Sheet 1: "Mapping"          — user-editable; ZoneName | CityName | Pincode (optional)
- *   Sheet 2: "Zones (Master)"   — locked; canonical list of zone_name values
- *   Sheet 3: "Cities (Master)"  — locked; canonical list of city_name values
- *
- * Mapping sheet has list-validation on the ZoneName + CityName columns
- * pointing at the master sheets. Pincode column is plain numeric — pincodes
- * are derived from city_name via pincode_firefox_city_mapping during upload,
- * but we expose the column so users can SEE which pincodes a city covers.
+ *   Sheet 1: "Zone Pincodes" (editable; default tab) — Cols:
+ *              zone_name | city_name | pincode
+ *            Each row = "this pincode belongs to this zone in this city."
+ *            Zones are created on the fly if (city_name, zone_name) doesn't
+ *            exist; pincodes must already be in tbl_pincode for that city.
+ *   Sheet 2: "Cities (Master)" — locked; (city_id, city_name).
+ *   Sheet 3: "Existing Zones"  — locked; (zone_id, zone_name, city_name).
+ *   Sheet 4: "Read me"         — locked; format notes.
  */
 
-const TEMPLATE_PROTECTION_PASSWORD = 'easyfix-zones';   // not a secret — just stops casual edits
-const MAX_DATA_ROWS = 5000;                              // pre-applies validation to N rows
+const TEMPLATE_PASSWORD = 'easyfix-zones';
+const MAX_DATA_ROWS = 5000;
 
-// ─── Generate the downloadable .xlsx template ─────────────────────────
 async function generateTemplate() {
   const wb = new ExcelJS.Workbook();
-  wb.creator  = 'EasyFix CRM';
-  wb.created  = new Date();
+  wb.creator = 'EasyFix CRM';
+  wb.created = new Date();
 
-  // Pull canonical lists ONCE — both master sheets share these.
-  const [[zones], [cities]] = await Promise.all([
-    pool.query('SELECT zone_id, zone_name, zone_status FROM tbl_zone_master ORDER BY zone_name ASC'),
+  const [[cities], [zones]] = await Promise.all([
     pool.query('SELECT city_id, city_name FROM tbl_city ORDER BY city_name ASC'),
+    pool.query(`SELECT z.zone_id, z.zone_name, c.city_name
+                  FROM tbl_zone_master z
+                  LEFT JOIN tbl_city c ON c.city_id = z.city_id
+                 ORDER BY c.city_name, z.zone_name`),
   ]);
 
-  // ── Sheet 2: Zones (Master) — built FIRST because the Mapping sheet's
-  //    validation formula references it by sheet name + range.
-  const zonesSheet = wb.addWorksheet('Zones (Master)');
-  zonesSheet.columns = [
-    { header: 'zone_id',     key: 'zone_id',     width: 10 },
-    { header: 'zone_name',   key: 'zone_name',   width: 32 },
-    { header: 'zone_status', key: 'zone_status', width: 12 },
+  // ── Editable sheet first (default-active tab) ──
+  const sheet = wb.addWorksheet('Zone Pincodes');
+  sheet.columns = [
+    { header: 'zone_name', key: 'zone_name', width: 24 },
+    { header: 'city_name', key: 'city_name', width: 24 },
+    { header: 'pincode',   key: 'pincode',   width: 14 },
   ];
-  zonesSheet.getRow(1).font = { bold: true };
-  zones.forEach((z) => zonesSheet.addRow(z));
-  zonesSheet.protect(TEMPLATE_PROTECTION_PASSWORD, {
-    selectLockedCells: true, selectUnlockedCells: true,
-    formatColumns: false, formatRows: false, insertRows: false, deleteRows: false,
-  });
+  sheet.getRow(1).font = { bold: true };
+  sheet.getRow(1).fill = {
+    type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' },
+  };
 
-  // ── Sheet 3: Cities (Master) — same shape, same protection.
+  // pincode column — text format, 6-digit validation.
+  for (let row = 2; row <= MAX_DATA_ROWS + 1; row++) {
+    sheet.getCell(`C${row}`).numFmt = '@';
+    sheet.getCell(`C${row}`).dataValidation = {
+      type: 'textLength',
+      operator: 'equal',
+      formulae: [6],
+      showErrorMessage: true,
+      errorTitle: 'Invalid pincode',
+      error: 'Pincode must be exactly 6 digits.',
+    };
+  }
+
+  // ── Cities (Master) ──
   const citiesSheet = wb.addWorksheet('Cities (Master)');
   citiesSheet.columns = [
     { header: 'city_id',   key: 'city_id',   width: 10 },
@@ -59,184 +65,197 @@ async function generateTemplate() {
   ];
   citiesSheet.getRow(1).font = { bold: true };
   cities.forEach((c) => citiesSheet.addRow(c));
-  citiesSheet.protect(TEMPLATE_PROTECTION_PASSWORD, {
+  citiesSheet.protect(TEMPLATE_PASSWORD, {
     selectLockedCells: true, selectUnlockedCells: true,
   });
 
-  // ── Sheet 1: Mapping (the editable one). Order it FIRST so it opens by
-  //    default. ExcelJS' addWorksheet doesn't accept a position arg in all
-  //    versions — we move via the views/firstSheet hint instead.
-  const mappingSheet = wb.addWorksheet('Mapping');
-  mappingSheet.columns = [
-    { header: 'ZoneName', key: 'ZoneName', width: 32 },
-    { header: 'CityName', key: 'CityName', width: 32 },
-    { header: 'Pincode',  key: 'Pincode',  width: 12 },
-  ];
-  mappingSheet.getRow(1).font      = { bold: true };
-  mappingSheet.getRow(1).fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE7F1FB' } };
-  mappingSheet.getRow(1).alignment = { horizontal: 'center' };
-
-  // Apply list-validation to rows 2..MAX_DATA_ROWS for the two name columns.
-  // Formula1 must be a worksheet reference enclosed in `'...'!`. We point at
-  // each master's used range so adding zones/cities later (regenerate template)
-  // automatically picks them up.
-  const zoneListLastRow   = zonesSheet.rowCount;   // includes header
-  const cityListLastRow   = citiesSheet.rowCount;
-
-  for (let row = 2; row <= MAX_DATA_ROWS; row++) {
-    mappingSheet.getCell(`A${row}`).dataValidation = {
+  // city_name column — list validation against the Cities master.
+  const cityListRange = `'Cities (Master)'!$B$2:$B$${cities.length + 1}`;
+  for (let row = 2; row <= MAX_DATA_ROWS + 1; row++) {
+    sheet.getCell(`B${row}`).dataValidation = {
       type: 'list',
-      allowBlank: true,
-      formulae: [`='Zones (Master)'!$B$2:$B$${zoneListLastRow}`],
+      allowBlank: false,
+      formulae: [cityListRange],
       showErrorMessage: true,
-      errorStyle: 'error',
-      errorTitle: 'Unknown zone',
-      error: 'Pick a zone from the list. To add a new zone, contact the admin first — the template only allows existing zones.',
-    };
-    mappingSheet.getCell(`B${row}`).dataValidation = {
-      type: 'list',
-      allowBlank: true,
-      formulae: [`='Cities (Master)'!$B$2:$B$${cityListLastRow}`],
-      showErrorMessage: true,
-      errorStyle: 'error',
-      errorTitle: 'Unknown city',
-      error: 'Pick a city from the master list. New cities must be onboarded by an admin first.',
-    };
-    // Pincode column — numeric 6-digit. allowBlank because some rows may
-    // describe a city-zone link without a pincode constraint.
-    mappingSheet.getCell(`C${row}`).dataValidation = {
-      type: 'whole',
-      operator: 'between',
-      formulae: [100000, 999999],
-      allowBlank: true,
-      showErrorMessage: true,
-      errorTitle: 'Invalid pincode',
-      error: 'Pincode must be a 6-digit number. Leave blank to map the whole city to the zone.',
+      errorTitle: 'Invalid city',
+      error: 'Pick a city from the Cities (Master) sheet.',
     };
   }
 
-  // Add a 4th informational sheet — instructions to ops. Locked.
-  const helpSheet = wb.addWorksheet('Instructions');
-  helpSheet.columns = [{ header: 'How to use this template', key: 'note', width: 100 }];
-  helpSheet.getRow(1).font = { bold: true, size: 14 };
-  [
-    '1. Fill the "Mapping" sheet only. The other sheets are locked.',
-    '2. ZoneName + CityName cells are dropdowns — pick from the master lists.',
-    '3. Pincode is OPTIONAL. Leave blank to assign ALL pincodes of that city to the zone.',
-    '4. When you re-upload, existing (zone, city) mappings are KEPT and new ones are added — nothing is deleted.',
-    '5. To REMOVE a mapping, do it via the UI (zone detail → Manage Cities → uncheck).',
-    '6. Maximum rows: 5000 per upload. Split into multiple files if you have more.',
-    '7. To add a new zone or city, contact your admin first and re-download this template.',
-  ].forEach((t) => helpSheet.addRow({ note: t }));
-  helpSheet.protect(TEMPLATE_PROTECTION_PASSWORD, { selectLockedCells: true, selectUnlockedCells: false });
+  // ── Existing Zones (reference) ──
+  const zonesSheet = wb.addWorksheet('Existing Zones');
+  zonesSheet.columns = [
+    { header: 'zone_id',   key: 'zone_id',   width: 10 },
+    { header: 'zone_name', key: 'zone_name', width: 28 },
+    { header: 'city_name', key: 'city_name', width: 24 },
+  ];
+  zonesSheet.getRow(1).font = { bold: true };
+  zones.forEach((z) => zonesSheet.addRow(z));
+  zonesSheet.protect(TEMPLATE_PASSWORD, {
+    selectLockedCells: true, selectUnlockedCells: true,
+  });
 
-  // Make Mapping the first/active tab.
-  wb.views = [{ activeTab: wb.worksheets.findIndex((ws) => ws.name === 'Mapping') }];
+  // ── Read me ──
+  const notes = wb.addWorksheet('Read me');
+  notes.getColumn(1).width = 90;
+  [
+    'EasyFix — Manage Zones bulk upload',
+    '',
+    '1. Fill the "Zone Pincodes" sheet. One row per (zone, city, pincode).',
+    '2. zone_name is free text. If the (city_name, zone_name) pair does not exist yet,',
+    '   the zone is created on commit and the pincode is assigned to it.',
+    '3. The pincode must already be present in Manage Pincodes (tbl_pincode) for the',
+    '   given city. Add missing pincodes there first.',
+    '4. A pincode can only belong to ONE zone. Rows that try to move a pincode from',
+    '   one zone to another are rejected — deassign in the source zone first.',
+    '5. Run a Dry-run from the upload modal to see what would happen before committing.',
+  ].forEach((line, i) => {
+    const c = notes.getCell(`A${i + 1}`);
+    c.value = line;
+    if (i === 0) c.font = { bold: true, size: 14 };
+  });
+  notes.protect(TEMPLATE_PASSWORD, { selectLockedCells: true, selectUnlockedCells: true });
+
+  // Make the editable sheet the default tab regardless of platform.
+  wb.views = [{
+    x: 0, y: 0, width: 12000, height: 8000,
+    firstSheet: 0, activeTab: 0, visibility: 'visible',
+  }];
 
   return wb.xlsx.writeBuffer();
 }
 
-// ─── Parse + apply an uploaded mapping file ───────────────────────────
-/*
- * Returns:
- *   { summary: { totalRows, validRows, invalidRows, applied, skipped },
- *     results: [{ rowNumber, status: 'applied'|'skipped'|'failed', reason? }] }
- *
- * Modes:
- *   dryRun=true  → no DB writes; just validates and reports per-row.
- *   dryRun=false → upserts (zone_id, city_id) into tbl_zone_city_mapping.
- *
- * Why no DELETE: the use case is "add new mappings"; removing a city-zone
- * link is destructive (every easyfixer pinned to that city_zone_id would
- * be orphaned). Removal is intentionally UI-only with explicit confirmation.
- */
-async function processUpload(buffer, { dryRun = false } = {}) {
-  // SheetJS for reading — its tolerance for slight format drift across Excel
-  // versions (LibreOffice, Numbers, Google Sheets exports) is the best.
-  const xlsx = require('xlsx');
-  const wb   = xlsx.read(buffer, { type: 'buffer' });
-  const ws   = wb.Sheets['Mapping'];
-  if (!ws) {
-    const err = new Error('No "Mapping" sheet found. Did you upload our template?');
-    err.status = 400; throw err;
+// ─── Upload parser ───────────────────────────────────────────────────
+async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
+  const wb = XLSX.read(buffer, { type: 'buffer' });
+  const sheet = wb.Sheets['Zone Pincodes'] || wb.Sheets[wb.SheetNames[0]];
+  if (!sheet) {
+    return {
+      summary: { totalRows: 0, createdZones: 0, assignedPincodes: 0, failedCount: 0, skipCount: 0, dryRun },
+      results: [{ rowNumber: null, status: 'failed', errors: ['No "Zone Pincodes" sheet found'] }],
+    };
   }
-  const rows = xlsx.utils.sheet_to_json(ws, { defval: null });
+  const records = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
 
-  // Pull master tables ONCE. Stringify keys for case-insensitive matching.
-  const [[zones], [cities]] = await Promise.all([
-    pool.query('SELECT zone_id, zone_name FROM tbl_zone_master WHERE zone_status = 1'),
-    pool.query('SELECT city_id, city_name FROM tbl_city'),
-  ]);
-  const zoneByName = new Map(zones.map((z) => [String(z.zone_name).trim().toLowerCase(), z.zone_id]));
-  const cityByName = new Map(cities.map((c) => [String(c.city_name).trim().toLowerCase(), c.city_id]));
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
 
-  const results  = [];
-  const toUpsert = [];
-  let invalidRows = 0;
+    const [[cities], [zones], [pincodes]] = await Promise.all([
+      conn.query('SELECT city_id, city_name FROM tbl_city'),
+      conn.query('SELECT zone_id, zone_name, city_id FROM tbl_zone_master'),
+      conn.query('SELECT pincode_id, pincode, city_id, zone_id FROM tbl_pincode WHERE pincode_status = 1'),
+    ]);
+    const cityByName = new Map(cities.map((c) => [String(c.city_name).trim().toLowerCase(), c.city_id]));
+    const zoneByCityName = new Map();
+    for (const z of zones) zoneByCityName.set(`${z.city_id}::${String(z.zone_name).trim().toLowerCase()}`, z);
+    const pincodeByValue = new Map(pincodes.map((p) => [String(p.pincode), p]));
 
-  rows.forEach((r, idx) => {
-    const rowNumber = idx + 2;   // +2: header + 1-indexed
-    const zoneName  = (r.ZoneName || '').toString().trim();
-    const cityName  = (r.CityName || '').toString().trim();
-    const pincode   = r.Pincode != null ? String(r.Pincode).trim() : null;
+    const results = [];
+    let createdZones = 0;
+    let assignedPincodes = 0;
+    let failedCount = 0;
+    let skipCount = 0;
 
-    if (!zoneName && !cityName) return;   // empty row — silently skip
-    if (!zoneName) { results.push({ rowNumber, status: 'failed', reason: 'ZoneName empty' }); invalidRows++; return; }
-    if (!cityName) { results.push({ rowNumber, status: 'failed', reason: 'CityName empty' }); invalidRows++; return; }
+    for (let i = 0; i < records.length; i++) {
+      const rowNumber = i + 2;
+      const r = records[i];
+      const zoneName = String(r.zone_name || '').trim();
+      const cityName = String(r.city_name || '').trim();
+      const pincode  = String(r.pincode  || '').trim();
 
-    const zoneId = zoneByName.get(zoneName.toLowerCase());
-    const cityId = cityByName.get(cityName.toLowerCase());
-    if (!zoneId) { results.push({ rowNumber, status: 'failed', reason: `Unknown zone "${zoneName}"` }); invalidRows++; return; }
-    if (!cityId) { results.push({ rowNumber, status: 'failed', reason: `Unknown city "${cityName}"` }); invalidRows++; return; }
-    if (pincode && !/^\d{6}$/.test(pincode)) {
-      results.push({ rowNumber, status: 'failed', reason: `Invalid pincode "${pincode}" (must be 6 digits)` });
-      invalidRows++; return;
+      if (!zoneName && !cityName && !pincode) continue;
+
+      const errors = [];
+      if (!zoneName) errors.push('zone_name is required');
+      if (!cityName) errors.push('city_name is required');
+      if (!/^\d{6}$/.test(pincode)) errors.push(`Invalid pincode "${pincode}" (must be 6 digits)`);
+
+      const cityId = cityByName.get(cityName.toLowerCase());
+      if (!cityId && cityName) errors.push(`Unknown city "${cityName}"`);
+
+      if (errors.length) {
+        results.push({ rowNumber, status: 'failed', errors });
+        failedCount++;
+        continue;
+      }
+
+      // Resolve or create zone (within this city).
+      const zoneKey = `${cityId}::${zoneName.toLowerCase()}`;
+      let zone = zoneByCityName.get(zoneKey);
+      if (!zone) {
+        if (dryRun) {
+          zone = { zone_id: -(createdZones + 1), zone_name: zoneName, city_id: cityId };
+          zoneByCityName.set(zoneKey, zone);
+        } else {
+          const [zr] = await conn.query(
+            `INSERT INTO tbl_zone_master (zone_name, city_id, zone_status, created_date)
+             VALUES (?, ?, 1, NOW())`,
+            [zoneName, cityId]
+          );
+          await conn.query(
+            'INSERT INTO tbl_zone_city_mapping (zone_id, city_id) VALUES (?, ?)',
+            [zr.insertId, cityId]
+          );
+          zone = { zone_id: zr.insertId, zone_name: zoneName, city_id: cityId };
+          zoneByCityName.set(zoneKey, zone);
+        }
+        createdZones++;
+      }
+
+      // Resolve pincode + city integrity check.
+      const p = pincodeByValue.get(pincode);
+      if (!p) {
+        results.push({ rowNumber, status: 'failed', errors: [`Pincode ${pincode} not in Manage Pincodes — add it first`] });
+        failedCount++;
+        continue;
+      }
+      if (Number(p.city_id) !== Number(cityId)) {
+        results.push({ rowNumber, status: 'failed', errors: [`Pincode ${pincode} is in a different city than "${cityName}"`] });
+        failedCount++;
+        continue;
+      }
+      if (p.zone_id != null && Number(p.zone_id) !== Number(zone.zone_id)) {
+        results.push({ rowNumber, status: 'skipped', reason: `Pincode ${pincode} is already in another zone (id ${p.zone_id})` });
+        skipCount++;
+        continue;
+      }
+      if (Number(p.zone_id) === Number(zone.zone_id)) {
+        results.push({ rowNumber, status: 'skipped', reason: `Pincode ${pincode} already in this zone` });
+        skipCount++;
+        continue;
+      }
+
+      if (!dryRun) {
+        await conn.query(
+          'UPDATE tbl_pincode SET zone_id = ?, updated_by = ? WHERE pincode_id = ?',
+          [zone.zone_id, userId, p.pincode_id]
+        );
+        p.zone_id = zone.zone_id;
+      }
+      results.push({ rowNumber, status: 'assigned', pincode, zone_name: zoneName, city_name: cityName });
+      assignedPincodes++;
     }
 
-    toUpsert.push({ zoneId, cityId, rowNumber });
-  });
+    if (dryRun) await conn.rollback(); else await conn.commit();
 
-  let applied = 0;
-  let skipped = 0;
-
-  if (!dryRun && toUpsert.length > 0) {
-    /*
-     * Single batched INSERT IGNORE — duplicates against the existing
-     * (zone_id, city_id) become silent no-ops. We learn whether each row
-     * was a true insert vs a pre-existing match by comparing affectedRows.
-     * For per-row reporting we run a follow-up SELECT, capped to the rows
-     * we attempted — cheap on this scale (< 5k rows).
-     */
-    const values = toUpsert.map((u) => [u.zoneId, u.cityId]);
-    const [insertResult] = await pool.query(
-      'INSERT IGNORE INTO tbl_zone_city_mapping (zone_id, city_id) VALUES ?',
-      [values]
-    );
-    applied = insertResult.affectedRows;
-    skipped = toUpsert.length - applied;
-
-    // Per-row labels — we don't know which exact rows were inserted vs
-    // skipped without an extra round-trip, so we report aggregate at the
-    // summary level and mark every attempted row as 'applied' optimistically.
-    // Edge case acceptable for an admin bulk tool.
-    toUpsert.forEach((u) => results.push({ rowNumber: u.rowNumber, status: 'applied' }));
-  } else {
-    toUpsert.forEach((u) => results.push({ rowNumber: u.rowNumber, status: dryRun ? 'would-apply' : 'applied' }));
+    return {
+      summary: {
+        totalRows: records.length,
+        createdZones,
+        assignedPincodes,
+        skipCount,
+        failedCount,
+        dryRun,
+      },
+      results,
+    };
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
   }
-
-  results.sort((a, b) => a.rowNumber - b.rowNumber);
-
-  return {
-    summary: {
-      totalRows:   rows.length,
-      validRows:   toUpsert.length,
-      invalidRows,
-      applied,
-      skipped,
-      dryRun,
-    },
-    results,
-  };
 }
 
 module.exports = { generateTemplate, processUpload };
