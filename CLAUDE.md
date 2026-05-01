@@ -11,7 +11,7 @@ Unified Node.js/Express backend. Replaces 5 legacy services: CRM, Dropwizard :80
 - JWT via `jsonwebtoken` — for /api/admin, /api/client, /api/mobile
 - **HTTP Basic Auth** — for /api/integration/v1/* only (legacy client contract)
 - Joi for validation, custom human-readable logger (see `logger.js` + `middleware/http-log.js`)
-- Shared DB: `easyfix_core` on port 3306 — **never alter schema, never add tables**
+- Shared DB: `easyfix_core` on port 3306 — **never alter schema, never add tables** (the rule protects the five legacy services that share the DB; an EasyFix-owned new table no legacy service references is an explicit exception, e.g. `tbl_pincode` from `migrations/2026-05-01-create-tbl-pincode.sql` for the generic Manage Pincodes feature, distinct from firefox-client `pincode_firefox_city_mapping`).
 
 ## Route groups and their response contracts
 

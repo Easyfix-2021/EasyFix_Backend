@@ -16,6 +16,7 @@ router.use(role(['admin']));
 
 router.use('/easyfixers',      require('./easyfixers'));
 router.use('/zones',           require('./zones'));
+router.use('/pincodes',        require('./pincodes'));
 router.use('/deep-skills',     require('./deep-skills'));
 router.use('/auto-allocation', require('./auto-allocation'));
 router.use('/jobs',          require('./jobs'));
