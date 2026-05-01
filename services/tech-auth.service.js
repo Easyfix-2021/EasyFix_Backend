@@ -32,16 +32,33 @@ async function createLoginOtp(mobile) {
   const otp = resolveLoginOtp(mobile);
   const now = new Date();
   const expires = otpExpiryDate(now);
-  // Retire any still-live prior Tech Login OTPs for this mobile first, so the
-  // user can't accidentally type an older one (verify picks the newest).
-  await pool.query(
-    `UPDATE otp_details SET is_expired = 1
-      WHERE otp_type = 'Mobile App Otp' AND user_mobile_no = ? AND is_expired = 0`,
-    [mobile]);
-  await pool.query(
-    `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
-     VALUES (?, 'Mobile App Otp', ?, ?, ?, ?, 0, 1)`,
-    [otp, tech.efr_email, mobile, now, expires]);
+  // Single-row-per-(email, mobile, otp_type) upsert. We always write BOTH
+  // tech.efr_email and mobile so the (email, mobile, otp_type) tuple stays
+  // meaningful — if a technician's mobile is later reassigned to a different
+  // efr (with different email), this tuple is naturally distinct.
+  // Legacy partial rows (only mobile, no email) cannot satisfy the AND query
+  // in verify, so they stay safely out of the auth flow.
+  const [[existing]] = await pool.query(
+    `SELECT id FROM otp_details
+      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Mobile App Otp'
+      LIMIT 1`,
+    [tech.efr_email, mobile]
+  );
+  if (existing) {
+    await pool.query(
+      `UPDATE otp_details
+          SET otp = ?, generated_on = ?, valid_up_to = ?, is_expired = 0,
+              count = count + 1
+        WHERE id = ?`,
+      [otp, now, expires, existing.id]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
+       VALUES (?, 'Mobile App Otp', ?, ?, ?, ?, 0, 1)`,
+      [otp, tech.efr_email, mobile, now, expires]
+    );
+  }
   if (process.env.NODE_ENV !== 'production') {
     logger.event('🔑', 'cyan',
       `OTP for ${mobile}: ${otp}  (technician efr_id=${tech.efr_id}, valid 5 min) — dev only`);
@@ -66,9 +83,13 @@ async function createLoginOtp(mobile) {
 async function verifyLoginOtp(mobile, otp) {
   const tech = await findByMobile(mobile);
   if (!tech) return { ok: false, reason: 'USER_NOT_FOUND' };
+  // Match the same (email, mobile, otp_type) tuple createLoginOtp wrote.
+  // Both columns AND-ed → legacy mobile-only rows can't bleed into auth.
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired FROM otp_details
-      WHERE user_mobile_no = ? AND otp_type = 'Mobile App Otp' ORDER BY id DESC LIMIT 1`, [mobile]);
+      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Mobile App Otp'
+      LIMIT 1`,
+    [tech.efr_email, mobile]);
   if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
   if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);

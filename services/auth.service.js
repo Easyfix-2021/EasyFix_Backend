@@ -72,32 +72,48 @@ async function createLoginOtp(identifier) {
   const now = new Date();
   const expires = otpExpiryDate(now);
 
-  // Retire any still-live prior OTPs for this user BEFORE issuing the new one.
-  // Without this, a user who re-requested OTP would have multiple valid rows in
-  // otp_details; verify picks the latest by id DESC, so entering the OTP from an
-  // older SMS silently fails with OTP_MISMATCH — confusing and hard to diagnose.
-  await pool.query(
-    `UPDATE otp_details SET is_expired = 1
-      WHERE otp_type = 'crm_login'
-        AND (user_email = ? OR user_mobile_no = ?)
-        AND is_expired = 0`,
+  // Single-row-per-(email, mobile, otp_type) model. We look up by ALL THREE
+  // fields together so:
+  //   • a mobile reassigned to a different email gets its own row (no false reuse),
+  //   • legacy partial rows that have only email OR only mobile (set during the
+  //     old per-request-INSERT regime, or imported from prior tools) cannot match
+  //     and therefore can never collide with new auth flows.
+  // Always write BOTH email AND mobile from the user record on every UPSERT —
+  // never just one — so the (email, mobile, otp_type) tuple stays meaningful.
+  const [[existing]] = await pool.query(
+    `SELECT id FROM otp_details
+      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'crm_login'
+      LIMIT 1`,
     [user.official_email, user.mobile_no]
   );
 
-  // Persist the OTP FIRST, then send. If the INSERT throws, we bail before
-  // any SMS/email goes out — otherwise the user would get a code that isn't
-  // in the DB and verify would always fail, looking like a server bug. Only
-  // after the row is written do we hand off to deliverOtp below.
-  const [insertResult] = await pool.query(
-    `INSERT INTO otp_details
-       (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
-     VALUES (?, ?, ?, ?, ?, ?, 0, 1)`,
-    [otp, 'crm_login', user.official_email, user.mobile_no, now, expires]
-  );
-  if (!insertResult?.insertId) {
-    // Should be impossible given MySQL's AUTO_INCREMENT on otp_details.id, but
-    // fail closed rather than send a code the user can't verify.
-    throw new Error('Failed to persist OTP row before dispatch');
+  if (existing) {
+    // Refresh the existing row in place. count++ is the legacy "OTPs issued"
+    // counter; we don't reset it on each cycle so support can see how many
+    // times a given user re-requested.
+    await pool.query(
+      `UPDATE otp_details
+          SET otp = ?, generated_on = ?, valid_up_to = ?, is_expired = 0,
+              count = count + 1
+        WHERE id = ?`,
+      [otp, now, expires, existing.id]
+    );
+  } else {
+    // First-ever OTP for this (email, mobile, otp_type) tuple — fresh INSERT.
+    // We do NOT fall back to "INSERT if any partial-row exists" because
+    // partial legacy rows shouldn't be repaired silently — they should stay
+    // out of the auth flow entirely, exactly as the user requested.
+    const [insertResult] = await pool.query(
+      `INSERT INTO otp_details
+         (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
+       VALUES (?, 'crm_login', ?, ?, ?, ?, 0, 1)`,
+      [otp, user.official_email, user.mobile_no, now, expires]
+    );
+    if (!insertResult?.insertId) {
+      // Should be impossible given MySQL's AUTO_INCREMENT on otp_details.id, but
+      // fail closed rather than send a code the user can't verify.
+      throw new Error('Failed to persist OTP row before dispatch');
+    }
   }
 
   // DEV ONLY: log the OTP so developers can test without an SMS/email gateway.
@@ -130,16 +146,17 @@ async function verifyLoginOtp(identifier, otp) {
   const user = await findActiveUserByIdentifier(identifier);
   if (!user) return { ok: false, reason: 'USER_NOT_FOUND' };
 
-  const isEmail = /@/.test(identifier);
-  const column = isEmail ? 'user_email' : 'user_mobile_no';
-
+  // Match the same (email, mobile, otp_type) tuple createLoginOtp wrote
+  // against. AND-ing both columns ensures legacy partial rows (rows that
+  // had only email or only mobile) never get returned here — they simply
+  // can't satisfy the predicate. Single-row-per-tuple model means LIMIT 1
+  // is redundant in the happy path but kept as a safety net.
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired
        FROM otp_details
-      WHERE ${column} = ? AND otp_type = 'crm_login'
-      ORDER BY id DESC
+      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'crm_login'
       LIMIT 1`,
-    [identifier]
+    [user.official_email, user.mobile_no]
   );
 
   if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };

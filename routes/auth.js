@@ -28,16 +28,31 @@ router.post('/login', (_req, res) => {
 /*
  * POST /api/auth/login-otp
  * Body: { identifier: email | 10-digit mobile }
- * Always returns 200 to avoid user-enumeration; OTP only issued if user exists.
+ *
+ * Surfaces an explicit "account not registered" error when no matching
+ * tbl_user row exists. This trades the anti-enumeration guarantee for a
+ * clearer UX — operators specifically requested it because internal CRM
+ * users were getting "OTP sent" messages and then waiting forever for
+ * SMS/email that would never come (because the user simply didn't exist
+ * in the system). The trade-off is acceptable for an internal-only CRM
+ * behind VPN auth; do NOT copy this pattern to externally-exposed
+ * endpoints (client/mobile/integration) without re-evaluating.
  */
 router.post('/login-otp', validate(loginOtpRequest), async (req, res, next) => {
   try {
     const { identifier } = req.body;
     const result = await createLoginOtp(identifier);
+    if (!result.found) {
+      return modernError(
+        res,
+        404,
+        'This account is not registered in the CRM. Please check the email / mobile or contact your admin.'
+      );
+    }
     return modernOk(
       res,
-      { delivered: result.found, expiresAt: result.expiresAt ?? null },
-      'if the identifier is registered, an OTP has been sent'
+      { delivered: true, expiresAt: result.expiresAt ?? null },
+      'OTP sent'
     );
   } catch (err) {
     return next(err);

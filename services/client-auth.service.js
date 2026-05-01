@@ -37,20 +37,30 @@ async function createLoginOtp(identifier) {
   const otp = resolveLoginOtp(identifier);
   const now = new Date();
   const expires = otpExpiryDate(now);
-  // Retire any still-live prior SPOC Login OTPs for this SPOC first, so a stale
-  // OTP from an earlier request can't outrank the one we're about to issue.
-  await pool.query(
-    `UPDATE otp_details SET is_expired = 1
-      WHERE otp_type = 'Login Otp'
-        AND (user_email = ? OR user_mobile_no = ?)
-        AND is_expired = 0`,
+  // Single-row-per-(email, mobile, otp_type) upsert. Always write BOTH email
+  // and mobile from the SPOC record, so legacy partial rows can never match
+  // a future verify. See auth.service.js for the full rationale.
+  const [[existing]] = await pool.query(
+    `SELECT id FROM otp_details
+      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Login Otp'
+      LIMIT 1`,
     [spoc.contact_email, spoc.contact_no]
   );
-  await pool.query(
-    `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
-     VALUES (?, 'Login Otp', ?, ?, ?, ?, 0, 1)`,
-    [otp, spoc.contact_email, spoc.contact_no, now, expires]
-  );
+  if (existing) {
+    await pool.query(
+      `UPDATE otp_details
+          SET otp = ?, generated_on = ?, valid_up_to = ?, is_expired = 0,
+              count = count + 1
+        WHERE id = ?`,
+      [otp, now, expires, existing.id]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
+       VALUES (?, 'Login Otp', ?, ?, ?, ?, 0, 1)`,
+      [otp, spoc.contact_email, spoc.contact_no, now, expires]
+    );
+  }
   if (process.env.NODE_ENV !== 'production') {
     logger.event('🔑', 'cyan',
       `OTP for ${spoc.contact_email || spoc.contact_no}: ${otp}  (client SPOC id=${spoc.id}, valid 5 min) — dev only`);
@@ -72,11 +82,13 @@ async function createLoginOtp(identifier) {
 async function verifyLoginOtp(identifier, otp) {
   const spoc = await findSpoc(identifier);
   if (!spoc) return { ok: false, reason: 'USER_NOT_FOUND' };
-  const col = /@/.test(identifier) ? 'user_email' : 'user_mobile_no';
+  // Match the same (email, mobile, otp_type) tuple that createLoginOtp wrote.
+  // AND-ing both columns ensures partial legacy rows never get returned.
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired FROM otp_details
-      WHERE ${col} = ? AND otp_type = 'Login Otp' ORDER BY id DESC LIMIT 1`,
-    [identifier]
+      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Login Otp'
+      LIMIT 1`,
+    [spoc.contact_email, spoc.contact_no]
   );
   if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
   if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
