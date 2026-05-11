@@ -1,75 +1,119 @@
 const router = require('express').Router();
-const Joi = require('joi');
+const Joi    = require('joi');
+
 const validate = require('../../middleware/validate');
-const { pool } = require('../../db');
 const { roleByName } = require('../../middleware/role');
+const userService = require('../../services/user.service');
 const { modernOk, modernError } = require('../../utils/response');
 
-// Admin-only (already gated at /api/admin). Additional user-mgmt restriction:
-// only roles 2 ("Admin") and 15 ("Admin Supply") can mutate users.
-router.get('/', async (req, res, next) => {
+/*
+ * /api/admin/users — Manage Users settings surface.
+ *
+ * Mount inherits:
+ *   - requireAuth + role(['admin'])  via routes/admin/index.js
+ *
+ * Mutation routes additionally roleByName(['Admin']) — only the canonical
+ * Admin role can create / edit / deactivate users. Other admin-group roles
+ * (Finance, Project Manager, etc.) can READ for context but not mutate.
+ *
+ * Internal-user gate (user_type_id = 5) is enforced in the service layer.
+ */
+
+// ─── Validators ──────────────────────────────────────────────────────
+const idParam = Joi.object({ userId: Joi.number().integer().positive().required() });
+
+const listQuery = Joi.object({
+  q:               Joi.string().allow('', null).optional(),
+  roleId:          Joi.number().integer().positive().optional(),
+  cityId:          Joi.number().integer().positive().optional(),
+  includeInactive: Joi.boolean().default(false),
+  limit:           Joi.number().integer().min(1).max(1000).default(200),
+  offset:          Joi.number().integer().min(0).default(0),
+  sortBy:          Joi.string().valid(...Object.keys(userService.SORTABLE_COLUMNS)).default('user_name'),
+  sortDir:         Joi.string().lowercase().valid('asc', 'desc').default('asc'),
+});
+
+const createBody = Joi.object({
+  user_name:      Joi.string().trim().min(2).max(200).required(),
+  official_email: Joi.string().trim().lowercase().email().max(255).required(),
+  mobile_no:      Joi.string().trim().pattern(/^[0-9]{10}$/).required(),
+  alternate_no:   Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
+  user_role:      Joi.number().integer().positive().required(),
+  city_id:        Joi.number().integer().positive().allow(null).optional(),
+  // manage_clients / manage_cities / manage_states — comma-separated id strings
+  // (legacy varchar; no FK enforcement). We don't validate the contents to
+  // stay flexible with how legacy callers populate them; if it becomes a
+  // problem we tighten here.
+  manage_clients: Joi.string().allow('', null).optional(),
+  manage_cities:  Joi.string().allow('', null).optional(),
+  manage_states:  Joi.string().allow('', null).optional(),
+});
+
+const updateBody = Joi.object({
+  mobile_no:      Joi.string().trim().pattern(/^[0-9]{10}$/).optional(),
+  alternate_no:   Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
+  user_role:      Joi.number().integer().positive().optional(),
+  city_id:        Joi.number().integer().positive().allow(null).optional(),
+  manage_clients: Joi.string().allow('', null).optional(),
+  manage_cities:  Joi.string().allow('', null).optional(),
+  manage_states:  Joi.string().allow('', null).optional(),
+  is_active:      Joi.boolean().optional(),
+}).min(1);
+
+// ─── READ ────────────────────────────────────────────────────────────
+router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
-    const { q, roleId, includeInactive } = req.query;
-    const clauses = [], params = [];
-    if (includeInactive !== 'true') clauses.push('u.user_status = 1');
-    if (roleId != null) { clauses.push('u.user_role = ?'); params.push(roleId); }
-    if (q) { clauses.push('(u.user_name LIKE ? OR u.official_email LIKE ? OR u.mobile_no LIKE ?)'); params.push(`%${q}%`, `%${q}%`, `%${q}%`); }
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const limit = Math.min(Number(req.query.limit) || 50, 500);
-    const offset = Number(req.query.offset) || 0;
-    params.push(limit, offset);
-    const [rows] = await pool.query(
-      `SELECT u.user_id, u.user_code, u.user_name, u.official_email, u.mobile_no, u.user_role, r.role_name, u.city_id, u.user_status
-         FROM tbl_user u LEFT JOIN tbl_role r ON r.role_id = u.user_role
-         ${where} ORDER BY u.user_name LIMIT ? OFFSET ?`, params);
-    modernOk(res, rows);
+    const data = await userService.listUsers(req.query);
+    modernOk(res, data);
   } catch (e) { next(e); }
 });
 
-router.get('/:id', async (req, res, next) => {
+router.get('/:userId', validate(idParam, 'params'), async (req, res, next) => {
   try {
-    const [[u]] = await pool.query('SELECT * FROM tbl_user WHERE user_id = ?', [req.params.id]);
-    if (!u) return modernError(res, 404, 'user not found');
-    modernOk(res, u);
+    const row = await userService.getUserById(Number(req.params.userId));
+    if (!row) return modernError(res, 404, 'User not found');
+    modernOk(res, row);
   } catch (e) { next(e); }
 });
 
-router.post('/', roleByName(['Admin']), validate(Joi.object({
-  userName: Joi.string().max(200).required(),
-  officialEmail: Joi.string().email().max(255).required(),
-  mobileNo: Joi.string().pattern(/^[0-9]{10}$/).required(),
-  userRole: Joi.number().integer().positive().required(),
-  cityId: Joi.number().integer().positive().optional(),
-})), async (req, res, next) => {
+// ─── WRITE ───────────────────────────────────────────────────────────
+router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, next) => {
   try {
-    const [ins] = await pool.query(
-      `INSERT INTO tbl_user (user_name, official_email, mobile_no, user_role, city_id, user_status, insert_date)
-       VALUES (?, ?, ?, ?, ?, 1, NOW())`,
-      [req.body.userName, req.body.officialEmail, req.body.mobileNo, req.body.userRole, req.body.cityId || null]);
+    const created = await userService.createUser({
+      ...req.body,
+      createdBy: req.user?.user_id,
+    });
     res.status(201);
-    modernOk(res, { user_id: ins.insertId });
-  } catch (e) { next(e); }
+    modernOk(res, created, 'User added');
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
-router.put('/:id', roleByName(['Admin']), async (req, res, next) => {
-  try {
-    const b = req.body || {};
-    const allowed = ['user_name', 'official_email', 'mobile_no', 'alternate_no', 'user_role', 'city_id', 'user_status', 'manage_clients', 'manage_cities', 'manage_states'];
-    const sets = [], vals = [];
-    for (const k of allowed) if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(b[k]); }
-    if (sets.length === 0) return modernError(res, 400, 'nothing to update');
-    sets.push('update_date = NOW()', 'updated_by = ?');
-    vals.push(req.user.user_id, req.params.id);
-    await pool.query(`UPDATE tbl_user SET ${sets.join(', ')} WHERE user_id = ?`, vals);
-    modernOk(res, { updated: true });
-  } catch (e) { next(e); }
-});
+router.patch('/:userId',
+  roleByName(['Admin']),
+  validate(idParam, 'params'),
+  validate(updateBody),
+  async (req, res, next) => {
+    try {
+      const updated = await userService.updateUser(
+        Number(req.params.userId), req.body, req.user?.user_id
+      );
+      if (!updated) return modernError(res, 404, 'User not found');
+      modernOk(res, updated, 'User updated');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  }
+);
 
-router.patch('/:id/status', roleByName(['Admin']), async (req, res, next) => {
+router.delete('/:userId', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
   try {
-    await pool.query('UPDATE tbl_user SET user_status = ?, update_date = NOW(), updated_by = ? WHERE user_id = ?',
-      [req.body.active ? 1 : 0, req.user.user_id, req.params.id]);
-    modernOk(res, { updated: true });
+    const ok = await userService.deactivateUser(Number(req.params.userId), req.user?.user_id);
+    if (!ok) return modernError(res, 404, 'User not found');
+    modernOk(res, { deactivated: true });
   } catch (e) { next(e); }
 });
 

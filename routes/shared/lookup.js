@@ -69,6 +69,21 @@ router.get('/users',            role(['admin']), validate(usersQuery, 'query'), 
   try { modernOk(res, await lookup.users(req.query)); } catch (e) { next(e); }
 });
 
+// Roles dropdown — admin-only. Used by the Manage Users form to fill the
+// "Role" picker, and by Manage Roles itself for the picker on related
+// screens. Optional `group` filter (admin|client|mobile|default) narrows
+// the list to roles valid for a specific user type.
+router.get('/roles',            role(['admin']),                                         async (req, res, next) => {
+  try { modernOk(res, await lookup.roles(req.query)); } catch (e) { next(e); }
+});
+
+// Menu-action catalogue — drives the per-menu action checkboxes on the
+// Manage Roles edit form. Admin-only since exposing the full action key
+// list reveals every gated capability in the CRM.
+router.get('/menu-actions',     role(['admin']),                                         async (_req, res, next) => {
+  try { modernOk(res, await lookup.menuActions()); } catch (e) { next(e); }
+});
+
 // Compact easyfixer picker for "Assign Technician" dropdowns. Admin-only: client
 // SPOCs and technicians themselves have no business enumerating the full bench.
 router.get('/easyfixers',       role(['admin']),                                          async (req, res, next) => {

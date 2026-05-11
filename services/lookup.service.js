@@ -135,6 +135,75 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
   return rows;
 }
 
+// ─── Roles (admin-scoped) ───────────────────────────────────────────
+/*
+ * Picker projection for tbl_role. The Manage Users form needs this to fill
+ * the "Role" dropdown; we also surface the classification group so the
+ * frontend can hide non-admin roles when assigning to internal staff.
+ *
+ * Active-only by default — the Manage Roles screen passes
+ * `includeInactive=true` when the operator toggles "Include inactive".
+ */
+async function roles({ q, includeInactive = false, group } = {}) {
+  const { ROLE_ID_TO_GROUP } = require('./role.service');
+  const clauses = [];
+  const params = [];
+  if (!includeInactive) clauses.push('r.role_status = 1');
+  if (q) {
+    clauses.push('(r.role_name LIKE ? OR r.role_desc LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`);
+  }
+  if (group) {
+    // Filter by group classification (admin/client/mobile/default). Reads
+    // the same in-code map the middleware uses — single source of truth.
+    const ids = Object.entries(ROLE_ID_TO_GROUP)
+      .filter(([, g]) => g === group)
+      .map(([id]) => Number(id));
+    if (ids.length === 0) return [];
+    clauses.push(`r.role_id IN (${ids.map(() => '?').join(',')})`);
+    params.push(...ids);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const [rows] = await pool.query(
+    `SELECT r.role_id, r.role_name, r.role_desc, r.role_status
+       FROM tbl_role r
+      ${where}
+      ORDER BY r.role_name ASC`,
+    params
+  );
+  return rows.map((r) => ({
+    ...r,
+    role_status: r.role_status === 1 || r.role_status === true ? 1 : 0,
+    group: ROLE_ID_TO_GROUP[r.role_id] ?? 'unknown',
+  }));
+}
+
+// ─── Menu actions (menu_action) — for Manage Roles editor ────────────
+/*
+ * Returns the full menu_action catalogue grouped by menu_id. Drives the
+ * per-menu action-permission checkboxes on the Manage Roles edit form.
+ *
+ *   menu_action.action_name  is the free-text permission key checked at
+ *                            button-render time (e.g. "isUserEdit").
+ *   menu_action.name         is the human label ("Edit User") shown in the
+ *                            checkbox UI.
+ *
+ * Active-only by default (`status = 1` AND `delete_status = 0` matches
+ * legacy MenuActionDaoImpl). Whole list is small (~100–300 rows in legacy
+ * prod), so we return everything and let the frontend filter by menu.
+ */
+async function menuActions() {
+  const [rows] = await pool.query(
+    `SELECT ma.id, ma.menu_id, m.menu_name, ma.name, ma.action_name
+       FROM menu_action ma
+       LEFT JOIN tbl_menu m ON m.menu_id = ma.menu_id
+      WHERE (ma.status IS NULL OR ma.status = 1)
+        AND (ma.delete_status IS NULL OR ma.delete_status = 0)
+      ORDER BY m.sequence ASC, m.menu_name ASC, ma.name ASC`
+  );
+  return rows;
+}
+
 // ─── Sidebar menus (tbl_menu) ───────────────────────────────────────
 /*
  * Returns the active menu tree as a flat list sorted by sequence. Frontend
@@ -237,6 +306,8 @@ module.exports = {
   clients,
   clientServices,
   users,
+  roles,
+  menuActions,
   easyfixers,
   menus,
   cancelReasons,

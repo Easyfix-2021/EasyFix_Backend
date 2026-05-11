@@ -27,6 +27,7 @@ router.use('/webhooks',        require('./webhooks'));
 router.use('/finance',         require('./finance'));
 router.use('/clients',         require('./clients'));
 router.use('/users',           require('./users'));
+router.use('/roles',           require('./roles'));
 router.use('/rate-cards',      require('./rate-cards'));
 router.use('/quotations',      require('./quotations'));
 router.use('/questionnaires',  require('./questionnaires'));

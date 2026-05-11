@@ -110,6 +110,12 @@ router.post('/verify-otp', validate(verifyOtpRequest), async (req, res, next) =>
 router.get('/me', requireAuth, async (req, res, next) => {
   try {
     const role = await getRoleById(req.user.user_role);
+    // Resolve menu_ids + action permissions in the same shape the legacy
+    // session map exposed (LoginAction.java lines 92–98). Frontend treats
+    // menuIds as the sidebar allowlist and actionPermissions as the
+    // button-gating Set.
+    const { getEffectivePermissions } = require('../services/role.service');
+    const permissions = await getEffectivePermissions(req.user.user_id);
     modernOk(res, {
       user: req.user,
       role: role && {
@@ -118,6 +124,7 @@ router.get('/me', requireAuth, async (req, res, next) => {
         group: role.group,
         active: role.role_status,
       },
+      permissions,
     });
   } catch (err) {
     next(err);
