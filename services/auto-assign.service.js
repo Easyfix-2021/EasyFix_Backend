@@ -435,22 +435,53 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
 }
 
 // ─── Single-job auto-assign ─────────────────────────────────────────
+/*
+ * Auto-assign now DELEGATES to candidate-ranking.service.rankCandidatesForJob
+ * — single source of truth for the layered pipeline. The legacy in-file
+ * eligibleCandidates / statsForCandidates / score functions remain for
+ * backward compatibility with anything that imported them directly, but
+ * the assign + bulk-assign code paths below all consume the shared service.
+ *
+ * Post-assignment side-effects (TechAssigned webhook, FCM push, failure-
+ * notification email) are unchanged — they fire from jobService.assign().
+ */
+const candidateRanking = require('./candidate-ranking.service');
+
 async function assignTopCandidate(jobId, actor) {
-  const result = await getCandidates(jobId, { limit: 1 });
+  const result = await candidateRanking.rankCandidatesForJob(jobId, { limit: 50 });
+
   if (result.alreadyAssigned) {
-    const err = new Error(`job ${jobId} is already assigned to easyfixer ${result.assignedTo}`);
+    const err = new Error(`job ${jobId} is already assigned`);
     err.status = 409;
     throw err;
   }
   if (!result.candidates.length) {
-    const err = new Error('no eligible candidate found');
+    const err = new Error(
+      result.note === 'no_deep_skill_match'
+        ? 'no candidate matched the deep-skill required for this job'
+        : 'no eligible candidate found'
+    );
     err.status = 422;
-    err.details = { l1Count: result.l1Count, rejectedCount: result.rejectedCount };
+    err.details = { l1Count: result.l1Count, rejectedCount: result.rejected.length, note: result.note };
     throw err;
   }
-  const top = result.candidates[0];
+
+  // Customer-paid jobs need a tech with cash on hand; pickAutoAssignCandidate
+  // walks the ranked list and grabs the first one over the floor (or the
+  // top-ranked tech with a `low_balance` flag if nobody clears it).
+  const pick = candidateRanking.pickAutoAssignCandidate(result, { paidBy: result.job.paid_by });
+  const top = pick.candidate;
+
   const assigned = await jobService.assign(jobId, { easyfixerId: top.efr_id }, actor);
-  return { job: assigned, chosen: top, l1Count: result.l1Count, rejectedCount: result.rejectedCount };
+  return {
+    job: assigned,
+    chosen: top,
+    pick_reason: pick.reason,
+    low_balance: pick.low_balance,
+    l1Count: result.l1Count,
+    rejectedCount: result.rejected.length,
+    note: result.note,
+  };
 }
 
 // ─── Bulk auto-assign for all unassigned booked jobs ────────────────
@@ -467,18 +498,29 @@ async function bulkAssignUnassigned({ limit = 50, dryRun = false } = {}, actor) 
   let assignedCount = 0;
   for (const { job_id } of unassigned) {
     try {
-      const candidates = await getCandidates(job_id, { limit: 1 });
-      if (!candidates.candidates.length) {
-        results.push({ jobId: job_id, status: 'no_candidate', l1Count: candidates.l1Count, rejectedCount: candidates.rejectedCount });
+      const ranked = await candidateRanking.rankCandidatesForJob(job_id, { limit: 50 });
+      if (!ranked.candidates.length) {
+        results.push({
+          jobId: job_id, status: 'no_candidate',
+          l1Count: ranked.l1Count, rejectedCount: ranked.rejected.length,
+          note: ranked.note,
+        });
         continue;
       }
-      const top = candidates.candidates[0];
+      const pick = candidateRanking.pickAutoAssignCandidate(ranked, { paidBy: ranked.job.paid_by });
+      const top = pick.candidate;
       if (dryRun) {
-        results.push({ jobId: job_id, status: 'would_assign', efrId: top.efr_id, score: top.score });
+        results.push({
+          jobId: job_id, status: 'would_assign', efrId: top.efr_id, score: top.score,
+          pick_reason: pick.reason, low_balance: pick.low_balance,
+        });
       } else {
         await jobService.assign(job_id, { easyfixerId: top.efr_id }, actor);
         assignedCount++;
-        results.push({ jobId: job_id, status: 'assigned', efrId: top.efr_id, score: top.score });
+        results.push({
+          jobId: job_id, status: 'assigned', efrId: top.efr_id, score: top.score,
+          pick_reason: pick.reason, low_balance: pick.low_balance,
+        });
       }
     } catch (e) {
       logger.warn({ jobId: job_id, err: e.message }, 'bulk auto-assign row failed');

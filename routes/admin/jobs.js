@@ -2,6 +2,7 @@ const router = require('express').Router();
 
 const validate = require('../../middleware/validate');
 const job = require('../../services/job.service');
+const candidateRanking = require('../../services/candidate-ranking.service');
 const { modernOk, modernError } = require('../../utils/response');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, ownerBody, idParam,
@@ -9,6 +10,34 @@ const {
 
 // Upload sub-router (POST /upload) — isolated because of multer middleware.
 router.use(require('./jobs-upload'));
+
+/*
+ * GET /api/admin/jobs/:id/candidates?limit=50
+ *
+ * Returns ranked technicians for the Assign / Reassign modal on /my-orders
+ * and /jobs. Same layered pipeline used by on-create auto-assign — see
+ * services/candidate-ranking.service.js. Returns per-candidate breakdowns
+ * (Rating, TAT, SDA, Worked-for-Client, Worked-for-Vertical, Attendance)
+ * plus account balance for sorting tie-break.
+ *
+ * If no technician passes the deep-skill filter, the response includes
+ * `note: 'no_deep_skill_match'` and the candidates list is the same query
+ * with the skill predicate dropped — so the modal can show a banner and
+ * still let ops pick someone.
+ *
+ * Listed BEFORE `/:id/assign` and other `/:id/*` so Express matches the
+ * literal `candidates` segment first.
+ */
+router.get('/:id/candidates', validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+    const result = await candidateRanking.rankCandidatesForJob(req.params.id, { limit });
+    modernOk(res, result);
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
