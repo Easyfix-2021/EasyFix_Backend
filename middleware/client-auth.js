@@ -3,8 +3,12 @@ const { findSpocById } = require('../services/client-auth.service');
 const { modernError } = require('../utils/response');
 
 module.exports = async function requireSpocAuth(req, res, next) {
-  const token = req.cookies?.spocToken ||
-    (req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.slice(7));
+  // Accept both the new cookie name (`client_auth_token`, aligned with the
+  // frontend localStorage key) and the legacy `spocToken` name during a
+  // rolling deploy. Either source is acceptable.
+  const token = req.cookies?.client_auth_token
+    || req.cookies?.spocToken
+    || (req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.slice(7));
   if (!token) return modernError(res, 401, 'authentication required');
 
   let payload;

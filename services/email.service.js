@@ -96,7 +96,7 @@ function toRecipientArray(input) {
   return arr.map((addr) => ({ emailAddress: { address: addr } }));
 }
 
-async function send({ to, subject, text, html, cc, bcc, category }) {
+async function send({ to, subject, text, html, cc, bcc, category, attachments }) {
   const originalTo = to;
   if (!to)             return { delivered: false, error: 'to is required' };
   if (!subject)        return { delivered: false, error: 'subject is required' };
@@ -171,6 +171,18 @@ async function send({ to, subject, text, html, cc, bcc, category }) {
       bccRecipients: toRecipientArray(bcc),
       internetMessageHeaders,
     };
+
+    // Graph attachments: each one is a fileAttachment with base64 contentBytes.
+    // Buffer.from() handles both Buffer inputs (from a PassThrough sink) and
+    // raw string content; the contentType defaults to application/octet-stream.
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      message.attachments = attachments.map((a) => ({
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        name: a.filename || a.name || 'attachment',
+        contentType: a.contentType || a.mimeType || 'application/octet-stream',
+        contentBytes: (Buffer.isBuffer(a.content) ? a.content : Buffer.from(a.content)).toString('base64'),
+      }));
+    }
 
     const graphUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(sender)}/sendMail`;
     const res = await fetch(graphUrl, {

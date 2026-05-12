@@ -15,13 +15,23 @@ module.exports = async function basicAuth(req, res, next) {
   const [user, pass] = Buffer.from(header.slice(6), 'base64').toString('utf8').split(':', 2);
   if (!user || !pass) return legacyError(res, 401, 'Unauthorized');
 
+  // Pull client_name in the same query — Decathlon-only branches in
+  // /v1/easyfixers/availability-status-check gate on the literal name.
   const [[row]] = await pool.query(
-    `SELECT client_login_id, client_id, login_name FROM tbl_client_website
-      WHERE login_name = ? AND login_password = ? AND status = 1 LIMIT 1`,
+    `SELECT cw.client_login_id, cw.client_id, cw.login_name, c.client_name
+       FROM tbl_client_website cw
+       LEFT JOIN tbl_client c ON c.client_id = cw.client_id
+      WHERE cw.login_name = ? AND cw.login_password = ? AND cw.status = 1
+      LIMIT 1`,
     [user, pass]
   );
   if (!row) return legacyError(res, 401, 'Invalid credentials');
 
-  req.integrationClient = { id: row.client_id, loginName: row.login_name, loginId: row.client_login_id };
+  req.integrationClient = {
+    id: row.client_id,
+    name: row.client_name || null,
+    loginName: row.login_name,
+    loginId: row.client_login_id,
+  };
   next();
 };

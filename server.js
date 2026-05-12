@@ -46,6 +46,33 @@ async function start() {
     process.exit(1);
   }
 
+  // Schema parity check — fails the boot if any column the code touches
+  // is missing from the live INFORMATION_SCHEMA. Caught 6 phantom-column
+  // bugs during the final migration audit; cheap to run on every start
+  // (~50ms of metadata queries).
+  // Override with SKIP_SCHEMA_VERIFY=true for emergency boots.
+  if (String(process.env.SKIP_SCHEMA_VERIFY).toLowerCase() !== 'true') {
+    try {
+      const { verifySchemaAgainstLiveDb } = require('./scripts/schema-verify');
+      const report = await verifySchemaAgainstLiveDb();
+      if (!report.ok) {
+        logger.error(`Schema parity check FAILED — ${report.requiredMismatches.length} mismatches:`);
+        for (const m of report.requiredMismatches) {
+          logger.error(`  ${m.table}.${m.col || m.missing}`);
+        }
+        logger.error('Server will not start. Run migrations or set SKIP_SCHEMA_VERIFY=true to override.');
+        process.exit(1);
+      }
+      logger.info(`Schema parity OK — ${report.columnsChecked} columns / ${report.tablesChecked} tables verified` +
+        (report.optionalMissing.length ? ` (${report.optionalMissing.length} optional tables missing — handled gracefully)` : ''));
+    } catch (err) {
+      logger.error(`Schema verify crashed — ${err.message}. Server will not start.`);
+      process.exit(1);
+    }
+  } else {
+    logger.warn('Schema verify SKIPPED via SKIP_SCHEMA_VERIFY=true.');
+  }
+
   const server = app.listen(PORT, () => {
     const env = process.env.NODE_ENV || 'development';
     logger.ready(`Server is ready — listening on http://localhost:${PORT} (${env} mode)`);

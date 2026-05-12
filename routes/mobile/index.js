@@ -257,10 +257,14 @@ router.post('/device', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
-router.get('/training-videos', async (req, res, next) => {
+// VERIFIED 2026-05-12 against ACD_APIs TrainingVideo.java:
+//   training_videos columns: id, title, description, sub_title, sub_description
+router.get('/training-videos', async (_req, res, next) => {
   try {
-    // Real column set unknown; return scaffolded placeholder with TODO
-    modernOk(res, { videos: [], note: 'training videos table TBD — Phase 12' });
+    const [rows] = await pool.query(
+      'SELECT id, title, description, sub_title, sub_description FROM training_videos ORDER BY id DESC'
+    );
+    modernOk(res, rows);
   } catch (e) { next(e); }
 });
 

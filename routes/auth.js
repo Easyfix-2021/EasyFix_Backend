@@ -148,10 +148,17 @@ router.post('/refresh', requireAuth, (req, res) => {
 
 /*
  * POST /api/auth/logout
- * Clears the cookie. JWTs themselves stay valid until expiry — stateless by design.
+ * Clears every known auth cookie. JWTs themselves stay valid until expiry
+ * — stateless by design. Cookies cleared:
+ *   `token`              — admin/CRM staff session
+ *   `client_auth_token`  — SPOC session (current name, matches frontend localStorage key)
+ *   `spocToken`          — SPOC session (legacy name, kept for rolling-deploy callers)
+ * Frontends are still responsible for wiping their own localStorage tokens.
  */
 router.post('/logout', (_req, res) => {
   res.clearCookie('token');
+  res.clearCookie('client_auth_token');
+  res.clearCookie('spocToken');
   modernOk(res, { loggedOut: true });
 });
 

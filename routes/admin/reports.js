@@ -1,6 +1,10 @@
 const router = require('express').Router();
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+const { sendXlsx } = require('../../utils/xlsx-export');
+
+const wantsXlsx = (req) => String(req.query.format || '').toLowerCase() === 'xlsx';
+const stamp = () => new Date().toISOString().slice(0, 10);
 
 router.get('/completed-jobs', async (req, res, next) => {
   try {
@@ -19,6 +23,24 @@ router.get('/completed-jobs', async (req, res, next) => {
          LEFT JOIN tbl_city      ci ON ci.city_id = ad.city_id
          WHERE ${clauses.join(' AND ')}
          ORDER BY j.checkout_date_time DESC LIMIT 1000`, params);
+
+    if (wantsXlsx(req)) {
+      return sendXlsx(res, {
+        filename: `completed-jobs-${stamp()}.xlsx`,
+        sheetName: 'Completed Jobs',
+        columns: [
+          { key: 'job_id',              header: 'Job ID',         width: 10 },
+          { key: 'fk_client_id',        header: 'Client ID',      width: 10 },
+          { key: 'client_name',         header: 'Client',         width: 28 },
+          { key: 'job_type',            header: 'Job Type',       width: 14 },
+          { key: 'checkout_date_time',  header: 'Checkout',       width: 20 },
+          { key: 'easyfixer',           header: 'Easyfixer',      width: 24 },
+          { key: 'city_name',           header: 'City',           width: 18 },
+          { key: 'total_amount',        header: 'Total Amount',   width: 14 },
+        ],
+        rows,
+      });
+    }
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -37,6 +59,21 @@ router.get('/easyfixer', async (req, res, next) => {
               COUNT(j.job_id) AS total_jobs
          FROM tbl_easyfixer ef LEFT JOIN tbl_job j ON j.fk_easyfixter_id = ef.efr_id
          ${where} GROUP BY ef.efr_id, ef.efr_name ORDER BY completed DESC LIMIT 500`, params);
+
+    if (wantsXlsx(req)) {
+      return sendXlsx(res, {
+        filename: `easyfixer-report-${stamp()}.xlsx`,
+        sheetName: 'Easyfixers',
+        columns: [
+          { key: 'efr_id',     header: 'Easyfixer ID', width: 12 },
+          { key: 'efr_name',   header: 'Name',         width: 26 },
+          { key: 'completed',  header: 'Completed',    width: 12 },
+          { key: 'cancelled',  header: 'Cancelled',    width: 12 },
+          { key: 'total_jobs', header: 'Total Jobs',   width: 12 },
+        ],
+        rows,
+      });
+    }
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -53,6 +90,21 @@ router.get('/payout-sheet', async (req, res, next) => {
            AND j.job_status IN (3,5) AND j.checkout_date_time BETWEEN ? AND ?
         WHERE ef.efr_status = 1
         GROUP BY ef.efr_id ORDER BY jobs_completed DESC LIMIT 1000`, [from, to]);
+
+    if (wantsXlsx(req)) {
+      return sendXlsx(res, {
+        filename: `payout-sheet-${stamp()}.xlsx`,
+        sheetName: 'Payout Sheet',
+        columns: [
+          { key: 'efr_id',          header: 'Easyfixer ID',    width: 12 },
+          { key: 'efr_name',        header: 'Name',            width: 26 },
+          { key: 'efr_no',          header: 'Mobile',          width: 14 },
+          { key: 'current_balance', header: 'Current Balance', width: 16 },
+          { key: 'jobs_completed',  header: 'Jobs Completed',  width: 14 },
+        ],
+        rows,
+      });
+    }
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -69,6 +121,21 @@ router.get('/city-analysis', async (req, res, next) => {
          LEFT JOIN tbl_job j ON j.fk_address_id = ad.address_id
         WHERE ci.city_status = 1
         GROUP BY ci.city_id ORDER BY total_jobs DESC LIMIT 100`);
+
+    if (wantsXlsx(req)) {
+      return sendXlsx(res, {
+        filename: `city-analysis-${stamp()}.xlsx`,
+        sheetName: 'City Analysis',
+        columns: [
+          { key: 'city_id',    header: 'City ID',    width: 10 },
+          { key: 'city_name',  header: 'City',       width: 22 },
+          { key: 'total_jobs', header: 'Total Jobs', width: 12 },
+          { key: 'completed',  header: 'Completed',  width: 12 },
+          { key: 'cancelled',  header: 'Cancelled',  width: 12 },
+        ],
+        rows,
+      });
+    }
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -82,6 +149,64 @@ router.get('/job-tracking', async (req, res, next) => {
          FROM scheduling_history sh LEFT JOIN tbl_easyfixer ef ON ef.efr_id = sh.easyfixer_id
         WHERE sh.job_id = ? ORDER BY sh.id ASC`, [jobId]);
     modernOk(res, history);
+  } catch (e) { next(e); }
+});
+
+// Legacy parity: userProductivity (UserAction.getUserCRMActiveTime).
+// Pairs each user's login_date_time with logout_date_time (or NOW() if open)
+// in tbl_user_login_logout_logs and sums active seconds per user across the
+// requested window. Returns one row per user with sessions count and active
+// hours; supports ?format=xlsx for download.
+router.get('/user-productivity', async (req, res, next) => {
+  try {
+    const { from, to, userId, roleId } = req.query;
+    if (!from || !to) return modernError(res, 400, 'from and to required');
+    const clauses = ['l.login_date_time BETWEEN ? AND ?'];
+    const params = [from, to];
+    if (userId != null) { clauses.push('l.user_id = ?'); params.push(userId); }
+    if (roleId != null) { clauses.push('u.user_role = ?'); params.push(roleId); }
+    const [rows] = await pool.query(
+      `SELECT u.user_id, u.user_name, u.user_code, u.official_email,
+              r.role_name,
+              COUNT(l.id) AS sessions,
+              SUM(TIMESTAMPDIFF(SECOND, l.login_date_time, COALESCE(l.logout_date_time, NOW()))) AS active_seconds
+         FROM tbl_user u
+         JOIN tbl_user_login_logout_logs l ON l.user_id = u.user_id
+         LEFT JOIN tbl_role r ON r.role_id = u.user_role
+        WHERE ${clauses.join(' AND ')}
+        GROUP BY u.user_id, u.user_name, u.user_code, u.official_email, r.role_name
+        ORDER BY active_seconds DESC
+        LIMIT 1000`, params);
+
+    const enriched = rows.map(r => {
+      const secs = Number(r.active_seconds) || 0;
+      const hours = secs / 3600;
+      return {
+        ...r,
+        active_seconds: secs,
+        active_hours: Math.round(hours * 100) / 100,
+        active_time: `${Math.floor(hours)}h ${Math.floor((secs % 3600) / 60)}m`,
+      };
+    });
+
+    if (wantsXlsx(req)) {
+      return sendXlsx(res, {
+        filename: `user-productivity-${stamp()}.xlsx`,
+        sheetName: 'User Productivity',
+        columns: [
+          { key: 'user_id',        header: 'User ID',     width: 10 },
+          { key: 'user_code',      header: 'Code',        width: 12 },
+          { key: 'user_name',      header: 'Name',        width: 26 },
+          { key: 'official_email', header: 'Email',       width: 28 },
+          { key: 'role_name',      header: 'Role',        width: 22 },
+          { key: 'sessions',       header: 'Sessions',    width: 10 },
+          { key: 'active_hours',   header: 'Active Hours',width: 14 },
+          { key: 'active_time',    header: 'Active Time', width: 14 },
+        ],
+        rows: enriched,
+      });
+    }
+    modernOk(res, enriched);
   } catch (e) { next(e); }
 });
 

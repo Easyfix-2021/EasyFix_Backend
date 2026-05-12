@@ -58,4 +58,64 @@ router.post('/test', validate(testBody), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ─── /admin/notifications/bulk-sms — marketing SMS blast ────────────
+// Mirrors legacy `sendBulkSMSToNosIntbl_bulk_sms_nosTable` +
+// `sendBulkSMS.sendSmstoAll`. Sends one SMS per row of
+// `tbl_bulk_sms_nos` (verified column: `mobile_no`).
+//
+// Inline `mobileNumbers` array overrides the table — useful when ops
+// wants to send to an ad-hoc list without touching the DB.
+//
+// Honours NOTIFICATIONS_DISABLE — in dev/staging the loop logs but
+// doesn't hit SMSCountry (per sms.service.js semantics).
+const { pool } = require('../../db');
+const Joi = require('joi');
+router.post('/bulk-sms', validate(Joi.object({
+  message: Joi.string().trim().min(1).max(500).required(),
+  mobileNumbers: Joi.array().items(Joi.string().pattern(/^\d{10,12}$/)).min(1).required(),
+})), async (req, res, next) => {
+  // Live-DB-verified 2026-05-12: `tbl_bulk_sms_nos` does NOT exist in
+  // production. Legacy `sendBulkSMS.java` referenced it for a one-off
+  // Diwali promo; the table was dropped years ago. We require inline
+  // `mobileNumbers` instead — admin must supply the list explicitly.
+  try {
+    const numbers = req.body.mobileNumbers;
+    const results = await Promise.all(numbers.map((n) => sms.send({ to: n, message: req.body.message })
+      .then((r) => ({ to: n, delivered: !!r.delivered, error: r.error || null }))
+      .catch((err) => ({ to: n, delivered: false, error: err.message }))));
+    const deliveredCount = results.filter((r) => r.delivered).length;
+    modernOk(res, {
+      total: results.length,
+      deliveredCount,
+      failedCount: results.length - deliveredCount,
+      results,
+    });
+  } catch (e) { next(e); }
+});
+
+// ─── /admin/notifications/whatsapp-templates ────────────────────────
+// Returns the 11 Gallabox templates wired to lifecycle events. The list
+// is the source of truth for which templateName to call sendTemplate
+// with from `services/notification-orchestrator.service.js`.
+//
+// Templates listed in CLAUDE.md (verified against WhatsNotificationUtil.java
+// imports): accepted_on_app, tx_accepted_client, order_reject, ota_noo,
+// ota_yes, cx_revisit_yes, eta_sent_clone_clone, pm_txreschedule,
+// cancel_order, cx_revisit_no, qa_cx_order_confirm.
+router.get('/whatsapp-templates', (_req, res) => {
+  modernOk(res, [
+    { event: 'job.assigned',          templateName: 'accepted_on_app',        recipient: 'client' },
+    { event: 'job.accepted_by_tech',  templateName: 'tx_accepted_client',     recipient: 'client' },
+    { event: 'job.rejected_by_tech',  templateName: 'order_reject',           recipient: 'client' },
+    { event: 'job.otp.no_attempt',    templateName: 'ota_noo',                recipient: 'customer' },
+    { event: 'job.otp.attempted',     templateName: 'ota_yes',                recipient: 'customer' },
+    { event: 'job.revisit.confirmed', templateName: 'cx_revisit_yes',         recipient: 'customer' },
+    { event: 'job.eta_sent',          templateName: 'eta_sent_clone_clone',   recipient: 'customer' },
+    { event: 'job.reschedule_by_pm',  templateName: 'pm_txreschedule',        recipient: 'customer' },
+    { event: 'job.cancelled',         templateName: 'cancel_order',           recipient: 'customer' },
+    { event: 'job.revisit.refused',   templateName: 'cx_revisit_no',          recipient: 'customer' },
+    { event: 'job.confirmed_by_qa',   templateName: 'qa_cx_order_confirm',    recipient: 'customer' },
+  ]);
+});
+
 module.exports = router;

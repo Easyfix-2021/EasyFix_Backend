@@ -6,7 +6,13 @@ const { pool } = require('../../../db');
 const lookupService = require('../../../services/lookup.service');
 const jobService = require('../../../services/job.service');
 const { legacyOk, legacyError } = require('../../../utils/response');
-const { statusLabel, parseLegacyDate, formatLegacyDate } = require('../../../services/integration.service');
+const {
+  statusLabel,
+  parseLegacyDate,
+  formatLegacyDate,
+  checkFirefoxAvailability,
+  checkDecathlonServiceability,
+} = require('../../../services/integration.service');
 const { writeBuffer } = require('../../../utils/file-storage');
 
 // All /v1/* routes require HTTP Basic Auth against tbl_client_website
@@ -216,38 +222,84 @@ router.post('/jobImage/addJobImages', upload.single('file'), async (req, res, ne
   } catch (e) { next(e); }
 });
 
-// ─── Stubs for less-used endpoints ──────────────────────────────────
-// These return minimal legacy-shape responses so the contract surface exists.
-// Full implementations can be added when a specific integrator requests.
-router.get('/easyfixers/availability-status', async (req, res) => {
-  legacyOk(res, { available: true, note: 'stub — full impl pending' });
+// ─── /v1/easyfixers/availability-status ─────────────────────────────
+// Real impl. Mirrors EasyFix_API EasyfixerResource:279 — uses
+// pincode_firefox_city_mapping + firefox_city_mapping to find the slot
+// capacity for the pincode's city, then counts scheduled jobs in the
+// same date/time-slot to decide. Returns the verbatim legacy shape:
+// `{"isAvailabil": "Yes" | "No"}`  (preserve the typo — Decathlon parsers
+// rely on it literally).
+router.get('/easyfixers/availability-status', async (req, res, next) => {
+  try {
+    const available = await checkFirefoxAvailability(pool, {
+      pincode: req.query.pincode,
+      requestedDate: req.query.requestedDate,
+      timeSlot: req.query.timeSlot,
+    });
+    legacyOk(res, { isAvailabil: available ? 'Yes' : 'No' });
+  } catch (e) { next(e); }
 });
-router.get('/easyfixers/availability-status-check', async (req, res) => {
-  legacyOk(res, { available: true, client: 'generic', note: 'stub — full impl pending' });
+
+// ─── /v1/easyfixers/availability-status-check (Decathlon variant) ───
+// Mirrors EasyfixerResource:309 — gates on client_name = "Decathlon
+// Sports India Private Limited" and then checks pincode_decathlon.
+// Returns legacy shape with `null` when not applicable (matches legacy).
+router.get('/easyfixers/availability-status-check', async (req, res, next) => {
+  try {
+    const result = await checkDecathlonServiceability(pool, {
+      pincode: req.query.pincode,
+      clientName: req.integrationClient.name,
+    });
+    if (result === null) return legacyOk(res, null);
+    legacyOk(res, { isAvailabil: result ? 'Yes' : 'No' });
+  } catch (e) { next(e); }
 });
-router.get('/easyfixers', async (req, res) => legacyOk(res, { note: 'stub — use /api/admin/easyfixers', easyfixers: [] }));
-router.get('/easyfixers/login', async (req, res) => legacyError(res, 501, 'Not Implemented — use /api/auth/login-otp'));
-router.get('/easyfixers/logout', async (req, res) => legacyOk(res, { loggedOut: true }));
-router.patch('/easyfixers', async (req, res) => legacyOk(res, { note: 'stub — accepted', ...req.body }));
-router.get('/easyfixers/transactions', async (req, res) => legacyOk(res, []));
-router.post('/easyfixers/transactions', async (req, res) => legacyOk(res, { accepted: true }));
-router.get('/easyfixers/recharges', async (req, res) => legacyOk(res, []));
-router.get('/easyfixers/city', async (req, res) => legacyOk(res, []));
-router.get('/easyfixers/teamTransactions', async (req, res) => legacyOk(res, []));
+// ─── /v1/easyfixers/* — INTERNAL-only legacy endpoints ──────────────
+// VERIFIED 2026-05-12 against EasyFix_API/EasyfixerResource.java:
+//   - /transactions, /recharges, /city, /teamTransactions all carry
+//     `@RolesAllowed({"crm","androidApp"})`. External Basic-Auth clients
+//     never had access to them. The new app's CRM users hit /api/admin/*
+//     and technicians hit /api/mobile/* — those routes carry the real
+//     implementations. These stubs exist only to satisfy any stale URL
+//     a misbehaving caller might probe; an empty list is the legacy's
+//     own response shape when no rows match.
+//   - /login is technician-app auth → use /api/auth/login-otp.
+//   - /logout was a no-op stamp.
+router.get('/easyfixers', async (_req, res) => legacyOk(res, { note: 'internal-only; use /api/admin/easyfixers', easyfixers: [] }));
+router.get('/easyfixers/login', async (_req, res) => legacyError(res, 501, 'Not Implemented — use /api/auth/login-otp'));
+router.get('/easyfixers/logout', async (_req, res) => legacyOk(res, { loggedOut: true }));
+router.patch('/easyfixers', async (req, res) => legacyOk(res, { note: 'internal-only; use /api/admin/easyfixers', ...req.body }));
+router.get('/easyfixers/transactions', async (_req, res) => legacyOk(res, []));
+router.post('/easyfixers/transactions', async (_req, res) => legacyOk(res, { accepted: true }));
+router.get('/easyfixers/recharges', async (_req, res) => legacyOk(res, []));
+router.get('/easyfixers/city', async (_req, res) => legacyOk(res, []));
+router.get('/easyfixers/teamTransactions', async (_req, res) => legacyOk(res, []));
 
-// /v1/users/*
-router.get('/users/all', async (req, res) => legacyOk(res, []));
-router.get('/users/ById', async (req, res) => legacyOk(res, null));
-router.get('/users/findUser', async (req, res) => legacyOk(res, null));
-router.get('/users/getRecieverByjobId', async (req, res) => legacyOk(res, null));
-router.post('/users/saveUserCallInfo', async (req, res) => legacyOk(res, { saved: true }));
-router.post('/users/contactUsers', async (req, res) => legacyOk(res, { accepted: true }));
+// ─── /v1/users/* — INTERNAL (website/CRM) endpoints ─────────────────
+// VERIFIED 2026-05-12 against EasyFix_API/UserResource.java:
+//   /findUser, /getRecieverByjobId, /saveUserCallInfo, /contactUsers
+//   all carry @RolesAllowed({"website"}) — internal CRM website token
+//   only, never an external Basic-Auth client. /all and /ById are not
+//   role-gated in legacy but expose internal user metadata; external
+//   clients have never had a documented reason to call them.
+// Real implementations for the new app live under /api/admin/users.
+router.get('/users/all', async (_req, res) => legacyOk(res, []));
+router.get('/users/ById', async (_req, res) => legacyOk(res, []));
+router.get('/users/findUser', async (_req, res) => legacyOk(res, null));
+router.get('/users/getRecieverByjobId', async (_req, res) => legacyOk(res, null));
+router.post('/users/saveUserCallInfo', async (_req, res) => legacyOk(res, { saved: true }));
+router.post('/users/contactUsers', async (_req, res) => legacyOk(res, { accepted: true }));
 
-// /v1/utils/*
-router.get('/utils/test', async (req, res) => legacyOk(res, { message: 'ok' }));
-router.get('/utils/generateOtp', async (req, res) => legacyOk(res, { otp: '1234', note: 'stub — use /api/auth/login-otp' }));
-router.get('/utils/validateOtp', async (req, res) => legacyOk(res, { valid: false, note: 'stub' }));
-router.post('/utils/notification', async (req, res) => legacyOk(res, { sent: true }));
+// ─── /v1/utils/* — DEAD CODE in legacy ──────────────────────────────
+// VERIFIED 2026-05-12: EasyFixUtilsResource.java has `//@Path("/v1/utils")`
+// commented out → Jersey never exposed these (except /utils/test which
+// is exempted by ResponseFilter for liveness probes). generateOtp/
+// validateOtp/notification are internal-only; OTP delivery now lives
+// at /api/auth/login-otp + /verify-otp on the modern stack.
+router.get('/utils/test', async (_req, res) => legacyOk(res, { message: 'ok' }));
+router.get('/utils/generateOtp', async (_req, res) => legacyError(res, 501, 'Not Implemented — use /api/auth/login-otp'));
+router.get('/utils/validateOtp', async (_req, res) => legacyError(res, 501, 'Not Implemented — use /api/auth/verify-otp'));
+router.post('/utils/notification', async (_req, res) => legacyOk(res, { sent: true }));
 router.post('/utils/uploadFile', upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) return legacyError(res, 400, 'file required');
@@ -264,8 +316,11 @@ router.get('/clients/:id', async (req, res, next) => {
     legacyOk(res, c || null);
   } catch (e) { next(e); }
 });
-router.get('/clients/getQuestionaireDetailsList', async (req, res) => legacyOk(res, []));
-router.post('/clients/saveQuestionaireAnswers', async (req, res) => legacyOk(res, { saved: true }));
+// VERIFIED 2026-05-12 against ClientResource.java: both endpoints
+// carry @RolesAllowed("androidApp") → only the technician app, never
+// an external integrator. Real impl belongs under /api/mobile/jobs/*.
+router.get('/clients/getQuestionaireDetailsList', async (_req, res) => legacyOk(res, []));
+router.post('/clients/saveQuestionaireAnswers', async (_req, res) => legacyOk(res, { saved: true }));
 
 // /v1/customer/*
 router.get('/customer/getCustomer', async (req, res, next) => {
@@ -308,11 +363,70 @@ router.get('/customer/jobs', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// /v1/clientInvoice
-router.get('/clientInvoice', async (req, res) => legacyOk(res, []));
+// ─── /v1/clientInvoice — date-range invoice list ────────────────────
+// VERIFIED 2026-05-12 against EasyFix_API (Invoice.java + InvoiceDAO.java):
+//   tbl_client_invoice columns:
+//     id (PK), fk_client_id, billing_from_date, billing_to_date,
+//     current_due_amount, previous_due_amount, total_invoice_amount,
+//     is_paid, is_raised, amount_due_date, file_path_excel, file_path_pdf
+//   Filter: billing_from_date >= startDate AND billing_to_date <= endDate
+//   Order:  billing_to_date DESC
+//   Legacy JSON field aliases (must preserve):
+//     invoiceId, billingStartDate, billingEndDate, currentamountDues,
+//     previousamountDues, totalInvoiceAmount, isPaid, israised,
+//     amountDueDate, invoiceMasterSheet, invoicePdf
+//
+// Authenticated client gets only their own rows; explicit clientId query
+// is honoured only if it matches their own id (defensive — legacy didn't
+// enforce this but we should, since Basic Auth is per-client).
+router.get('/clientInvoice', async (req, res, next) => {
+  try {
+    const callerClientId = req.integrationClient.id;
+    const requestedClientId = req.query.clientId ? Number(req.query.clientId) : callerClientId;
+    if (requestedClientId !== callerClientId) {
+      return legacyError(res, 403, 'Forbidden');
+    }
+    const { startDate, endDate } = req.query;
+    const args = [callerClientId];
+    let where = 'fk_client_id = ?';
+    if (startDate && endDate) {
+      where += ' AND billing_from_date >= ? AND billing_to_date <= ?';
+      args.push(startDate, endDate);
+    }
+    const [rows] = await pool.query(
+      `SELECT id, fk_client_id, billing_from_date, billing_to_date,
+              current_due_amount, previous_due_amount, total_invoice_amount,
+              is_paid, is_raised, amount_due_date, file_path_excel, file_path_pdf
+         FROM tbl_client_invoice
+        WHERE ${where}
+        ORDER BY billing_to_date DESC`,
+      args
+    );
+    const data = rows.map((r) => ({
+      invoiceId: r.id,
+      client: { clientId: r.fk_client_id },
+      billingStartDate: formatLegacyDate(r.billing_from_date),
+      billingEndDate: formatLegacyDate(r.billing_to_date),
+      currentamountDues: r.current_due_amount,
+      previousamountDues: r.previous_due_amount,
+      totalInvoiceAmount: r.total_invoice_amount,
+      isPaid: r.is_paid,
+      israised: r.is_raised,
+      amountDueDate: formatLegacyDate(r.amount_due_date),
+      invoiceMasterSheet: r.file_path_excel,
+      invoicePdf: r.file_path_pdf,
+    }));
+    legacyOk(res, data);
+  } catch (e) { next(e); }
+});
 
-// /v1/userLog
-router.get('/userLog/findAll', async (req, res) => legacyOk(res, []));
-router.get('/userLog/download', async (req, res) => legacyOk(res, { note: 'use CRM export' }));
+// ─── /v1/userLog/* — DEAD CODE in legacy ────────────────────────────
+// VERIFIED 2026-05-12: EasyFix_API/UserLogResource.java has its @Path
+// annotation commented out (`//@Path("/v1/userLog")`), meaning Jersey
+// never exposed these endpoints. They're registered but unreachable.
+// Therefore external clients have never been able to call /v1/userLog/*.
+// We keep contract-shape stubs in case a misbehaving integrator probes.
+router.get('/userLog/findAll', async (_req, res) => legacyOk(res, []));
+router.get('/userLog/download', async (_req, res) => legacyOk(res, []));
 
 module.exports = router;

@@ -1,27 +1,70 @@
 const router = require('express').Router();
+const Joi = require('joi');
+const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+
+/*
+ * Auxiliary admin endpoints — attendance, training videos, materials,
+ * Aadhaar uniqueness, geocoding proxy, email-verify callback, bulk
+ * job reassignment.
+ *
+ * VERIFIED 2026-05-12 against legacy entity classes:
+ *   tbl_easyfixer_attendance (ACD_APIs/Attendance.java):
+ *     id (PK), easyfixer_id, morning_slot, evening_slot,
+ *     is_leave_marked, created_on, insert_date, updated_on
+ *     — NOT `efr_id`/`date`/`status`/`remarks` (those were assumed).
+ *
+ *   training_videos (TrainingVideo.java):
+ *     id (PK), title, description, sub_title, sub_description
+ *
+ *   confirmation_token (ConfirmationToken.java):
+ *     id (PK), token, login_id, is_verified, client_id, easyfixer_id,
+ *     is_token_expired
+ *
+ *   tbl_easyfixer aadhaar/PAN: adhaar_card_number (NOT `aadhaar` — DB
+ *   spelling has "adhaar" — preserve), pan_card_number.
+ */
 
 // ─── Attendance ─────────────────────────────────────────────────────
 router.get('/attendance', async (req, res, next) => {
   try {
-    const { efrId, from, to } = req.query;
+    const { easyfixerId, from, to } = req.query;
     const clauses = [], params = [];
-    if (efrId != null) { clauses.push('efr_id = ?'); params.push(efrId); }
-    if (from && to)    { clauses.push('date BETWEEN ? AND ?'); params.push(from, to); }
+    if (easyfixerId != null) { clauses.push('easyfixer_id = ?'); params.push(easyfixerId); }
+    if (from && to) {
+      clauses.push('DATE(created_on) BETWEEN ? AND ?');
+      params.push(from, to);
+    }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const [rows] = await pool.query(`SELECT * FROM tbl_easyfixer_attendance ${where} ORDER BY id DESC LIMIT 500`, params)
-      .catch(() => [[]]);
+    const [rows] = await pool.query(
+      `SELECT id, easyfixer_id, morning_slot, evening_slot, is_leave_marked,
+              created_on, insert_date, updated_on
+         FROM tbl_easyfixer_attendance
+        ${where}
+        ORDER BY id DESC
+        LIMIT 500`,
+      params
+    );
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
 
-router.post('/attendance', async (req, res, next) => {
+router.post('/attendance', validate(Joi.object({
+  easyfixerId: Joi.number().integer().positive().required(),
+  morningSlot: Joi.string().max(50).allow('', null).optional(),
+  eveningSlot: Joi.string().max(50).allow('', null).optional(),
+  isLeaveMarked: Joi.number().integer().valid(0, 1).default(0),
+})), async (req, res, next) => {
   try {
-    const b = req.body || {};
     const [ins] = await pool.query(
-      'INSERT INTO tbl_easyfixer_attendance (efr_id, date, status, remarks, created_date) VALUES (?, ?, ?, ?, NOW())',
-      [b.efrId, b.date, b.status || 'present', b.remarks || null]).catch(() => [{ insertId: null }]);
+      `INSERT INTO tbl_easyfixer_attendance
+         (easyfixer_id, morning_slot, evening_slot, is_leave_marked, created_on, insert_date)
+       VALUES (?, ?, ?, ?, NOW(), NOW())`,
+      [req.body.easyfixerId, req.body.morningSlot || null,
+       req.body.eveningSlot || null, req.body.isLeaveMarked]
+    );
+    res.status(201);
     modernOk(res, { id: ins.insertId });
   } catch (e) { next(e); }
 });
@@ -29,7 +72,10 @@ router.post('/attendance', async (req, res, next) => {
 // ─── Materials ──────────────────────────────────────────────────────
 router.get('/materials/job/:jobId', async (req, res, next) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM job_material WHERE job_id = ? ORDER BY id DESC', [req.params.jobId]);
+    const [rows] = await pool.query(
+      'SELECT * FROM job_material WHERE job_id = ? ORDER BY id DESC',
+      [req.params.jobId]
+    );
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -42,7 +88,8 @@ router.post('/materials', async (req, res, next) => {
       `INSERT INTO job_material (job_id, material_name, description, sku, unit, unit_price, total_price)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [b.jobId, b.materialName, b.description || null, b.sku || null, b.unit || null,
-       b.unitPrice || 0, (b.unitPrice || 0) * (b.quantity || 1)]);
+       b.unitPrice || 0, (b.unitPrice || 0) * (b.quantity || 1)]
+    );
     res.status(201);
     modernOk(res, { id: ins.insertId });
   } catch (e) { next(e); }
@@ -58,50 +105,193 @@ router.delete('/materials/:id', async (req, res, next) => {
 // ─── Training videos ────────────────────────────────────────────────
 router.get('/training-videos', async (req, res, next) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM training_videos').catch(() => [[]]);
+    const [rows] = await pool.query(
+      'SELECT id, title, description, sub_title, sub_description FROM training_videos ORDER BY id DESC'
+    );
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
 
-// ─── Aadhaar / PAN uniqueness check ────────────────────────────────
+router.post('/training-videos', validate(Joi.object({
+  title: Joi.string().trim().min(1).max(255).required(),
+  description: Joi.string().max(2000).allow('', null).optional(),
+  sub_title: Joi.string().max(255).allow('', null).optional(),
+  sub_description: Joi.string().max(2000).allow('', null).optional(),
+})), async (req, res, next) => {
+  try {
+    const [ins] = await pool.query(
+      `INSERT INTO training_videos (title, description, sub_title, sub_description)
+       VALUES (?, ?, ?, ?)`,
+      [req.body.title, req.body.description || null,
+       req.body.sub_title || null, req.body.sub_description || null]
+    );
+    res.status(201);
+    modernOk(res, { id: ins.insertId });
+  } catch (e) { next(e); }
+});
+
+router.delete('/training-videos/:id', async (req, res, next) => {
+  try {
+    const [r] = await pool.query('DELETE FROM training_videos WHERE id = ?', [req.params.id]);
+    if (r.affectedRows === 0) return modernError(res, 404, 'video not found');
+    modernOk(res, { deleted: true });
+  } catch (e) { next(e); }
+});
+
+// ─── Aadhaar / PAN uniqueness ───────────────────────────────────────
+// VERIFIED tbl_easyfixer columns: adhaar_card_number (DB spelling
+// preserves the "adhaar" typo per CLAUDE.md), pan_card_number.
 router.get('/aadhaar-check/:number', async (req, res, next) => {
   try {
     const n = req.params.number;
     const [[r]] = await pool.query(
-      'SELECT COUNT(*) AS n, MIN(efr_id) AS existing_efr_id FROM tbl_easyfixer WHERE adhaar_card_number = ? OR pan_card_number = ?',
-      [n, n]);
+      `SELECT COUNT(*) AS n, MIN(efr_id) AS existing_efr_id
+         FROM tbl_easyfixer
+        WHERE adhaar_card_number = ? OR pan_card_number = ?`,
+      [n, n]
+    );
     modernOk(res, { exists: r.n > 0, existing_efr_id: r.existing_efr_id });
   } catch (e) { next(e); }
 });
 
-// ─── Geocoding (proxy to MapMyIndia — stub; Phase 14 adds caching) ─
-router.get('/geocode/:pincode', async (req, res) => {
-  modernOk(res, {
-    pincode: req.params.pincode,
-    note: 'stub — MapMyIndia proxy pending. Use TOKEN_URL + CITY_DETAILS_URL from .env.',
-  });
+// ─── Aadhaar auto-fill (name+DOB lookup) ────────────────────────────
+// Legacy endpoint `/profile/name-dob-aadhaar` — returns name + DOB
+// stored against an aadhaar number on tbl_easyfixer. Useful for the
+// "I recognise this person" pre-fill flow.
+router.get('/aadhaar-prefill/:number', async (req, res, next) => {
+  try {
+    const [[r]] = await pool.query(
+      `SELECT efr_id, efr_name, date_of_birth AS dob, adhaar_card_number, pan_card_number
+         FROM tbl_easyfixer
+        WHERE adhaar_card_number = ?
+        LIMIT 1`,
+      [req.params.number]
+    );
+    if (!r) return modernError(res, 404, 'no easyfixer with this aadhaar');
+    modernOk(res, r);
+  } catch (e) { next(e); }
 });
 
-// ─── Experience catalog (for profile onboarding) ────────────────────
+// ─── Geocoding proxy (MapMyIndia) with simple in-memory token cache ─
+// The legacy geocoding flow has two endpoints: (1) get an OAuth token,
+// (2) call CITY_DETAILS_URL. Token is reused across requests until it
+// expires (~24h). In-memory cache is fine for a single Node instance;
+// when we scale horizontally, lift this to Redis (Phase 14).
+let _mmiToken = { value: null, expiresAt: 0 };
+async function getMmiToken() {
+  if (_mmiToken.value && Date.now() < _mmiToken.expiresAt) return _mmiToken.value;
+  const url = process.env.MMI_TOKEN_URL;
+  const clientId = process.env.MMI_CLIENT_ID;
+  const clientSecret = process.env.MMI_CLIENT_SECRET;
+  if (!url || !clientId || !clientSecret) return null;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: clientId,
+      client_secret: clientSecret,
+    }),
+  });
+  if (!res.ok) return null;
+  const j = await res.json();
+  const ttlMs = (Number(j.expires_in) || 3600) * 1000;
+  _mmiToken = { value: j.access_token, expiresAt: Date.now() + ttlMs - 30_000 };
+  return _mmiToken.value;
+}
+
+router.get('/geocode/:pincode', async (req, res, next) => {
+  try {
+    const token = await getMmiToken();
+    if (!token) {
+      return modernOk(res, {
+        pincode: req.params.pincode,
+        note: 'MMI credentials not configured (MMI_TOKEN_URL/MMI_CLIENT_ID/MMI_CLIENT_SECRET)',
+      });
+    }
+    const url = `${process.env.MMI_CITY_DETAILS_URL}?pincode=${encodeURIComponent(req.params.pincode)}`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) return modernError(res, r.status, await r.text());
+    const data = await r.json();
+    modernOk(res, data);
+  } catch (e) { next(e); }
+});
+
+// ─── Experience catalog ─────────────────────────────────────────────
 router.get('/experience', async (req, res, next) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM experience WHERE 1=1 ORDER BY id').catch(() => [[]]);
+    const [rows] = await pool.query('SELECT * FROM experience ORDER BY id').catch(() => [[]]);
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
 
-// ─── Marital status lookup ─────────────────────────────────────────
 router.get('/marital-status', async (req, res) => {
-  modernOk(res, [{ id: 1, name: 'Single' }, { id: 2, name: 'Married' }, { id: 3, name: 'Divorced' }, { id: 4, name: 'Widowed' }]);
+  modernOk(res, [
+    { id: 1, name: 'Single' }, { id: 2, name: 'Married' },
+    { id: 3, name: 'Divorced' }, { id: 4, name: 'Widowed' },
+  ]);
 });
 
-// ─── Email verification callback (returns HTML for email-click flow) ─
-router.get('/verify-email', async (req, res) => {
-  const token = req.query.token;
-  if (!token) return res.status(400).send('<html><body><h2>Missing token</h2></body></html>');
-  // Lookup logic stubbed — would validate against confirmation_token table
-  res.set('Content-Type', 'text/html');
-  res.send(`<html><body><h2>Email Verified</h2><p>Thank you. You may close this window.</p></body></html>`);
+// ─── Email verification callback ────────────────────────────────────
+// VERIFIED confirmation_token columns: id, token, login_id, is_verified,
+// client_id, easyfixer_id, is_token_expired. Lookup on `token`, then
+// mark is_verified=1 + is_token_expired=1 (single-use semantics).
+router.get('/verify-email', async (req, res, next) => {
+  try {
+    const token = req.query.token;
+    if (!token) return res.status(400).send('<html><body><h2>Missing token</h2></body></html>');
+    const [[row]] = await pool.query(
+      `SELECT id, login_id, client_id, easyfixer_id, is_verified, is_token_expired
+         FROM confirmation_token
+        WHERE token = ? LIMIT 1`,
+      [String(token)]
+    );
+    res.set('Content-Type', 'text/html');
+    if (!row) return res.status(404).send('<html><body><h2>Invalid token</h2></body></html>');
+    if (row.is_token_expired) return res.send('<html><body><h2>Link already used or expired</h2></body></html>');
+    await pool.query(
+      'UPDATE confirmation_token SET is_verified = 1, is_token_expired = 1 WHERE id = ?',
+      [row.id]
+    );
+    res.send('<html><body><h2>Email Verified</h2><p>Thank you. You may close this window.</p></body></html>');
+  } catch (e) { next(e); }
+});
+
+// ─── Bulk job reassign ──────────────────────────────────────────────
+// Mirrors legacy `activeUserJobAssignment` (activeUserJobListAction.java).
+// Round-robins active jobs (status 0,1,2,3,4) across a given set of
+// admin user_ids. Used by ops to reshuffle ownership when staff joins
+// or leaves; not for technician (efr) assignment — that's auto-assign.
+router.post('/bulk-reassign', validate(Joi.object({
+  userIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+  statuses: Joi.array().items(Joi.number().integer()).default([0, 1, 2, 3, 4]),
+  limit: Joi.number().integer().min(1).max(5000).default(500),
+})), async (req, res, next) => {
+  try {
+    const placeholders = req.body.statuses.map(() => '?').join(',');
+    const [jobs] = await pool.query(
+      `SELECT job_id FROM tbl_job
+        WHERE job_status IN (${placeholders})
+        ORDER BY job_id
+        LIMIT ?`,
+      [...req.body.statuses, req.body.limit]
+    );
+    const conn = await pool.getConnection();
+    let reassigned = 0;
+    try {
+      await conn.beginTransaction();
+      for (let i = 0; i < jobs.length; i++) {
+        const ownerId = req.body.userIds[i % req.body.userIds.length];
+        await conn.query(
+          'UPDATE tbl_job SET job_owner = ?, last_update_time = NOW() WHERE job_id = ?',
+          [ownerId, jobs[i].job_id]
+        );
+        reassigned++;
+      }
+      await conn.commit();
+    } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
+    modernOk(res, { reassigned, userCount: req.body.userIds.length });
+  } catch (e) { next(e); }
 });
 
 module.exports = router;

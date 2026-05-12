@@ -1,0 +1,241 @@
+const router = require('express').Router();
+const Joi = require('joi');
+const validate = require('../../middleware/validate');
+const { pool } = require('../../db');
+const { modernOk, modernError } = require('../../utils/response');
+
+/*
+ * Advance Payment audit workflow on `tbl_efr_advance_payment`.
+ *
+ * State machine via `adv_status`:
+ *   0 = pending / initiated by PM
+ *   1 = ops approved (mid-state)
+ *   2 = finance approved (terminal)
+ *   3 = rejected (by ops or finance)
+ *
+ * VERIFIED 2026-05-12 against live INFORMATION_SCHEMA:
+ *   tbl_efr_advance_payment columns:
+ *     advance_id (PK), client_id, job_id, efr_id,
+ *     adv_status,
+ *     job_total_amt, advance_amt,
+ *     initiated_on, initiated_by, pm_remarks,
+ *     ops_action_on, ops_action_by, ops_remarks,
+ *     fin_action_on, fin_action_by, fin_remarks,
+ *     supporting_document, updated_on, updated_by, transaction_id
+ */
+
+// ─── GET /admin/advances — list with easyfixer + client join ────────
+router.get('/', async (req, res, next) => {
+  try {
+    const { status, efrId } = req.query;
+    const clauses = [];
+    const params = [];
+    if (status != null && status !== '') {
+      clauses.push('a.adv_status = ?');
+      params.push(Number(status));
+    }
+    if (efrId != null && efrId !== '') {
+      clauses.push('a.efr_id = ?');
+      params.push(Number(efrId));
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+    const offset = Number(req.query.offset) || 0;
+    params.push(limit, offset);
+
+    const [rows] = await pool.query(
+      `SELECT a.advance_id, a.client_id, a.job_id, a.efr_id,
+              a.adv_status, a.job_total_amt, a.advance_amt,
+              a.initiated_on, a.initiated_by, a.pm_remarks,
+              a.ops_action_on, a.ops_action_by, a.ops_remarks,
+              a.fin_action_on, a.fin_action_by, a.fin_remarks,
+              a.supporting_document, a.updated_on, a.updated_by, a.transaction_id,
+              e.efr_name, e.efr_no,
+              c.client_name
+         FROM tbl_efr_advance_payment a
+         LEFT JOIN tbl_easyfixer e ON e.efr_id    = a.efr_id
+         LEFT JOIN tbl_client    c ON c.client_id = a.client_id
+         ${where}
+        ORDER BY a.advance_id DESC
+        LIMIT ? OFFSET ?`,
+      params
+    );
+    modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /admin/advances/:id — detail ───────────────────────────────
+router.get('/:id', async (req, res, next) => {
+  try {
+    const [[row]] = await pool.query(
+      `SELECT a.*, e.efr_name, e.efr_no, c.client_name
+         FROM tbl_efr_advance_payment a
+         LEFT JOIN tbl_easyfixer e ON e.efr_id    = a.efr_id
+         LEFT JOIN tbl_client    c ON c.client_id = a.client_id
+        WHERE a.advance_id = ?`,
+      [Number(req.params.id)]
+    );
+    if (!row) return modernError(res, 404, 'advance not found');
+    modernOk(res, row);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /admin/advances — PM initiates an advance ─────────────────
+router.post('/', validate(Joi.object({
+  jobId: Joi.number().integer().positive().required(),
+  efrId: Joi.number().integer().positive().required(),
+  clientId: Joi.number().integer().positive().optional(),
+  advanceAmt: Joi.number().positive().required(),
+  jobTotalAmt: Joi.number().min(0).required(),
+  pmRemarks: Joi.string().max(1000).allow('', null).optional(),
+  supportingDocument: Joi.string().max(255).allow('', null).optional(),
+})), async (req, res, next) => {
+  try {
+    const b = req.body;
+    let clientId = b.clientId;
+    if (clientId == null) {
+      const [[job]] = await pool.query(
+        'SELECT fk_client_id FROM tbl_job WHERE job_id = ?',
+        [b.jobId]
+      );
+      if (job && job.fk_client_id != null) clientId = job.fk_client_id;
+    }
+    const [ins] = await pool.query(
+      `INSERT INTO tbl_efr_advance_payment
+         (client_id, job_id, efr_id, adv_status,
+          job_total_amt, advance_amt,
+          initiated_on, initiated_by, pm_remarks,
+          supporting_document, updated_on, updated_by)
+       VALUES (?, ?, ?, 0, ?, ?, NOW(), ?, ?, ?, NOW(), ?)`,
+      [
+        clientId || null,
+        b.jobId,
+        b.efrId,
+        b.jobTotalAmt,
+        b.advanceAmt,
+        req.user.user_id,
+        b.pmRemarks || null,
+        b.supportingDocument || null,
+        req.user.user_id,
+      ]
+    );
+    res.status(201);
+    modernOk(res, { advanceId: ins.insertId, status: 0 }, 'advance initiated');
+  } catch (e) { next(e); }
+});
+
+// ─── POST /admin/advances/:id/ops-approve — moves to status 1 ───────
+router.post('/:id/ops-approve', validate(Joi.object({
+  remarks: Joi.string().max(1000).allow('', null).optional(),
+})), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const [[row]] = await pool.query(
+      'SELECT adv_status FROM tbl_efr_advance_payment WHERE advance_id = ?',
+      [id]
+    );
+    if (!row) return modernError(res, 404, 'advance not found');
+    if (Number(row.adv_status) !== 0) {
+      return modernError(res, 409, `advance is not pending (current status ${row.adv_status})`);
+    }
+    const [r] = await pool.query(
+      `UPDATE tbl_efr_advance_payment
+          SET adv_status = 1,
+              ops_action_on = NOW(),
+              ops_action_by = ?,
+              ops_remarks = ?,
+              updated_on = NOW(),
+              updated_by = ?
+        WHERE advance_id = ?`,
+      [req.user.user_id, req.body.remarks || null, req.user.user_id, id]
+    );
+    if (r.affectedRows === 0) return modernError(res, 404, 'advance not found');
+    modernOk(res, { approvedBy: 'ops', status: 1 });
+  } catch (e) { next(e); }
+});
+
+// ─── POST /admin/advances/:id/fin-approve — moves to status 2 ───────
+router.post('/:id/fin-approve', validate(Joi.object({
+  remarks: Joi.string().max(1000).allow('', null).optional(),
+  transactionId: Joi.string().max(100).allow('', null).optional(),
+})), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const [[row]] = await pool.query(
+      'SELECT adv_status FROM tbl_efr_advance_payment WHERE advance_id = ?',
+      [id]
+    );
+    if (!row) return modernError(res, 404, 'advance not found');
+    if (Number(row.adv_status) !== 1) {
+      return modernError(res, 409, `advance is not in ops-approved state (current status ${row.adv_status})`);
+    }
+    const [r] = await pool.query(
+      `UPDATE tbl_efr_advance_payment
+          SET adv_status = 2,
+              fin_action_on = NOW(),
+              fin_action_by = ?,
+              fin_remarks = ?,
+              transaction_id = ?,
+              updated_on = NOW(),
+              updated_by = ?
+        WHERE advance_id = ?`,
+      [
+        req.user.user_id,
+        req.body.remarks || null,
+        req.body.transactionId || null,
+        req.user.user_id,
+        id,
+      ]
+    );
+    if (r.affectedRows === 0) return modernError(res, 404, 'advance not found');
+    modernOk(res, { approvedBy: 'finance', status: 2 });
+  } catch (e) { next(e); }
+});
+
+// ─── POST /admin/advances/:id/reject — moves to status 3 ────────────
+// Stamps ops_* fields when rejecting from pending state, fin_* fields
+// when rejecting from ops-approved state. Already-terminal advances
+// (status 2 or 3) cannot be rejected.
+router.post('/:id/reject', validate(Joi.object({
+  remarks: Joi.string().max(1000).allow('', null).optional(),
+})), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const [[row]] = await pool.query(
+      'SELECT adv_status FROM tbl_efr_advance_payment WHERE advance_id = ?',
+      [id]
+    );
+    if (!row) return modernError(res, 404, 'advance not found');
+    const current = Number(row.adv_status);
+    if (current !== 0 && current !== 1) {
+      return modernError(res, 409, `advance cannot be rejected from current status ${current}`);
+    }
+    const sql = current === 0
+      ? `UPDATE tbl_efr_advance_payment
+            SET adv_status = 3,
+                ops_action_on = NOW(),
+                ops_action_by = ?,
+                ops_remarks = ?,
+                updated_on = NOW(),
+                updated_by = ?
+          WHERE advance_id = ?`
+      : `UPDATE tbl_efr_advance_payment
+            SET adv_status = 3,
+                fin_action_on = NOW(),
+                fin_action_by = ?,
+                fin_remarks = ?,
+                updated_on = NOW(),
+                updated_by = ?
+          WHERE advance_id = ?`;
+    const [r] = await pool.query(sql, [
+      req.user.user_id,
+      req.body.remarks || null,
+      req.user.user_id,
+      id,
+    ]);
+    if (r.affectedRows === 0) return modernError(res, 404, 'advance not found');
+    modernOk(res, { rejected: true, rejectedBy: current === 0 ? 'ops' : 'finance', status: 3 });
+  } catch (e) { next(e); }
+});
+
+module.exports = router;

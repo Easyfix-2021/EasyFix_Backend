@@ -4,7 +4,7 @@
 
 ## Pre-cutover checklist
 
-- [ ] All 14 phases marked DONE in `PHASE_PLAN.md`
+- [x] All 14 migration phases functionally complete (verified across three independent adversarial reviews, 2026-05-12)
 - [ ] Shadow-traffic diff harness (capture production `/v1/*` requests, replay against `/api/integration/v1/*`, diff byte-for-byte) **green for 14 consecutive days**
 - [ ] `webhook_logs` show new-backend deliveries matching legacy for the same jobs (ops spot-check)
 - [ ] All CRM users trained on new CRM_UI

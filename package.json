@@ -8,12 +8,15 @@
     "dev": "nodemon server.js",
     "start": "NODE_ENV=production node server.js",
     "build": "node scripts/build-check.js",
-    "test:db": "node scripts/test-db.js"
+    "test:db": "node scripts/test-db.js",
+    "verify:schema": "node scripts/schema-verify.js",
+    "verify:all": "npm run build && npm run test:db && npm run verify:schema"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "archiver": "^8.0.0",
     "compression": "^1.7.5",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
@@ -25,6 +28,7 @@
     "multer": "^1.4.5-lts.1",
     "mysql2": "^3.11.5",
     "nodemailer": "^8.0.5",
+    "pdfkit": "^0.18.0",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {

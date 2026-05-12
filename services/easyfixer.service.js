@@ -23,6 +23,7 @@ const LIST_COLUMNS = `
   e.efr_no, e.efr_email, e.efr_cityId, c.city_name AS city_name,
   e.efr_status, e.efr_service_category, e.efr_service_type,
   e.efr_profile_perc, e.is_technician_verified,
+  e.final_submission, e.new_easy_fixer,
   e.efr_manager_id, e.insert_date, e.update_date
 `;
 
