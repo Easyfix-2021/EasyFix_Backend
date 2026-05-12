@@ -12,8 +12,11 @@ const validate = require('../../middleware/validate');
  * upserts customers via job creation, so this admin surface is read-first
  * with a light upsert path.
  *
- * Columns observed in legacy: customer_id, customer_name, customer_mob_no,
- * customer_email, alt_mob_no, customer_status, insert_date, update_date.
+ * VERIFIED columns in production (INFORMATION_SCHEMA 2026-05-12):
+ *   customer_id, customer_mob_no, customer_name, customer_email,
+ *   is_active, insert_date, update_date, created_by, updated_by.
+ *   (Earlier comment listed `alt_mob_no` + `customer_status` — neither
+ *   exists in production. Removed.)
  */
 
 const listQuery = Joi.object({
@@ -36,7 +39,7 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
     }
     const [rows] = await pool.query(
       `SELECT customer_id, customer_name, customer_mob_no, customer_email,
-              alt_mob_no, customer_status, insert_date, update_date,
+              is_active, insert_date, update_date,
               (SELECT COUNT(*) FROM tbl_job j WHERE j.fk_customer_id = c.customer_id) AS job_count
          FROM tbl_customer c
         WHERE ${where.join(' AND ')}

@@ -89,6 +89,24 @@ const EXPECTED = {
     'id', 'easyfixer_id', 'morning_slot', 'evening_slot',
     'is_leave_marked', 'created_on', 'insert_date', 'updated_on',
   ],
+  tbl_customer: [
+    'customer_id', 'customer_mob_no', 'customer_name', 'customer_email',
+    'is_active', 'insert_date', 'update_date', 'created_by', 'updated_by',
+  ],
+  tbl_easyfixer_transaction: [
+    'transaction_id', 'easyfixer_id', 'source', 'description',
+    'transaction_type', 'transaction_date', 'amount', 'balance',
+    'created_date', 'created_by', 'job_id', 'trans_reason_code',
+  ],
+  tbl_tools: [
+    'tool_id', 'tool_name', 'tool_desc', 'tool_status', 'tool_img',
+  ],
+  tbl_role: [
+    'role_id', 'role_name', 'role_desc', 'menu_ids', 'role_status',
+    'insert_date', 'update_date',
+    'updayted_by', // legacy DB typo ("updayted", not "updated") — preserve
+    'inserted_by', 'display_job_dashboard', 'logging_tracking',
+  ],
   confirmation_token: [
     'id', 'token', 'login_id', 'is_verified', 'client_id', 'easyfixer_id', 'is_token_expired',
   ],

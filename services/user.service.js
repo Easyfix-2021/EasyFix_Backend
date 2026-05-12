@@ -187,9 +187,13 @@ async function createUser({
 // ─── Update ──────────────────────────────────────────────────────────
 async function updateUser(userId, fields, updatedBy) {
   // Confirm target exists + is internal — keeps callers from accidentally
-  // editing a client/technician row through this endpoint.
+  // editing a client/technician row through this endpoint. Also load
+  // the current mobile so we can skip the uniqueness check when the
+  // PATCH body re-sends the same mobile unchanged (legacy data has
+  // multiple active users sharing the same number — historical drift
+  // we shouldn't penalise on every save).
   const [[me]] = await pool.query(
-    'SELECT user_id, user_type_id FROM tbl_user WHERE user_id = ? LIMIT 1',
+    'SELECT user_id, user_type_id, mobile_no FROM tbl_user WHERE user_id = ? LIMIT 1',
     [userId]
   );
   if (!me) throw mkErr(404, 'User not found');
@@ -213,13 +217,21 @@ async function updateUser(userId, fields, updatedBy) {
     }
     if (key === 'mobile_no' && val) {
       const mob = String(val).trim();
-      const [[dup]] = await pool.query(
-        `SELECT user_id FROM tbl_user
-          WHERE mobile_no = ? AND user_status = 1 AND user_type_id = ?
-            AND user_id <> ? LIMIT 1`,
-        [mob, INTERNAL_USER_TYPE_ID, userId]
-      );
-      if (dup) throw mkErr(409, `Another active user already uses mobile "${mob}"`);
+      // Only enforce uniqueness if the mobile is actually changing.
+      // Editing a user with the SAME mobile they already have must
+      // never fire a 409 — that's a save-without-changes operation.
+      // Legacy production data has duplicate mobiles across active
+      // internal users we can't clean up retroactively from this code
+      // path; we'd block ALL edits to those rows otherwise.
+      if (mob !== String(me.mobile_no || '')) {
+        const [[dup]] = await pool.query(
+          `SELECT user_id FROM tbl_user
+            WHERE mobile_no = ? AND user_status = 1 AND user_type_id = ?
+              AND user_id <> ? LIMIT 1`,
+          [mob, INTERNAL_USER_TYPE_ID, userId]
+        );
+        if (dup) throw mkErr(409, `Another active user already uses mobile "${mob}"`);
+      }
       val = mob;
     }
     sets.push(`${key} = ?`);

@@ -426,6 +426,41 @@ router.post('/email-statement', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
+// ─── /admin/finance/efr-transactions — Easyfixer ledger ────────────
+// VERIFIED 2026-05-12 against live INFORMATION_SCHEMA:
+//   tbl_easyfixer_transaction columns:
+//     transaction_id, easyfixer_id, source, description, transaction_type,
+//     transaction_date, amount, balance, created_date, created_by,
+//     job_id, trans_reason_code
+//   transaction_type values: 1 (credit) and 2 (debit) per the legacy
+//   convention. The Finance sidebar's "Easyfixer Debit" and "Easyfixer
+//   Credit" sub-menus both point here with a different ?type= filter.
+router.get('/efr-transactions', async (req, res, next) => {
+  try {
+    const { efrId, type, from, to } = req.query;
+    const clauses = [], params = [];
+    if (efrId != null) { clauses.push('et.easyfixer_id = ?'); params.push(efrId); }
+    if (type != null)  { clauses.push('et.transaction_type = ?'); params.push(type); }
+    if (from)          { clauses.push('et.transaction_date >= ?'); params.push(from); }
+    if (to)            { clauses.push('et.transaction_date <= ?'); params.push(to); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const limit = Math.min(Number(req.query.limit) || 200, 500);
+    const [rows] = await pool.query(
+      `SELECT et.transaction_id, et.easyfixer_id, et.source, et.description,
+              et.transaction_type, et.transaction_date, et.amount, et.balance,
+              et.job_id, et.trans_reason_code,
+              e.efr_name, e.efr_no
+         FROM tbl_easyfixer_transaction et
+         LEFT JOIN tbl_easyfixer e ON e.efr_id = et.easyfixer_id
+         ${where}
+        ORDER BY et.transaction_id DESC
+        LIMIT ?`,
+      [...params, limit]
+    );
+    modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
 // ─── Transactions (ledger) ──────────────────────────────────────────
 router.get('/transactions', async (req, res, next) => {
   try {
