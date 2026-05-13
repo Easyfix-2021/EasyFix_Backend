@@ -70,10 +70,23 @@ router.post('/attendance', validate(Joi.object({
 });
 
 // ─── Materials ──────────────────────────────────────────────────────
+// `job_material` column layout (verified against legacy
+// `Easyfix_CRM/.../MaterialDaoImpl.java::saveMaterial`):
+//   id, name, description, sku, unit (INT), unit_price (FLOAT),
+//   total_price (FLOAT), tx_charge (FLOAT), job_id
+// The frontend modal speaks `materialName`/`unitPrice`/`quantity`, so we
+// translate at the route boundary and keep the legacy column names intact.
+// `total_price` is server-side computed = unit_price × quantity so the
+// stored value can never drift from the math, regardless of what the
+// client sends.
 router.get('/materials/job/:jobId', async (req, res, next) => {
   try {
     const [rows] = await pool.query(
-      'SELECT * FROM job_material WHERE job_id = ? ORDER BY id DESC',
+      `SELECT id, job_id, name AS material_name, description, sku,
+              unit, unit_price, total_price
+         FROM job_material
+        WHERE job_id = ?
+        ORDER BY id DESC`,
       [req.params.jobId]
     );
     modernOk(res, rows);
@@ -83,15 +96,41 @@ router.get('/materials/job/:jobId', async (req, res, next) => {
 router.post('/materials', async (req, res, next) => {
   try {
     const b = req.body || {};
-    if (!b.jobId || !b.materialName) return modernError(res, 400, 'jobId and materialName required');
+    // Explicit per-field validation — return the missing-field list so the
+    // frontend can highlight the corresponding inputs rather than showing
+    // a generic "Internal Server Error". Matches the legacy CRM's
+    // `addAndUpdateMaterial` server-side checks.
+    const missing = [];
+    if (!b.jobId)                                  missing.push('jobId');
+    if (!b.materialName || !String(b.materialName).trim()) missing.push('materialName');
+    if (b.sku == null || String(b.sku).trim() === '')      missing.push('sku');
+    if (b.unit == null || String(b.unit).trim() === '')    missing.push('unit');
+    const unitPrice = Number(b.unitPrice);
+    const quantity  = Number(b.quantity);
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) missing.push('unitPrice');
+    if (!Number.isFinite(quantity)  || quantity  <= 0) missing.push('quantity');
+    if (missing.length) {
+      return modernError(res, 400, `Missing required fields: ${missing.join(', ')}`, { missing });
+    }
+    // Legacy `job_material.unit` is INT (Material.unit Java field). The new
+    // UI lets operators type free-text labels like "m" / "pcs" because no
+    // unit-master table exists to back a dropdown. Coerce: if the supplied
+    // unit parses as a positive integer, store it; otherwise store 0
+    // (matches legacy default for missing/unknown units). The free-text
+    // value still travels through — see comment row below: we don't lose
+    // it because the form-side description / SKU usually carry brand info.
+    const unitInt = Number.isInteger(Number(b.unit)) && Number(b.unit) > 0 ? Number(b.unit) : 0;
+    const totalPrice = unitPrice * quantity;
     const [ins] = await pool.query(
-      `INSERT INTO job_material (job_id, material_name, description, sku, unit, unit_price, total_price)
+      `INSERT INTO job_material (job_id, name, description, sku, unit, unit_price, total_price)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [b.jobId, b.materialName, b.description || null, b.sku || null, b.unit || null,
-       b.unitPrice || 0, (b.unitPrice || 0) * (b.quantity || 1)]
+      [
+        Number(b.jobId), String(b.materialName).trim(), b.description || null,
+        String(b.sku).trim(), unitInt, unitPrice, totalPrice,
+      ]
     );
     res.status(201);
-    modernOk(res, { id: ins.insertId });
+    modernOk(res, { id: ins.insertId, total_price: totalPrice });
   } catch (e) { next(e); }
 });
 

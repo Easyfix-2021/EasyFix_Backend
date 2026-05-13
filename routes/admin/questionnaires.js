@@ -178,10 +178,22 @@ router.delete('/details/:detailId', async (req, res, next) => {
 });
 
 // ─── Answers (read-only — answers come from tech app) ───────────────
+// PK column is `c_qd_ans_id`, NOT `id` — verified against legacy entity
+// `EasyFix_API/.../entity/QuestionaireAnswer.java`. Earlier `ORDER BY id`
+// raised ER_BAD_FIELD_ERROR ("Unknown column 'id'") and the modal
+// surfaced "Internal Server Error". Also expose a flat alias `id` so
+// existing frontend list rendering (key={r.id}) keeps working without
+// a parallel column rename on the consumer.
 router.get('/answers/:jobId', async (req, res, next) => {
   try {
     const [rows] = await pool.query(
-      `SELECT * FROM tbl_questionaire_answer WHERE job_id = ? ORDER BY id DESC`,
+      `SELECT c_qd_ans_id AS id,
+              c_qd_ans_id, c_qd_id, c_questionaire_id, job_id,
+              c_qd_ans, c_qd_comments, c_qd_proof_doc,
+              inserted_by, insert_date, updated_by, update_date
+         FROM tbl_questionaire_answer
+        WHERE job_id = ?
+        ORDER BY c_qd_ans_id DESC`,
       [req.params.jobId]
     );
     modernOk(res, rows);
