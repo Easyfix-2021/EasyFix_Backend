@@ -3,6 +3,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
 
 // ─── Clients CRUD ───────────────────────────────────────────────────
 router.get('/', async (req, res, next) => {
@@ -10,6 +11,26 @@ router.get('/', async (req, res, next) => {
     const { q, includeInactive } = req.query;
     const clauses = [];
     const params = [];
+    // RBAC: restrict the visible client list to the caller's
+    // manage_clients AND manage_verticals scope. `clients` directly
+    // filters by client_id; `verticals` filters by tbl_client.vertical_id.
+    const scope = buildRequestScope(req);
+    if (scope?.clients) {
+      const c = scope.clients;
+      if (c.mode === 'none') clauses.push('1=0');
+      else if (c.mode === 'allow' && c.ids.length) {
+        clauses.push(`client_id IN (${c.ids.map(() => '?').join(',')})`);
+        params.push(...c.ids);
+      }
+    }
+    if (scope?.verticals) {
+      const v = scope.verticals;
+      if (v.mode === 'none') clauses.push('1=0');
+      else if (v.mode === 'allow' && v.ids.length) {
+        clauses.push(`vertical_id IN (${v.ids.map(() => '?').join(',')})`);
+        params.push(...v.ids);
+      }
+    }
     if (includeInactive !== 'true') clauses.push('client_status = 1');
     if (q) { clauses.push('client_name LIKE ?'); params.push(`%${q}%`); }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -17,7 +38,7 @@ router.get('/', async (req, res, next) => {
     const offset = Number(req.query.offset) || 0;
     params.push(limit, offset);
     const [rows] = await pool.query(
-      `SELECT client_id, client_name, client_email, client_status, client_type, reference_code, booking_cut_off
+      `SELECT client_id, client_name, client_email, client_status, client_type, reference_code, booking_cut_off, vertical_id
          FROM tbl_client ${where} ORDER BY client_name LIMIT ? OFFSET ?`, params);
     modernOk(res, rows);
   } catch (e) { next(e); }
@@ -27,6 +48,8 @@ router.get('/:id', async (req, res, next) => {
   try {
     const [[c]] = await pool.query('SELECT * FROM tbl_client WHERE client_id = ?', [req.params.id]);
     if (!c) return modernError(res, 404, 'client not found');
+    const guard = assertEntityInScope(req, { client_id: c.client_id, vertical_id: c.vertical_id });
+    if (!guard.ok) return modernError(res, 404, 'client not found');
     modernOk(res, c);
   } catch (e) { next(e); }
 });

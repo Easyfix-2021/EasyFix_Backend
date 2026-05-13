@@ -33,12 +33,27 @@ const DETAIL_COLUMNS = `
 `;
 
 // ─── List ───────────────────────────────────────────────────────────
+// `scope` (optional) is the parsed RBAC scope from /auth/me. When
+// supplied, the easyfixer list is row-filtered by `e.efr_cityId` against
+// scope.cities (and `mode='none'` short-circuits to zero rows).
 async function list({
   q, cityId, serviceCategory, isVerified, status,
+  scope,
   limit = 50, offset = 0, includeInactive = false,
 } = {}) {
   const clauses = [];
   const params = [];
+
+  // RBAC city scope — applied first so any explicit cityId filter
+  // narrows within the allowed set.
+  if (scope?.cities) {
+    const ci = scope.cities;
+    if (ci.mode === 'none') clauses.push('1=0');
+    else if (ci.mode === 'allow' && ci.ids.length) {
+      clauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+      params.push(...ci.ids);
+    }
+  }
 
   if (!includeInactive && status == null) clauses.push('e.efr_status = 1');
   if (status === 0 || status === 1) {

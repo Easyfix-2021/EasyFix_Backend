@@ -7,6 +7,29 @@ const { modernOk, modernError } = require('../../utils/response');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, ownerBody, idParam,
 } = require('../../validators/job.validator');
+const { assertEntityInScope } = require('../../lib/scope');
+
+/*
+ * Row-level scope guard for every /:id endpoint. Fetches the job once,
+ * confirms (client_id, city_id, vertical_id) all sit within the caller's
+ * manage_* scope. Returns 404 (not 403) on scope failure to avoid leaking
+ * existence of out-of-scope job_ids. Attaches the row at req.scopedJob
+ * so downstream handlers can use it without a second fetch.
+ */
+async function scopedJob(req, res, next) {
+  try {
+    const j = await job.getById(req.params.id);
+    if (!j) return modernError(res, 404, 'job not found');
+    const guard = assertEntityInScope(req, {
+      client_id:   j.fk_client_id,
+      city_id:     j.city_id,
+      vertical_id: j.vertical_id,
+    });
+    if (!guard.ok) return modernError(res, 404, 'job not found');
+    req.scopedJob = j;
+    return next();
+  } catch (e) { next(e); }
+}
 
 // Upload sub-router (POST /upload) — isolated because of multer middleware.
 router.use(require('./jobs-upload'));
@@ -28,7 +51,7 @@ router.use(require('./jobs-upload'));
  * Listed BEFORE `/:id/assign` and other `/:id/*` so Express matches the
  * literal `candidates` segment first.
  */
-router.get('/:id/candidates', validate(idParam, 'params'), async (req, res, next) => {
+router.get('/:id/candidates', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
     const result = await candidateRanking.rankCandidatesForJob(req.params.id, { limit });
@@ -41,7 +64,14 @@ router.get('/:id/candidates', validate(idParam, 'params'), async (req, res, next
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
-    const { rows, total } = await job.list(req.query);
+    // Row-level RBAC + reporting hierarchy: row-filter the list by the
+    // UNION of (caller's own manage_* scope) ∪ (every direct/indirect
+    // report's manage_* scope). Admin/Finance bypass via the bypass
+    // list in lib/scope.js.
+    const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+    const { pool } = require('../../db');
+    const scope = await buildRequestScopeWithHierarchy(req, pool);
+    const { rows, total } = await job.list({ ...req.query, scope });
     modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
   } catch (e) { next(e); }
 });
@@ -64,21 +94,31 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
 router.get('/counts', async (req, res, next) => {
   try {
     const ownerId = req.query.ownerId ? Number(req.query.ownerId) : undefined;
-    const counts = await job.getStatusCounts({ ownerId: Number.isFinite(ownerId) ? ownerId : undefined });
+    // Dashboard cards must respect the caller's RBAC scope (hierarchy-
+    // unioned). req.scope is attached by the global admin middleware
+    // (routes/admin/index.js). Admin/Finance get undefined → no row filter.
+    const counts = await job.getStatusCounts({
+      ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
+      scope: req.scope,
+    });
     modernOk(res, counts);
   } catch (e) { next(e); }
 });
 
-router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
-  try {
-    const row = await job.getById(req.params.id);
-    if (!row) return modernError(res, 404, 'job not found');
-    modernOk(res, row);
-  } catch (e) { next(e); }
+router.get('/:id', validate(idParam, 'params'), scopedJob, async (req, res) => {
+  modernOk(res, req.scopedJob);
 });
 
 router.post('/', validate(createBody), async (req, res, next) => {
   try {
+    // Scope check on create: caller can only create jobs for a client/city
+    // within their manage_* scope. Same guard runs on subsequent edits via
+    // the `scopedJob` middleware.
+    const guard = assertEntityInScope(req, {
+      client_id: req.body.fk_client_id,
+      city_id:   req.body.address?.city_id,
+    });
+    if (!guard.ok) return modernError(res, 403, 'cannot create a job outside your assigned scope');
     const created = await job.create(req.body, req.user);
     res.status(201);
     modernOk(res, created, 'job created');
@@ -97,24 +137,24 @@ const updateHandler = async (req, res, next) => {
     modernOk(res, updated, 'job updated');
   } catch (e) { next(e); }
 };
-router.put('/:id',   validate(idParam, 'params'), validate(updateBody), updateHandler);
-router.patch('/:id', validate(idParam, 'params'), validate(updateBody), updateHandler);
+router.put('/:id',   validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
+router.patch('/:id', validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
 
-router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), async (req, res, next) => {
+router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, async (req, res, next) => {
   try {
     const updated = await job.setStatus(req.params.id, req.body, req.user);
     modernOk(res, updated, 'job status updated');
   } catch (e) { next(e); }
 });
 
-router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), async (req, res, next) => {
+router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, async (req, res, next) => {
   try {
     const updated = await job.assign(req.params.id, req.body, req.user);
     modernOk(res, updated, 'technician assigned');
   } catch (e) { next(e); }
 });
 
-router.patch('/:id/owner', validate(idParam, 'params'), validate(ownerBody), async (req, res, next) => {
+router.patch('/:id/owner', validate(idParam, 'params'), validate(ownerBody), scopedJob, async (req, res, next) => {
   try {
     const updated = await job.changeOwner(req.params.id, req.body, req.user);
     modernOk(res, updated, 'job owner changed');
@@ -137,7 +177,7 @@ const holdBody = require('joi').object({
   reason: require('joi').string().trim().min(1).max(500).required(),
   appointment_time: require('joi').date().iso().required(),
 });
-router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), async (req, res, next) => {
+router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), scopedJob, async (req, res, next) => {
   try {
     await pool.query(
       `UPDATE tbl_job
@@ -153,7 +193,7 @@ router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), async (
     modernOk(res, { on_hold: true, status: 21 });
   } catch (e) { next(e); }
 });
-router.post('/:id/hold/release', validate(idParam, 'params'), async (req, res, next) => {
+router.post('/:id/hold/release', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     await pool.query('UPDATE tbl_job SET job_status = 10 WHERE job_id = ?', [req.params.id]);
     modernOk(res, { released: true, status: 10 });
@@ -178,7 +218,7 @@ router.post('/:id/hold/release', validate(idParam, 'params'), async (req, res, n
 // email with the estimate breakdown; PDF attachment can be wired
 // when ops requests it (the SP and audit trail are already in place).
 const emailServiceForJobs = require('../../services/email.service');
-router.get('/:id/estimate/preview', validate(idParam, 'params'), async (req, res, next) => {
+router.get('/:id/estimate/preview', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     const jobId = Number(req.params.id);
     const [services] = await pool.query(
@@ -205,6 +245,7 @@ router.post('/:id/estimate/send-for-approval',
   validate(require('joi').object({
     comments: require('joi').string().max(1000).allow('', null).optional(),
   }).optional()),
+  scopedJob,
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
@@ -320,7 +361,7 @@ const commentBody = Joi.object({
   efr_id:         Joi.number().integer().positive().optional(),
 });
 
-router.get('/:id/comments', validate(idParam, 'params'), async (req, res, next) => {
+router.get('/:id/comments', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try { modernOk(res, await jobComments.listComments(req.params.id)); }
   catch (e) { next(e); }
 });
@@ -328,6 +369,7 @@ router.get('/:id/comments', validate(idParam, 'params'), async (req, res, next) 
 router.post('/:id/comments',
   validate(idParam, 'params'),
   validate(commentBody),
+  scopedJob,
   async (req, res, next) => {
     try {
       const created = await jobComments.addComment(req.params.id, {
@@ -354,7 +396,7 @@ const feedbackBody = Joi.object({
   happyWithService:  Joi.number().integer().valid(0, 1).optional(),
 }).min(1);
 
-router.get('/:id/feedback', validate(idParam, 'params'), async (req, res, next) => {
+router.get('/:id/feedback', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try { modernOk(res, await jobFeedback.getFeedback(req.params.id)); }
   catch (e) { next(e); }
 });
@@ -362,6 +404,7 @@ router.get('/:id/feedback', validate(idParam, 'params'), async (req, res, next) 
 router.put('/:id/feedback',
   validate(idParam, 'params'),
   validate(feedbackBody),
+  scopedJob,
   async (req, res, next) => {
     try {
       const row = await jobFeedback.upsertFeedback(Number(req.params.id), req.body);

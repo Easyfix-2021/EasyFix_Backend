@@ -5,6 +5,8 @@ const { role } = require('../../middleware/role');
 const validate = require('../../middleware/validate');
 const lookup = require('../../services/lookup.service');
 const { modernOk } = require('../../utils/response');
+const { pool } = require('../../db');
+const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
 const {
   citiesQuery, serviceTypesQuery, clientsQuery, clientServicesQuery,
   usersQuery, banksQuery, simpleIncludeInactive,
@@ -27,6 +29,11 @@ router.get('/cities',             validate(citiesQuery, 'query'),          async
 
 router.get('/states',             async (_req, res, next) => {
   try { modernOk(res, await lookup.states()); } catch (e) { next(e); }
+});
+
+// Verticals — drives the Manage Users Verticals picker for RBAC scope.
+router.get('/verticals',          async (_req, res, next) => {
+  try { modernOk(res, await lookup.verticals()); } catch (e) { next(e); }
 });
 
 router.get('/service-categories', validate(simpleIncludeInactive, 'query'), async (req, res, next) => {
@@ -58,7 +65,15 @@ router.get('/document-types',     validate(simpleIncludeInactive, 'query'), asyn
 // MUST NOT be able to enumerate all clients or internal staff — that's a
 // data-leak bug waiting to happen. /api/client/* will expose a scoped view.
 router.get('/clients',          role(['admin']), validate(clientsQuery, 'query'),        async (req, res, next) => {
-  try { modernOk(res, await lookup.clients(req.query)); } catch (e) { next(e); }
+  try {
+    // Compute scope here because /shared/* isn't mounted under the admin
+    // middleware that pre-attaches req.scope. Hierarchy-aware so a
+    // reporting manager's picker shows the union of own + downstream
+    // reports' manage_clients. Lookup-permissive default — see
+    // services/lookup.service.js::clients for the NULL/empty rule.
+    const scope = await buildRequestScopeWithHierarchy(req, pool);
+    modernOk(res, await lookup.clients({ ...req.query, scope }));
+  } catch (e) { next(e); }
 });
 
 router.get('/client-services',  role(['admin']), validate(clientServicesQuery, 'query'), async (req, res, next) => {

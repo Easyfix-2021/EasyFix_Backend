@@ -53,7 +53,12 @@ const MUTABLE_COLUMNS = Object.freeze([
   // own account. If renaming becomes a real ops need, add a dedicated
   // "transfer ownership" flow rather than a plain UPDATE.
   'mobile_no', 'alternate_no', 'user_role', 'city_id',
-  'manage_clients', 'manage_cities', 'manage_states',
+  // Scope CSVs — drive row-level RBAC. Each accepts the legacy
+  // wildcard "0" meaning "all". See lib/scope.js for the parser.
+  'manage_clients', 'manage_cities', 'manage_states', 'manage_verticals',
+  // Reporting manager — single user_id. Drives hierarchy DFS for
+  // scope-union (see findDescendantUserIds + buildHierarchyTree).
+  'reporting_manager',
 ]);
 
 // ─── List ────────────────────────────────────────────────────────────
@@ -86,7 +91,8 @@ async function listUsers({
         u.user_id, u.user_code, u.user_name, u.official_email, u.mobile_no,
         u.alternate_no, u.user_role, r.role_name,
         u.city_id, c.city_name,
-        u.manage_clients, u.manage_cities, u.manage_states,
+        u.manage_clients, u.manage_cities, u.manage_states, u.manage_verticals,
+        u.reporting_manager,
         u.user_status, u.insert_date, u.update_date
        FROM tbl_user  u
        LEFT JOIN tbl_role r ON r.role_id = u.user_role
@@ -110,7 +116,8 @@ async function getUserById(userId) {
     `SELECT u.user_id, u.user_code, u.user_name, u.official_email, u.mobile_no,
             u.alternate_no, u.user_role, r.role_name,
             u.city_id, c.city_name,
-            u.manage_clients, u.manage_cities, u.manage_states,
+            u.manage_clients, u.manage_cities, u.manage_states, u.manage_verticals,
+        u.reporting_manager,
             u.user_status, u.insert_date, u.update_date, u.updated_by
        FROM tbl_user  u
        LEFT JOIN tbl_role r ON r.role_id = u.user_role
@@ -133,7 +140,9 @@ async function getUserById(userId) {
  */
 async function createUser({
   user_name, official_email, mobile_no, user_role,
-  city_id, alternate_no, manage_clients, manage_cities, manage_states,
+  city_id, alternate_no,
+  manage_clients, manage_cities, manage_states, manage_verticals,
+  reporting_manager,
   createdBy,
 }) {
   const name  = String(user_name || '').trim();
@@ -171,13 +180,15 @@ async function createUser({
     `INSERT INTO tbl_user
        (user_name, official_email, mobile_no, alternate_no,
         user_role, user_type_id, city_id,
-        manage_clients, manage_cities, manage_states,
+        manage_clients, manage_cities, manage_states, manage_verticals,
+        reporting_manager,
         user_status, insert_date, updated_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
     [
       name, email, mob, alternate_no || null,
       Number(user_role), INTERNAL_USER_TYPE_ID, city_id ? Number(city_id) : null,
-      manage_clients || null, manage_cities || null, manage_states || null,
+      manage_clients || null, manage_cities || null, manage_states || null, manage_verticals || null,
+      reporting_manager ? Number(reporting_manager) : null,
       STATUS_ACTIVE, createdBy || null,
     ]
   );
@@ -253,6 +264,140 @@ async function updateUser(userId, fields, updatedBy) {
 }
 
 // ─── Soft-delete (status flag) ──────────────────────────────────────
+/**
+ * Hierarchy DFS — return every user_id that reports to `rootUserId`
+ * directly or transitively via `tbl_user.reporting_manager`.
+ *
+ * Strategy: load the (manager_id, user_id) adjacency for all internal
+ * users once (cheap — single SELECT, ~few thousand rows), build an
+ * in-memory map, then DFS from the root. Cycles are guarded by a
+ * `visited` set; legacy production data has at least one self-loop.
+ *
+ * Returns: { descendants: number[], directReports: number[] }
+ *   descendants — DFS-flattened all-levels (excluding rootUserId itself)
+ *   directReports — only the level-1 children (drives the graph view's
+ *                   initial render)
+ *
+ * Cached briefly: hierarchy mutations are rare (org change ≪ per-request)
+ * so we hold a 60s cache to avoid re-scanning on every /auth/me hit.
+ */
+let _hierarchyCache = { at: 0, byManager: null };
+async function _loadHierarchyAdjacency() {
+  if (_hierarchyCache.byManager && Date.now() - _hierarchyCache.at < 60_000) {
+    return _hierarchyCache.byManager;
+  }
+  const [rows] = await pool.query(
+    `SELECT user_id, reporting_manager
+       FROM tbl_user
+      WHERE user_type_id = ?
+        AND user_status = 1`,
+    [INTERNAL_USER_TYPE_ID]
+  );
+  const byManager = new Map();
+  for (const r of rows) {
+    const mgr = Number(r.reporting_manager || 0);
+    if (!mgr) continue;
+    if (!byManager.has(mgr)) byManager.set(mgr, []);
+    byManager.get(mgr).push(Number(r.user_id));
+  }
+  _hierarchyCache = { at: Date.now(), byManager };
+  return byManager;
+}
+
+async function findDescendantUserIds(rootUserId) {
+  const adj = await _loadHierarchyAdjacency();
+  const directReports = adj.get(Number(rootUserId)) || [];
+  const descendants = [];
+  const visited = new Set([Number(rootUserId)]);
+  const stack = [...directReports];
+  while (stack.length) {
+    const id = stack.pop();
+    if (visited.has(id)) continue; // cycle guard
+    visited.add(id);
+    descendants.push(id);
+    const children = adj.get(id) || [];
+    for (const c of children) stack.push(c);
+  }
+  return { descendants, directReports };
+}
+
+/**
+ * Build a hierarchy tree rooted at `rootUserId` — used by the Users →
+ * Hierarchy graph view. Returns the user node + nested children, plus
+ * the chain of ancestors so the UI can show "this person reports up to".
+ */
+async function buildHierarchyTree(rootUserId) {
+  const adj = await _loadHierarchyAdjacency();
+  const [[root]] = await pool.query(
+    `SELECT u.user_id, u.user_name, u.official_email, u.mobile_no,
+            u.user_role, r.role_name, u.reporting_manager
+       FROM tbl_user u LEFT JOIN tbl_role r ON r.role_id = u.user_role
+      WHERE u.user_id = ? AND u.user_type_id = ?`,
+    [rootUserId, INTERNAL_USER_TYPE_ID]
+  );
+  if (!root) return null;
+
+  // Collect every user_id we'll need in one query (root + descendants + ancestors).
+  const { descendants } = await findDescendantUserIds(rootUserId);
+  const ancestors = [];
+  let cursor = root.reporting_manager;
+  const seen = new Set([Number(rootUserId)]);
+  while (cursor && !seen.has(Number(cursor))) {
+    seen.add(Number(cursor));
+    ancestors.push(Number(cursor));
+    const [[mgrRow]] = await pool.query(
+      'SELECT reporting_manager FROM tbl_user WHERE user_id = ? LIMIT 1',
+      [cursor]
+    );
+    cursor = mgrRow ? mgrRow.reporting_manager : null;
+  }
+
+  const allIds = [Number(rootUserId), ...descendants, ...ancestors];
+  if (allIds.length === 0) return root;
+  const placeholders = allIds.map(() => '?').join(',');
+  const [allUsers] = await pool.query(
+    `SELECT u.user_id, u.user_name, u.official_email, u.mobile_no,
+            u.user_role, r.role_name, u.reporting_manager
+       FROM tbl_user u LEFT JOIN tbl_role r ON r.role_id = u.user_role
+      WHERE u.user_id IN (${placeholders})`,
+    allIds
+  );
+  const byId = new Map(allUsers.map((u) => [u.user_id, { ...u, children: [] }]));
+
+  // Build nested children tree
+  function attach(uid) {
+    const node = byId.get(uid);
+    if (!node) return null;
+    const childIds = adj.get(uid) || [];
+    node.children = childIds.map(attach).filter(Boolean);
+    return node;
+  }
+  const tree = attach(Number(rootUserId));
+  const ancestorChain = ancestors.map((id) => byId.get(id)).filter(Boolean);
+  return { tree, ancestors: ancestorChain };
+}
+
+/*
+ * Real-time mobile-uniqueness probe — drives the Add/Edit User form's
+ * inline validation so the operator finds out BEFORE clicking Save that
+ * a number is already taken. Cheap (mobile_no has an index in production
+ * and the table is ~hundreds of rows of internal staff), so a debounced
+ * call per keystroke is acceptable. We mirror the same active-internal
+ * gate used on create/update — historical inactive duplicates don't count.
+ */
+async function isMobileTakenByAnother(mobile, excludeUserId) {
+  const mob = String(mobile || '').trim();
+  if (!/^[0-9]{10}$/.test(mob)) return { available: false, reason: 'invalid' };
+  const params = [mob, INTERNAL_USER_TYPE_ID];
+  let sql = `SELECT user_id, user_name FROM tbl_user
+              WHERE mobile_no = ? AND user_status = 1 AND user_type_id = ?`;
+  if (excludeUserId) { sql += ' AND user_id <> ?'; params.push(Number(excludeUserId)); }
+  sql += ' LIMIT 1';
+  const [[row]] = await pool.query(sql, params);
+  if (!row) return { available: true };
+  return { available: false, takenBy: { user_id: row.user_id, user_name: row.user_name } };
+}
+
 async function deactivateUser(userId, updatedBy) {
   const [r] = await pool.query(
     `UPDATE tbl_user
@@ -269,6 +414,9 @@ module.exports = {
   createUser,
   updateUser,
   deactivateUser,
+  isMobileTakenByAnother,
+  findDescendantUserIds,
+  buildHierarchyTree,
   SORTABLE_COLUMNS,
   INTERNAL_USER_TYPE_ID,
 };

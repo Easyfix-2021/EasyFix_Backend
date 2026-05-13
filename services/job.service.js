@@ -94,13 +94,51 @@ const DETAIL_JOIN = LIST_JOIN + `
 `;
 
 // ─── List ───────────────────────────────────────────────────────────
+// `scope` (optional) is the parsed RBAC scope from /auth/me:
+//   { clients:{mode,ids}, cities:{mode,ids}, verticals:{mode,ids} }
+// When supplied, the list is row-filtered to the caller's allowed
+// clients + cities + verticals. mode='all' means no filter for that
+// dimension; mode='none' returns zero rows; mode='allow' adds an
+// IN(...) clause. See lib/scope.js. Admin/Finance bypass scope —
+// the caller decides whether to pass it.
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
   startDate, endDate,
+  scope,
   limit = 50, offset = 0,
 } = {}) {
   const clauses = [];
   const params = [];
+
+  // Apply RBAC scope FIRST so any explicit clientId/cityId filter
+  // narrows within the allowed set (caller can't widen scope by passing
+  // a clientId outside their manage_clients).
+  if (scope) {
+    const c = scope.clients, ci = scope.cities, v = scope.verticals;
+    if (c) {
+      if (c.mode === 'none') { clauses.push('1=0'); }
+      else if (c.mode === 'allow' && c.ids.length) {
+        clauses.push(`j.fk_client_id IN (${c.ids.map(() => '?').join(',')})`);
+        params.push(...c.ids);
+      }
+    }
+    if (ci) {
+      if (ci.mode === 'none') { clauses.push('1=0'); }
+      else if (ci.mode === 'allow' && ci.ids.length) {
+        clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
+        params.push(...ci.ids);
+      }
+    }
+    if (v) {
+      if (v.mode === 'none') { clauses.push('1=0'); }
+      else if (v.mode === 'allow' && v.ids.length) {
+        // Vertical lives on tbl_client; LIST_JOIN already pulls
+        // tbl_client cl, so cl.vertical_id is reachable.
+        clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
+        params.push(...v.ids);
+      }
+    }
+  }
 
   // `statuses` (array/CSV) takes priority over single `status` — supports UI
   // tabs that bucket multiple codes (e.g. "Pending to Close" = 2 OR 20,
@@ -185,7 +223,7 @@ async function getById(jobId) {
               cu.customer_name, cu.customer_mob_no, cu.customer_email,
               ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
               ad.gps_location, ad.city_id, ci.city_name,
-              cl.client_name, cl.client_email,
+              cl.client_name, cl.client_email, cl.vertical_id,
               ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
               ow.user_name AS owner_name,
               cr.user_name AS created_by_name
@@ -243,31 +281,65 @@ async function getJobMeta(jobId) {
  * side sum — we use client-side sum because MySQL 5.7's WITH ROLLUP syntax is
  * fussy and the row count is always tiny (≤ 10 status codes).
  */
-async function getStatusCounts({ ownerId } = {}) {
+async function getStatusCounts({ ownerId, scope } = {}) {
   /*
    * Two queries run in parallel:
    *   1. GROUP BY job_status — the raw count per code.
    *   2. BOOKED split by fk_easyfixter_id IS NULL — gives the dashboard the
    *      two derived buckets (Pending for Scheduling vs Pending App Ack) in
-   *      one round-trip instead of a follow-up COUNT. Cheap on tbl_job
-   *      because job_status is indexed and the filter is sargable.
-   * Client-side sum for the grand total — easier than WITH ROLLUP on MySQL 5.7.
+   *      one round-trip instead of a follow-up COUNT.
    *
-   * `ownerId` (optional) scopes both queries to `job_owner = ?` — used by the
-   * My Orders sidebar flow to show "MY jobs by status" counts. Numeric guard
-   * in the route layer makes SQL injection impossible; we still parameterise.
+   * `ownerId` scopes both queries to `job_owner = ?` (My Orders flow).
+   * `scope`   row-filters by the caller's manage_clients × manage_cities
+   *           × manage_verticals — drives the Dashboard cards so a PM only
+   *           sees counts within their assigned scope (including downstream
+   *           hierarchy when scope was built with buildRequestScopeWithHierarchy).
+   * When scope is needed we LEFT JOIN tbl_address (for city) + tbl_client
+   * (for vertical) — same join shape as LIST_JOIN.
    */
-  const ownerWhere = ownerId ? 'WHERE job_owner = ?' : '';
-  const ownerAnd   = ownerId ? 'AND job_owner = ?' : '';
-  const ownerBind  = ownerId ? [ownerId] : [];
+  const clauses = [];
+  const params = [];
+
+  if (ownerId) { clauses.push('j.job_owner = ?'); params.push(ownerId); }
+  if (scope) {
+    const c = scope.clients, ci = scope.cities, v = scope.verticals;
+    if ((c && c.mode === 'none') || (ci && ci.mode === 'none') || (v && v.mode === 'none')) {
+      clauses.push('1=0');
+    }
+    if (c && c.mode === 'allow' && c.ids.length) {
+      clauses.push(`j.fk_client_id IN (${c.ids.map(() => '?').join(',')})`);
+      params.push(...c.ids);
+    }
+    if (ci && ci.mode === 'allow' && ci.ids.length) {
+      clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
+      params.push(...ci.ids);
+    }
+    if (v && v.mode === 'allow' && v.ids.length) {
+      clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
+      params.push(...v.ids);
+    }
+  }
+
+  // Only JOIN tables we actually filter against — cheap on the indexed FKs.
+  const needsAd = scope?.cities?.mode === 'allow';
+  const needsCl = scope?.verticals?.mode === 'allow';
+  const joins = [
+    needsAd ? 'LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id' : '',
+    needsCl ? 'LEFT JOIN tbl_client  cl ON cl.client_id  = j.fk_client_id'  : '',
+  ].filter(Boolean).join(' ');
+
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const bookedWhere = clauses.length
+    ? `WHERE j.job_status = ${STATUS.BOOKED} AND ${clauses.join(' AND ')}`
+    : `WHERE j.job_status = ${STATUS.BOOKED}`;
 
   const [statusRows, bookedSplitRows] = await Promise.all([
-    pool.query(`SELECT job_status, COUNT(*) AS c FROM tbl_job ${ownerWhere} GROUP BY job_status`, ownerBind),
+    pool.query(`SELECT j.job_status, COUNT(*) AS c FROM tbl_job j ${joins} ${where} GROUP BY j.job_status`, params),
     pool.query(
-      `SELECT fk_easyfixter_id IS NULL AS unassigned, COUNT(*) AS c
-         FROM tbl_job WHERE job_status = ${STATUS.BOOKED} ${ownerAnd}
+      `SELECT j.fk_easyfixter_id IS NULL AS unassigned, COUNT(*) AS c
+         FROM tbl_job j ${joins} ${bookedWhere}
         GROUP BY unassigned`,
-      ownerBind
+      params
     ),
   ]);
   const byStatus = {};

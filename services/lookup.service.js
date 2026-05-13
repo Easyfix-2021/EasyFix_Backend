@@ -39,6 +39,18 @@ async function states() {
   return rows;
 }
 
+// Verticals — drives the Manage Users "Verticals" picker for RBAC
+// scope. Only active rows; the master CRUD lives at /admin/verticals.
+async function verticals() {
+  const [rows] = await pool.query(
+    `SELECT vertical_id, vertical_name, vertical_desc, status
+       FROM tbl_vertical
+      WHERE status = 1
+      ORDER BY vertical_name ASC`
+  );
+  return rows;
+}
+
 // ─── Services ───────────────────────────────────────────────────────
 async function serviceCategories({ includeInactive = false } = {}) {
   const where = includeInactive ? '' : 'WHERE service_catg_status = 1';
@@ -67,11 +79,39 @@ async function serviceTypes({ categoryId, includeInactive = false } = {}) {
 }
 
 // ─── Clients ────────────────────────────────────────────────────────
-async function clients({ q, limit = 100, offset = 0, includeInactive = false } = {}) {
+/*
+ * Scope semantics for THIS lookup (deliberately permissive — see notes):
+ *
+ *   - Bypass roles (Admin / Finance)            → all clients
+ *   - manage_clients = "0" wildcard             → all clients
+ *   - manage_clients = "1,5,10,..." specific    → ONLY those client_ids
+ *   - manage_clients = NULL / empty (legacy)    → all clients
+ *
+ * Last bullet is the difference vs the strict parseScope() semantics in
+ * lib/scope.js: there, NULL/empty means "none". For a *picker* that
+ * gates booking creation, "none" is too aggressive — legacy CRM users
+ * with NULL manage_clients (the historical default) still expect to see
+ * client options in the Booking form. Actual writes (POST /admin/jobs)
+ * still enforce the strict scope on `fk_client_id`, so widening the
+ * picker doesn't widen data access; an out-of-scope create gets rejected
+ * at the mutation layer.
+ *
+ * `scope` is the precomputed object attached by routes/admin/index.js
+ * via buildRequestScopeWithHierarchy. Lookups are mounted under /shared
+ * so we accept the scope as a function argument rather than reading req.
+ */
+async function clients({ q, limit = 100, offset = 0, includeInactive = false, scope } = {}) {
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('client_status = 1');
   if (q)                { clauses.push('client_name LIKE ?'); params.push(`%${q}%`); }
+  // Apply scope only when the caller has SPECIFIC clients assigned.
+  // 'all' (wildcard "0"), 'none' (NULL/empty), or undefined (bypass) all
+  // skip the filter — picker stays populated.
+  if (scope && scope.clients && scope.clients.mode === 'allow' && scope.clients.ids.length > 0) {
+    clauses.push(`client_id IN (${scope.clients.placeholders})`);
+    params.push(...scope.clients.ids);
+  }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   params.push(Number(limit), Number(offset));
   const [rows] = await pool.query(
@@ -314,4 +354,5 @@ module.exports = {
   rescheduleReasons,
   banks,
   documentTypes,
+  verticals,
 };

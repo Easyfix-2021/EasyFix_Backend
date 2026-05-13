@@ -2,17 +2,29 @@ const router = require('express').Router();
 
 const requireAuth = require('../../middleware/auth');
 const { role } = require('../../middleware/role');
+const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+const { pool } = require('../../db');
 
 /*
- * Every /api/admin/* sub-resource inherits these two gates:
+ * Every /api/admin/* sub-resource inherits these gates:
  *   - requireAuth   → valid JWT, fresh tbl_user row on req.user
  *   - role(['admin']) → user_role must classify to 'admin' group
+ *   - scope attach  → computes the hierarchy-unioned scope ONCE per
+ *                     request and stashes on req.scope. Downstream
+ *                     handlers + assertEntityInScope read this.
  *
  * Fine-grained role restrictions (e.g. finance-only reports) layer on with
  * roleByName() at the sub-route level.
  */
 router.use(requireAuth);
 router.use(role(['admin']));
+router.use(async (req, _res, next) => {
+  // Hierarchy-aware scope: own manage_* ∪ every direct/indirect report's
+  // manage_*. Bypass roles (Admin/Finance) get `undefined` = no row filter.
+  try { req.scope = await buildRequestScopeWithHierarchy(req, pool); }
+  catch (e) { return next(e); }
+  next();
+});
 
 router.use('/easyfixers',      require('./easyfixers'));
 router.use('/zones',           require('./zones'));

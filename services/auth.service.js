@@ -32,7 +32,9 @@ async function findActiveUserByIdentifier(identifier) {
   const column = isEmail ? 'official_email' : 'mobile_no';
   const [[user]] = await pool.query(
     `SELECT user_id, user_code, user_name, official_email, user_role, user_type_id,
-            city_id, mobile_no, alternate_no, manage_clients, manage_cities, user_status
+            city_id, mobile_no, alternate_no,
+            manage_clients, manage_cities, manage_states, manage_verticals,
+            user_status
        FROM tbl_user
       WHERE ${column} = ?
         AND user_status = 1
@@ -46,7 +48,9 @@ async function findActiveUserByIdentifier(identifier) {
 async function findUserById(userId) {
   const [[user]] = await pool.query(
     `SELECT user_id, user_code, user_name, official_email, user_role, user_type_id,
-            city_id, mobile_no, alternate_no, manage_clients, manage_cities, user_status
+            city_id, mobile_no, alternate_no,
+            manage_clients, manage_cities, manage_states, manage_verticals,
+            user_status
        FROM tbl_user
       WHERE user_id = ?
         AND user_status = 1

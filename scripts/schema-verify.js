@@ -107,6 +107,14 @@ const EXPECTED = {
     'updayted_by', // legacy DB typo ("updayted", not "updated") — preserve
     'inserted_by', 'display_job_dashboard', 'logging_tracking',
   ],
+  tbl_user: [
+    'user_id', 'user_name', 'official_email', 'mobile_no', 'alternate_no',
+    'user_role', 'user_type_id', 'city_id', 'user_status',
+    'manage_clients', 'manage_cities', 'manage_states', 'manage_verticals',
+    'reporting_manager',
+    'insert_date', 'update_date', 'updated_by',
+  ],
+  tbl_vertical: ['vertical_id', 'vertical_name', 'status'],
   confirmation_token: [
     'id', 'token', 'login_id', 'is_verified', 'client_id', 'easyfixer_id', 'is_token_expired',
   ],

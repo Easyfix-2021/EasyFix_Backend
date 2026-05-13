@@ -7,6 +7,47 @@ const { sendXlsx } = require('../../utils/xlsx-export');
 const { renderInvoicePdf } = require('../../utils/pdf-invoice');
 const archiver = require('archiver');
 const { PassThrough } = require('stream');
+const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
+
+/*
+ * Row-level scope guard for every invoice `/invoices/:id*` endpoint.
+ * Fetches the invoice's client, asserts the caller's manage_clients
+ * scope covers it, and attaches the row at `req.scopedInvoice` so
+ * downstream handlers can reuse it without a second SELECT.
+ * Returns 404 (not 403) on scope failure to avoid leaking ids.
+ */
+async function scopedInvoice(req, res, next) {
+  try {
+    const [[inv]] = await pool.query(
+      `SELECT id, fk_client_id, total_invoice_amount, total_paid_amount,
+              total_tds_deducted, is_paid, is_raised
+         FROM tbl_client_invoice WHERE id = ? LIMIT 1`,
+      [req.params.id]
+    );
+    if (!inv) return modernError(res, 404, 'invoice not found');
+    const guard = assertEntityInScope(req, { client_id: inv.fk_client_id });
+    if (!guard.ok) return modernError(res, 404, 'invoice not found');
+    req.scopedInvoice = inv;
+    return next();
+  } catch (e) { next(e); }
+}
+
+/*
+ * Easyfixer-side scope guard for /payouts/:id*, /ndm-recharges/:id*,
+ * /efr-transactions, and similar. Loads the EFR's city to assert the
+ * caller's manage_cities scope covers it. The fetcher accepts the
+ * efr_id directly via req.body.efrId (POSTs) or by joining through
+ * the parent row (passed via `efrIdResolver`).
+ */
+async function assertEfrInScope(req, efrId) {
+  if (!efrId) return { ok: true }; // dimension absent
+  const [[e]] = await pool.query(
+    'SELECT efr_cityId FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+    [efrId]
+  );
+  if (!e) return { ok: false, reason: 'easyfixer not found' };
+  return assertEntityInScope(req, { city_id: e.efr_cityId });
+}
 
 // Shared helper: load the invoice + client + flat line items used by
 // both /excel and /pdf. Keeps the two endpoints in lock-step.
@@ -121,6 +162,16 @@ router.get('/invoices', async (req, res, next) => {
   try {
     const { clientId, isPaid, from, to } = req.query;
     const clauses = [], params = [];
+    // RBAC: limit visible invoices to the caller's manage_clients scope.
+    const scope = buildRequestScope(req);
+    if (scope?.clients) {
+      const c = scope.clients;
+      if (c.mode === 'none') clauses.push('1=0');
+      else if (c.mode === 'allow' && c.ids.length) {
+        clauses.push(`fk_client_id IN (${c.ids.map(() => '?').join(',')})`);
+        params.push(...c.ids);
+      }
+    }
     if (clientId != null) { clauses.push('fk_client_id = ?'); params.push(clientId); }
     if (isPaid === '1' || isPaid === 'true')  clauses.push('is_paid = 1');
     if (isPaid === '0' || isPaid === 'false') clauses.push('is_paid = 0');
@@ -139,12 +190,11 @@ router.get('/invoices', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/invoices/:id', async (req, res, next) => {
+router.get('/invoices/:id', scopedInvoice, async (req, res, next) => {
   try {
-    const [[inv]] = await pool.query('SELECT * FROM tbl_client_invoice WHERE id = ?', [req.params.id]);
-    if (!inv) return modernError(res, 404, 'invoice not found');
+    const [[full]] = await pool.query('SELECT * FROM tbl_client_invoice WHERE id = ?', [req.params.id]);
     const [payments] = await pool.query('SELECT * FROM tbl_client_invoice_paid WHERE fk_invoice_id = ?', [req.params.id]);
-    modernOk(res, { ...inv, payments });
+    modernOk(res, { ...full, payments });
   } catch (e) { next(e); }
 });
 
@@ -154,6 +204,9 @@ router.post('/invoices/generate', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     const { clientId, from, to } = req.body;
+    // RBAC: caller can only generate invoices for clients in their scope.
+    const guard = assertEntityInScope(req, { client_id: clientId });
+    if (!guard.ok) return modernError(res, 403, 'client outside your scope');
     // Sum of completed jobs in range — simplified; real legacy pulls job_services totals
     const [[sum]] = await pool.query(
       `SELECT COALESCE(SUM(js.total_charge * js.quantity), 0) AS total, COUNT(DISTINCT j.job_id) AS jobCount
@@ -188,9 +241,10 @@ router.post('/invoices/:id/payment', validate(Joi.object({
   paidDate: Joi.date().iso().optional(),
   comments: Joi.string().max(500).optional(),
   uploadDocuments: Joi.string().max(255).allow('', null).optional(),
-})), async (req, res, next) => {
+})), scopedInvoice, async (req, res, next) => {
   try {
     const invId = Number(req.params.id);
+    // scopedInvoice loaded the basic row already; re-fetch the totals fields.
     const [[inv]] = await pool.query(
       `SELECT fk_client_id, total_invoice_amount,
               COALESCE(total_paid_amount, 0) AS total_paid_amount,
@@ -241,7 +295,7 @@ router.patch('/invoices/:id/status', validate(Joi.object({
   isRaised: Joi.boolean().optional(),
   isPaid: Joi.boolean().optional(),
   comments: Joi.string().max(500).optional(),
-}).min(1)), async (req, res, next) => {
+}).min(1)), scopedInvoice, async (req, res, next) => {
   try {
     const sets = [], vals = [];
     if (req.body.isRaised !== undefined) { sets.push('is_raised = ?'); vals.push(req.body.isRaised ? 1 : 0); }
@@ -275,7 +329,7 @@ router.patch('/invoices/:id/status', validate(Joi.object({
 // where `checkout_date_time` falls in the billing window. If
 // `invoiced_job_ids` CSV is set on the invoice, honour that list
 // instead (legacy ops sometimes hand-picks which jobs go in).
-router.get('/invoices/:id/excel', async (req, res, next) => {
+router.get('/invoices/:id/excel', scopedInvoice, async (req, res, next) => {
   try {
     const data = await loadInvoiceArtifactData(Number(req.params.id));
     if (!data) return modernError(res, 404, 'invoice not found');
@@ -305,7 +359,7 @@ router.get('/invoices/:id/excel', async (req, res, next) => {
 // ─── /admin/finance/invoices/:id/pdf — formal PDF invoice ───────────
 // Uses utils/pdf-invoice.js (pdfkit). The PDF is the formal client-
 // facing artifact (mirrors legacy `file_path_pdf` / `invoicePdf`).
-router.get('/invoices/:id/pdf', async (req, res, next) => {
+router.get('/invoices/:id/pdf', scopedInvoice, async (req, res, next) => {
   try {
     const data = await loadInvoiceArtifactData(Number(req.params.id));
     if (!data) return modernError(res, 404, 'invoice not found');
@@ -326,6 +380,16 @@ router.get('/invoices/zip', async (req, res, next) => {
   try {
     const { clientId, from, to } = req.query;
     const clauses = [], params = [];
+    // RBAC: only zip invoices for clients in the caller's scope.
+    const scope = buildRequestScope(req);
+    if (scope?.clients) {
+      const c = scope.clients;
+      if (c.mode === 'none') return modernError(res, 403, 'no client access');
+      if (c.mode === 'allow' && c.ids.length) {
+        clauses.push(`fk_client_id IN (${c.ids.map(() => '?').join(',')})`);
+        params.push(...c.ids);
+      }
+    }
     if (clientId) { clauses.push('fk_client_id = ?'); params.push(clientId); }
     if (from)     { clauses.push('billing_from_date >= ?'); params.push(from); }
     if (to)       { clauses.push('billing_to_date   <= ?'); params.push(to); }
@@ -377,6 +441,9 @@ router.post('/email-statement', validate(Joi.object({
     const data = await loadInvoiceArtifactData(Number(req.body.invoiceId));
     if (!data) return modernError(res, 404, 'invoice not found');
     const { inv, client, lines } = data;
+    // RBAC: caller must have scope over the invoice's client.
+    const guard = assertEntityInScope(req, { client_id: inv.fk_client_id });
+    if (!guard.ok) return modernError(res, 404, 'invoice not found');
 
     let recipients = req.body.to || [];
     if (recipients.length === 0) {
@@ -439,6 +506,16 @@ router.get('/efr-transactions', async (req, res, next) => {
   try {
     const { efrId, type, from, to } = req.query;
     const clauses = [], params = [];
+    // RBAC city scope — filter rows by the easyfixer's city
+    const scope = buildRequestScope(req);
+    if (scope?.cities) {
+      const ci = scope.cities;
+      if (ci.mode === 'none') clauses.push('1=0');
+      else if (ci.mode === 'allow' && ci.ids.length) {
+        clauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+        params.push(...ci.ids);
+      }
+    }
     if (efrId != null) { clauses.push('et.easyfixer_id = ?'); params.push(efrId); }
     if (type != null)  { clauses.push('et.transaction_type = ?'); params.push(type); }
     if (from)          { clauses.push('et.transaction_date >= ?'); params.push(from); }
@@ -466,6 +543,16 @@ router.get('/transactions', async (req, res, next) => {
   try {
     const { clientId, jobId } = req.query;
     const clauses = [], params = [];
+    // RBAC: filter by manage_clients
+    const scope = buildRequestScope(req);
+    if (scope?.clients) {
+      const c = scope.clients;
+      if (c.mode === 'none') clauses.push('1=0');
+      else if (c.mode === 'allow' && c.ids.length) {
+        clauses.push(`client_id IN (${c.ids.map(() => '?').join(',')})`);
+        params.push(...c.ids);
+      }
+    }
     if (clientId != null) { clauses.push('client_id = ?'); params.push(clientId); }
     if (jobId != null)    { clauses.push('job_id = ?');    params.push(jobId); }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -485,6 +572,9 @@ router.post('/transactions', validate(Joi.object({
   description: Joi.string().max(500).optional(),
 })), async (req, res, next) => {
   try {
+    // RBAC: caller must have scope over the target client.
+    const guard = assertEntityInScope(req, { client_id: req.body.clientId });
+    if (!guard.ok) return modernError(res, 403, 'client outside your scope');
     const [[prior]] = await pool.query(
       'SELECT balance FROM tbl_client_transaction WHERE client_id = ? ORDER BY client_trans_id DESC LIMIT 1',
       [req.body.clientId]);
@@ -502,9 +592,22 @@ router.post('/transactions', validate(Joi.object({
 router.get('/purchase-orders', async (req, res, next) => {
   try {
     const { clientId } = req.query;
+    const clauses = [], params = [];
+    // RBAC: filter by manage_clients
+    const scope = buildRequestScope(req);
+    if (scope?.clients) {
+      const c = scope.clients;
+      if (c.mode === 'none') clauses.push('1=0');
+      else if (c.mode === 'allow' && c.ids.length) {
+        clauses.push(`fk_client_id IN (${c.ids.map(() => '?').join(',')})`);
+        params.push(...c.ids);
+      }
+    }
+    if (clientId != null) { clauses.push('fk_client_id = ?'); params.push(clientId); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     const [rows] = await pool.query(
-      `SELECT * FROM tbl_client_purchase_order_details ${clientId != null ? 'WHERE fk_client_id = ?' : ''} ORDER BY inv_po_id DESC LIMIT 500`,
-      clientId != null ? [clientId] : []);
+      `SELECT * FROM tbl_client_purchase_order_details ${where} ORDER BY inv_po_id DESC LIMIT 500`,
+      params);
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -512,6 +615,9 @@ router.get('/purchase-orders', async (req, res, next) => {
 router.post('/purchase-orders', async (req, res, next) => {
   try {
     const b = req.body || {};
+    // RBAC: caller must have scope over the target client.
+    const guard = assertEntityInScope(req, { client_id: b.clientId });
+    if (!guard.ok) return modernError(res, 403, 'client outside your scope');
     const [ins] = await pool.query(
       `INSERT INTO tbl_client_purchase_order_details
          (fk_client_id, inv_client_po_num, inv_po_desc, inv_po_start_date, inv_po_end_date, inv_po_total_amnt, inv_po_date)
@@ -525,8 +631,14 @@ router.post('/purchase-orders', async (req, res, next) => {
 // ─── Easyfixer payout ledger ───────────────────────────────────────
 router.get('/easyfixer/:id/payout', async (req, res, next) => {
   try {
-    const [[balance]] = await pool.query('SELECT efr_id, current_balance FROM tbl_easyfixer WHERE efr_id = ?', [req.params.id]);
-    modernOk(res, balance || null);
+    const [[balance]] = await pool.query(
+      'SELECT efr_id, efr_cityId, current_balance FROM tbl_easyfixer WHERE efr_id = ?',
+      [req.params.id]
+    );
+    if (!balance) return modernError(res, 404, 'easyfixer not found');
+    const guard = assertEntityInScope(req, { city_id: balance.efr_cityId });
+    if (!guard.ok) return modernError(res, 404, 'easyfixer not found');
+    modernOk(res, balance);
   } catch (e) { next(e); }
 });
 
@@ -563,6 +675,16 @@ router.get('/payouts', async (req, res, next) => {
   try {
     const { efrId, status } = req.query;
     const clauses = [], params = [];
+    // RBAC: filter by easyfixer's city
+    const scope = buildRequestScope(req);
+    if (scope?.cities) {
+      const ci = scope.cities;
+      if (ci.mode === 'none') clauses.push('1=0');
+      else if (ci.mode === 'allow' && ci.ids.length) {
+        clauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+        params.push(...ci.ids);
+      }
+    }
     if (efrId != null)  { clauses.push('sp.efr_id = ?'); params.push(efrId); }
     if (status != null) { clauses.push('sp.is_approved_by_fin = ?'); params.push(status); }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -625,6 +747,8 @@ router.post('/payouts', validate(Joi.object({
   pmRequestAmount: Joi.number().min(0).required(),
 })), async (req, res, next) => {
   try {
+    const efrGuard = await assertEfrInScope(req, req.body.efrId);
+    if (!efrGuard.ok) return modernError(res, 403, 'easyfixer outside your scope');
     const [ins] = await pool.query(
       `INSERT INTO tbl_service_payout
          (efr_balance, ops_amount, pm_req_amount, pm_req_date, pm_req_by, is_approved_by_fin, efr_id)
@@ -671,6 +795,8 @@ router.post('/payouts/:id/ops-approve', validate(Joi.object({
   opsApprovedAmount: Joi.number().min(0).required(),
 })), async (req, res, next) => {
   try {
+    const efrGuard = await assertEfrInScope(req, req.body.efrId);
+    if (!efrGuard.ok) return modernError(res, 404, 'payout not found');
     await pool.query(
       'CALL sp_ef_approve_payout_by_ops(?, ?, ?, ?, ?)',
       [Number(req.params.id), req.body.efrId, req.body.opsApprovedAmount, req.user.user_id, 1]
@@ -687,6 +813,8 @@ router.post('/payouts/:id/fin-approve', validate(Joi.object({
   payoutDoc: Joi.string().max(255).allow('', null).optional(),
 })), async (req, res, next) => {
   try {
+    const efrGuard = await assertEfrInScope(req, req.body.efrId);
+    if (!efrGuard.ok) return modernError(res, 404, 'payout not found');
     await pool.query(
       'CALL sp_ef_approve_payout_by_finance(?, ?, ?, ?, ?, ?, ?)',
       [
@@ -710,6 +838,8 @@ router.post('/payouts/:id/fin-reject', validate(Joi.object({
   efrId: Joi.number().integer().positive().required(),
 })), async (req, res, next) => {
   try {
+    const efrGuard = await assertEfrInScope(req, req.body.efrId);
+    if (!efrGuard.ok) return modernError(res, 404, 'payout not found');
     const [r] = await pool.query(
       `UPDATE tbl_service_payout
           SET is_approved_by_fin = 3,
@@ -747,6 +877,24 @@ router.get('/ndm-recharges', async (req, res, next) => {
       [efrId, ndmId, flag]
     );
     const data = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : [];
+    // RBAC: post-filter the SP result by easyfixer city scope. SP doesn't
+    // accept a scope param so we filter in-memory; volume is bounded
+    // (pending-approval rows ≤ low hundreds).
+    const scope = buildRequestScope(req);
+    if (scope?.cities && scope.cities.mode !== 'all') {
+      if (scope.cities.mode === 'none') return modernOk(res, []);
+      const allowed = new Set(scope.cities.ids);
+      const efrIds = [...new Set(data.map((r) => r.efr_id).filter(Boolean))];
+      if (efrIds.length === 0) return modernOk(res, []);
+      const placeholders = efrIds.map(() => '?').join(',');
+      const [efrCityRows] = await pool.query(
+        `SELECT efr_id, efr_cityId FROM tbl_easyfixer WHERE efr_id IN (${placeholders})`,
+        efrIds
+      );
+      const cityByEfr = new Map(efrCityRows.map((r) => [r.efr_id, r.efr_cityId]));
+      const filtered = data.filter((r) => allowed.has(cityByEfr.get(r.efr_id)));
+      return modernOk(res, filtered);
+    }
     modernOk(res, data);
   } catch (e) { next(e); }
 });
@@ -761,6 +909,8 @@ router.post('/ndm-recharges', validate(Joi.object({
   referenceId: Joi.string().max(100).allow('', null).optional(),
 })), async (req, res, next) => {
   try {
+    const efrGuard = await assertEfrInScope(req, req.body.efrId);
+    if (!efrGuard.ok) return modernError(res, 403, 'easyfixer outside your scope');
     const [ins] = await pool.query(
       `INSERT INTO tbl_ndm_recharge
          (efr_id, ndm_id, recharge_amount, recharge_date, recharge_type,
@@ -785,6 +935,8 @@ router.post('/ndm-recharges/:id/approve', async (req, res, next) => {
     );
     if (!r) return modernError(res, 404, 'recharge not found');
     if (r.approved_by_finance === 1) return modernError(res, 409, 'already approved');
+    const efrGuard = await assertEfrInScope(req, r.efr_id);
+    if (!efrGuard.ok) return modernError(res, 404, 'recharge not found');
 
     const conn = await pool.getConnection();
     try {
@@ -818,13 +970,17 @@ router.post('/ndm-recharges/:id/approve', async (req, res, next) => {
 
 router.post('/ndm-recharges/:id/reject', async (req, res, next) => {
   try {
+    const id = Number(req.params.id);
+    const [[r]] = await pool.query(
+      'SELECT efr_id FROM tbl_ndm_recharge WHERE recharge_id = ? AND approved_by_finance = 0',
+      [id]
+    );
+    if (!r) return modernError(res, 404, 'recharge not found or already approved');
+    const efrGuard = await assertEfrInScope(req, r.efr_id);
+    if (!efrGuard.ok) return modernError(res, 404, 'recharge not found');
     // Legacy `updateFinanceRejected` simply DELETES the row. Preserving
     // that behaviour — there's no audit table to soft-delete to.
-    const [r] = await pool.query(
-      'DELETE FROM tbl_ndm_recharge WHERE recharge_id = ? AND approved_by_finance = 0',
-      [Number(req.params.id)]
-    );
-    if (r.affectedRows === 0) return modernError(res, 404, 'recharge not found or already approved');
+    await pool.query('DELETE FROM tbl_ndm_recharge WHERE recharge_id = ?', [id]);
     modernOk(res, { rejected: true });
   } catch (e) { next(e); }
 });
@@ -835,6 +991,8 @@ router.post('/easyfixer/:id/recharge', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     const efrId = Number(req.params.id);
+    const efrGuard = await assertEfrInScope(req, efrId);
+    if (!efrGuard.ok) return modernError(res, 404, 'easyfixer not found');
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();

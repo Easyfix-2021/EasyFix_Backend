@@ -3,6 +3,20 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
+
+// Helper: given a jobId, return {client_id, city_id, vertical_id} for scope check.
+async function jobScopeFields(jobId) {
+  const [[row]] = await pool.query(
+    `SELECT j.fk_client_id AS client_id, ad.city_id, cl.vertical_id
+       FROM tbl_job j
+       LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+       LEFT JOIN tbl_client  cl ON cl.client_id  = j.fk_client_id
+      WHERE j.job_id = ? LIMIT 1`,
+    [jobId]
+  );
+  return row || null;
+}
 
 /*
  * Quotations admin CRUD + validator + expiry countdown.
@@ -24,6 +38,11 @@ router.get('/', async (req, res, next) => {
   try {
     const { jobId } = req.query;
     if (!jobId) return modernError(res, 400, 'jobId required');
+    // RBAC: caller must have scope over the job's client/city/vertical.
+    const jf = await jobScopeFields(Number(jobId));
+    if (!jf) return modernOk(res, []);
+    const guard = assertEntityInScope(req, jf);
+    if (!guard.ok) return modernOk(res, []);
     const [rows] = await pool.query(
       `SELECT id, type, name, unit, unit_price,
               tx_charge, client_charge, approved_charge, margin,
@@ -52,6 +71,10 @@ const productBody = Joi.object({
 
 router.post('/product', validate(productBody), async (req, res, next) => {
   try {
+    const jf = await jobScopeFields(req.body.jobId);
+    if (!jf) return modernError(res, 404, 'job not found');
+    const guard = assertEntityInScope(req, jf);
+    if (!guard.ok) return modernError(res, 404, 'job not found');
     const [ins] = await pool.query(
       `INSERT INTO quotation_details
          (type, name, unit, unit_price, tx_charge, client_charge, margin,
@@ -74,6 +97,10 @@ router.post('/product', validate(productBody), async (req, res, next) => {
 router.post('/material', validate(productBody.fork(['name'], (s) => s)
     .keys({ materialId: Joi.number().integer().positive().optional() })), async (req, res, next) => {
   try {
+    const jf = await jobScopeFields(req.body.jobId);
+    if (!jf) return modernError(res, 404, 'job not found');
+    const guard = assertEntityInScope(req, jf);
+    if (!guard.ok) return modernError(res, 404, 'job not found');
     const [ins] = await pool.query(
       `INSERT INTO quotation_details
          (type, name, unit, unit_price, tx_charge, client_charge, margin,
@@ -250,18 +277,36 @@ router.get('/expiry/:jobId', async (req, res, next) => {
 // List all expired pending estimates — drives the escalation queue.
 router.get('/expired', async (req, res, next) => {
   try {
+    const clauses = [
+      'j.approval_sent_on_date_time IS NOT NULL',
+      'j.approved_on_date_time IS NULL',
+      'j.approval_reject_date_time IS NULL',
+      'TIMESTAMPDIFF(HOUR, j.approval_sent_on_date_time, NOW()) > 48',
+    ];
+    const params = [];
+    // RBAC scope
+    const scope = buildRequestScope(req);
+    if (scope) {
+      if (scope.clients.mode === 'none') clauses.push('1=0');
+      if (scope.clients.mode === 'allow' && scope.clients.ids.length) {
+        clauses.push(`j.fk_client_id IN (${scope.clients.ids.map(() => '?').join(',')})`);
+        params.push(...scope.clients.ids);
+      }
+      if (scope.verticals.mode === 'allow' && scope.verticals.ids.length) {
+        clauses.push(`c.vertical_id IN (${scope.verticals.ids.map(() => '?').join(',')})`);
+        params.push(...scope.verticals.ids);
+      }
+    }
     const [rows] = await pool.query(
       `SELECT j.job_id, j.job_reference_id, j.fk_client_id, c.client_name,
               j.approval_sent_on_date_time, j.no_of_req_approval,
               TIMESTAMPDIFF(HOUR, j.approval_sent_on_date_time, NOW()) AS hours_elapsed
          FROM tbl_job j
          LEFT JOIN tbl_client c ON c.client_id = j.fk_client_id
-        WHERE j.approval_sent_on_date_time IS NOT NULL
-          AND j.approved_on_date_time IS NULL
-          AND j.approval_reject_date_time IS NULL
-          AND TIMESTAMPDIFF(HOUR, j.approval_sent_on_date_time, NOW()) > 48
+        WHERE ${clauses.join(' AND ')}
         ORDER BY j.approval_sent_on_date_time
-        LIMIT 500`
+        LIMIT 500`,
+      params
     );
     modernOk(res, rows);
   } catch (e) { next(e); }

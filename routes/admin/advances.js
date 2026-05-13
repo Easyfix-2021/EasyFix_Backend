@@ -3,6 +3,36 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
+
+// Helper: load an advance + its scope-relevant fields (client/vertical/city).
+async function loadAdvanceForScope(advanceId) {
+  const [[row]] = await pool.query(
+    `SELECT a.advance_id, a.client_id, a.efr_id,
+            cl.vertical_id, e.efr_cityId AS city_id
+       FROM tbl_efr_advance_payment a
+       LEFT JOIN tbl_client    cl ON cl.client_id = a.client_id
+       LEFT JOIN tbl_easyfixer e  ON e.efr_id     = a.efr_id
+      WHERE a.advance_id = ? LIMIT 1`,
+    [advanceId]
+  );
+  return row || null;
+}
+
+async function scopedAdvance(req, res, next) {
+  try {
+    const row = await loadAdvanceForScope(req.params.id);
+    if (!row) return modernError(res, 404, 'advance not found');
+    const guard = assertEntityInScope(req, {
+      client_id: row.client_id,
+      city_id: row.city_id,
+      vertical_id: row.vertical_id,
+    });
+    if (!guard.ok) return modernError(res, 404, 'advance not found');
+    req.scopedAdvance = row;
+    return next();
+  } catch (e) { next(e); }
+}
 
 /*
  * Advance Payment audit workflow on `tbl_efr_advance_payment`.
@@ -30,6 +60,22 @@ router.get('/', async (req, res, next) => {
     const { status, efrId } = req.query;
     const clauses = [];
     const params = [];
+    // RBAC: scope by client (manage_clients) + city (manage_cities via
+    // joined efr.efr_cityId) + vertical (joined cl.vertical_id).
+    const scope = buildRequestScope(req);
+    if (scope) {
+      const c = scope.clients, ci = scope.cities, v = scope.verticals;
+      if (c.mode === 'none' || ci.mode === 'none' || v.mode === 'none') clauses.push('1=0');
+      if (c.mode === 'allow' && c.ids.length) {
+        clauses.push(`a.client_id IN (${c.ids.map(() => '?').join(',')})`); params.push(...c.ids);
+      }
+      if (ci.mode === 'allow' && ci.ids.length) {
+        clauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`); params.push(...ci.ids);
+      }
+      if (v.mode === 'allow' && v.ids.length) {
+        clauses.push(`c.vertical_id IN (${v.ids.map(() => '?').join(',')})`); params.push(...v.ids);
+      }
+    }
     if (status != null && status !== '') {
       clauses.push('a.adv_status = ?');
       params.push(Number(status));
@@ -65,7 +111,7 @@ router.get('/', async (req, res, next) => {
 });
 
 // ─── GET /admin/advances/:id — detail ───────────────────────────────
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', scopedAdvance, async (req, res, next) => {
   try {
     const [[row]] = await pool.query(
       `SELECT a.*, e.efr_name, e.efr_no, c.client_name
@@ -100,6 +146,16 @@ router.post('/', validate(Joi.object({
       );
       if (job && job.fk_client_id != null) clientId = job.fk_client_id;
     }
+    // RBAC: caller's scope must cover the client + the efr's city.
+    const [[efr]] = await pool.query(
+      'SELECT efr_cityId FROM tbl_easyfixer WHERE efr_id = ?',
+      [b.efrId]
+    );
+    const guard = assertEntityInScope(req, {
+      client_id: clientId,
+      city_id: efr?.efr_cityId,
+    });
+    if (!guard.ok) return modernError(res, 403, 'client or easyfixer outside your scope');
     const [ins] = await pool.query(
       `INSERT INTO tbl_efr_advance_payment
          (client_id, job_id, efr_id, adv_status,
@@ -127,7 +183,7 @@ router.post('/', validate(Joi.object({
 // ─── POST /admin/advances/:id/ops-approve — moves to status 1 ───────
 router.post('/:id/ops-approve', validate(Joi.object({
   remarks: Joi.string().max(1000).allow('', null).optional(),
-})), async (req, res, next) => {
+})), scopedAdvance, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const [[row]] = await pool.query(
@@ -158,7 +214,7 @@ router.post('/:id/ops-approve', validate(Joi.object({
 router.post('/:id/fin-approve', validate(Joi.object({
   remarks: Joi.string().max(1000).allow('', null).optional(),
   transactionId: Joi.string().max(100).allow('', null).optional(),
-})), async (req, res, next) => {
+})), scopedAdvance, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const [[row]] = await pool.query(
@@ -198,7 +254,7 @@ router.post('/:id/fin-approve', validate(Joi.object({
 // (status 2 or 3) cannot be rejected.
 router.post('/:id/reject', validate(Joi.object({
   remarks: Joi.string().max(1000).allow('', null).optional(),
-})), async (req, res, next) => {
+})), scopedAdvance, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     const [[row]] = await pool.query(

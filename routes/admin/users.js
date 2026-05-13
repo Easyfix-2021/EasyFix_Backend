@@ -40,25 +40,47 @@ const createBody = Joi.object({
   alternate_no:   Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
   user_role:      Joi.number().integer().positive().required(),
   city_id:        Joi.number().integer().positive().allow(null).optional(),
-  // manage_clients / manage_cities / manage_states — comma-separated id strings
-  // (legacy varchar; no FK enforcement). We don't validate the contents to
-  // stay flexible with how legacy callers populate them; if it becomes a
-  // problem we tighten here.
-  manage_clients: Joi.string().allow('', null).optional(),
-  manage_cities:  Joi.string().allow('', null).optional(),
-  manage_states:  Joi.string().allow('', null).optional(),
+  // RBAC scope CSVs — comma-separated id strings (legacy varchar; no
+  // FK enforcement). The literal "0" is a wildcard meaning "all" —
+  // see lib/scope.js. We don't validate contents beyond shape so that
+  // legacy callers and bulk-imports keep working.
+  manage_clients:    Joi.string().allow('', null).optional(),
+  manage_cities:     Joi.string().allow('', null).optional(),
+  manage_states:     Joi.string().allow('', null).optional(),
+  manage_verticals:  Joi.string().allow('', null).optional(),
+  reporting_manager: Joi.number().integer().positive().allow(null).optional(),
 });
 
 const updateBody = Joi.object({
-  mobile_no:      Joi.string().trim().pattern(/^[0-9]{10}$/).optional(),
-  alternate_no:   Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
-  user_role:      Joi.number().integer().positive().optional(),
-  city_id:        Joi.number().integer().positive().allow(null).optional(),
-  manage_clients: Joi.string().allow('', null).optional(),
-  manage_cities:  Joi.string().allow('', null).optional(),
-  manage_states:  Joi.string().allow('', null).optional(),
-  is_active:      Joi.boolean().optional(),
+  mobile_no:         Joi.string().trim().pattern(/^[0-9]{10}$/).optional(),
+  alternate_no:      Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
+  user_role:         Joi.number().integer().positive().optional(),
+  city_id:           Joi.number().integer().positive().allow(null).optional(),
+  manage_clients:    Joi.string().allow('', null).optional(),
+  manage_cities:     Joi.string().allow('', null).optional(),
+  manage_states:     Joi.string().allow('', null).optional(),
+  manage_verticals:  Joi.string().allow('', null).optional(),
+  reporting_manager: Joi.number().integer().positive().allow(null).optional(),
+  is_active:         Joi.boolean().optional(),
 }).min(1);
+
+// ─── Real-time mobile uniqueness probe ──────────────────────────────
+// Mounted BEFORE /:userId so Express doesn't try to parse "check-mobile"
+// as an integer user id. Used by the Add/Edit User form for inline
+// validation — the operator finds out a mobile is taken before clicking
+// Save. Read-only, idempotent; safe for any admin-group user.
+const checkMobileQuery = Joi.object({
+  mobile:        Joi.string().trim().pattern(/^[0-9]{10}$/).required(),
+  excludeUserId: Joi.number().integer().positive().optional(),
+});
+router.get('/check-mobile', validate(checkMobileQuery, 'query'), async (req, res, next) => {
+  try {
+    const result = await userService.isMobileTakenByAnother(
+      req.query.mobile, req.query.excludeUserId
+    );
+    modernOk(res, result);
+  } catch (e) { next(e); }
+});
 
 // ─── READ ────────────────────────────────────────────────────────────
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
@@ -73,6 +95,20 @@ router.get('/:userId', validate(idParam, 'params'), async (req, res, next) => {
     const row = await userService.getUserById(Number(req.params.userId));
     if (!row) return modernError(res, 404, 'User not found');
     modernOk(res, row);
+  } catch (e) { next(e); }
+});
+
+// ─── Hierarchy graph — Users → Hierarchy ────────────────────────────
+// Returns a tree rooted at `userId` containing every direct + indirect
+// report (BFS expanded server-side via DFS over tbl_user.reporting_manager)
+// plus the chain of ancestors above them. Powers the Users → Hierarchy
+// graph view. The user can be looked up by id or by official_email
+// before hitting this endpoint via the standard list filter.
+router.get('/:userId/hierarchy', validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    const tree = await userService.buildHierarchyTree(Number(req.params.userId));
+    if (!tree) return modernError(res, 404, 'User not found');
+    modernOk(res, tree);
   } catch (e) { next(e); }
 });
 

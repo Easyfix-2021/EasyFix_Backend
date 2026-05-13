@@ -115,7 +115,53 @@ router.get('/me', requireAuth, async (req, res, next) => {
     // menuIds as the sidebar allowlist and actionPermissions as the
     // button-gating Set.
     const { getEffectivePermissions } = require('../services/role.service');
+    const { parseScope, bypassesScope, mergeScope } = require('../lib/scope');
+    const { findDescendantUserIds } = require('../services/user.service');
+    const { pool } = require('../db');
     const permissions = await getEffectivePermissions(req.user.user_id);
+
+    // Row-level RBAC scope — parsed from the user's `manage_*` CSV
+    // columns + UNIONED with the scope of every direct/indirect report
+    // (reporting hierarchy DFS via tbl_user.reporting_manager). A PM
+    // sees their own assigned data PLUS the union of every downstream
+    // report's assigned data. Bypass roles (Admin/Finance) get 'all'
+    // across the board.
+    const bypass = role && bypassesScope(role.role_name);
+    let scope;
+    let hierarchy = { directReports: [], descendants: [] };
+    if (bypass) {
+      scope = {
+        clients:   { mode: 'all', ids: [] },
+        cities:    { mode: 'all', ids: [] },
+        states:    { mode: 'all', ids: [] },
+        verticals: { mode: 'all', ids: [] },
+      };
+    } else {
+      // Own scope
+      scope = {
+        clients:   parseScope(req.user.manage_clients),
+        cities:    parseScope(req.user.manage_cities),
+        states:    parseScope(req.user.manage_states),
+        verticals: parseScope(req.user.manage_verticals),
+      };
+      // Union in every downstream report's scope
+      hierarchy = await findDescendantUserIds(req.user.user_id);
+      if (hierarchy.descendants.length > 0) {
+        const placeholders = hierarchy.descendants.map(() => '?').join(',');
+        const [rows] = await pool.query(
+          `SELECT manage_clients, manage_cities, manage_states, manage_verticals
+             FROM tbl_user WHERE user_id IN (${placeholders})`,
+          hierarchy.descendants
+        );
+        for (const r of rows) {
+          scope.clients   = mergeScope(scope.clients,   parseScope(r.manage_clients));
+          scope.cities    = mergeScope(scope.cities,    parseScope(r.manage_cities));
+          scope.states    = mergeScope(scope.states,    parseScope(r.manage_states));
+          scope.verticals = mergeScope(scope.verticals, parseScope(r.manage_verticals));
+        }
+      }
+    }
+
     modernOk(res, {
       user: req.user,
       role: role && {
@@ -125,6 +171,11 @@ router.get('/me', requireAuth, async (req, res, next) => {
         active: role.role_status,
       },
       permissions,
+      scope,
+      hierarchy: {
+        directReportsCount: hierarchy.directReports.length,
+        descendantsCount: hierarchy.descendants.length,
+      },
     });
   } catch (err) {
     next(err);
