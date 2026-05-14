@@ -105,6 +105,228 @@ router.get('/counts', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * GET /api/admin/jobs/escalated
+ *
+ * Ported from legacy ACD action `getEscalatedJobs` (JobDaoImpl.java:4690).
+ * Returns the same enriched shape the Angular Client Dashboard's
+ * "Escalated Jobs" modal renders.
+ *
+ * Data sources (verified against legacy SQL):
+ *   - tbl_easyfixer_rating_by_customer (alias e)  : the canonical
+ *       escalation record. Columns: table_id, job_id, easyfixer_id,
+ *       is_escalated (0/1), escalated_by (user_id FK), escalated_time,
+ *       resolved_time, escalated_comments, no_of_escalations,
+ *       escalated_from, completed_action, inprogress_action,
+ *       closed_action, escalation_closed_time.
+ *   - tbl_job_escalation_info (alias i)           : per-stage history.
+ *       Aggregated into job_stage (CSV of "date + stage") so each row
+ *       shows where the job sat at each escalation moment.
+ *   - tbl_job (j), tbl_address (a), tbl_city (c), tbl_client (cl),
+ *     tbl_user (u) — joined for client name, city, owner, etc.
+ *
+ * Filter param `status` ∈ {open, closed, pending}:
+ *   - open    : escalated_time IS NOT NULL AND
+ *               (resolved_time IS NULL OR escalated_time > resolved_time
+ *                OR closed_action = 16)
+ *   - closed  : escalated_time + resolved_time + escalation_closed_time
+ *               all NOT NULL AND closed_action != 16
+ *   - pending : escalated > resolved, no closed_action=15
+ *
+ * RBAC: respects req.scope (clients × cities × verticals).
+ */
+router.get('/escalated', async (req, res, next) => {
+  try {
+    const status = String(req.query.status || 'open').toLowerCase();
+    const q = String(req.query.q || '').trim();
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
+    const clauses = ['e.is_escalated = 1', 'e.escalated_time IS NOT NULL'];
+    const params = [];
+
+    if (status === 'open') {
+      clauses.push('(e.resolved_time IS NULL OR e.escalated_time > e.resolved_time OR e.closed_action = 16)');
+    } else if (status === 'closed') {
+      clauses.push('e.resolved_time IS NOT NULL');
+      clauses.push('e.escalation_closed_time IS NOT NULL');
+      clauses.push('(e.closed_action IS NULL OR e.closed_action != 16)');
+    } else if (status === 'pending') {
+      clauses.push('e.resolved_time IS NOT NULL');
+      clauses.push('e.escalated_time < e.resolved_time');
+      clauses.push('(e.escalation_closed_time IS NULL OR e.closed_action != 15)');
+    }
+
+    if (q) {
+      clauses.push('(j.job_id = ? OR cl.client_name LIKE ? OR c.city_name LIKE ?)');
+      params.push(Number(q) || 0, `%${q}%`, `%${q}%`);
+    }
+
+    // RBAC scope — same shape as the main list. We only filter when scope
+    // is set; Admin/Finance bypass via the lib/scope.js bypass list.
+    const sc = req.scope;
+    if (sc) {
+      if (sc.clients) {
+        if (sc.clients.mode === 'none') clauses.push('1=0');
+        else if (sc.clients.mode === 'allow' && sc.clients.ids.length) {
+          clauses.push(`j.fk_client_id IN (${sc.clients.ids.map(() => '?').join(',')})`);
+          params.push(...sc.clients.ids);
+        }
+      }
+      if (sc.cities) {
+        if (sc.cities.mode === 'none') clauses.push('1=0');
+        else if (sc.cities.mode === 'allow' && sc.cities.ids.length) {
+          clauses.push(`a.city_id IN (${sc.cities.ids.map(() => '?').join(',')})`);
+          params.push(...sc.cities.ids);
+        }
+      }
+      if (sc.verticals) {
+        if (sc.verticals.mode === 'none') clauses.push('1=0');
+        else if (sc.verticals.mode === 'allow' && sc.verticals.ids.length) {
+          clauses.push(`cl.vertical_id IN (${sc.verticals.ids.map(() => '?').join(',')})`);
+          params.push(...sc.verticals.ids);
+        }
+      }
+    }
+
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    // Aggregated job_stage subquery — for each job, concatenates every
+    // (escalation_time, job_stage) pair from tbl_job_escalation_info.
+    // Mirrors the legacy group_concat in JobDaoImpl line 4705.
+    const baseFrom = `
+      FROM tbl_easyfixer_rating_by_customer e
+      LEFT JOIN tbl_job     j  ON j.job_id = e.job_id
+      LEFT JOIN tbl_address a  ON a.address_id = j.fk_address_id
+      LEFT JOIN tbl_city    c  ON c.city_id = a.city_id
+      LEFT JOIN tbl_client  cl ON cl.client_id = j.fk_client_id
+      LEFT JOIN tbl_user    u  ON u.user_id = e.escalated_by
+      LEFT JOIN (
+        SELECT job_id,
+               GROUP_CONCAT(
+                 CONCAT(
+                   DATE_FORMAT(escalation_time, '%d %M %Y %h:%i %p'),
+                   ' · ', COALESCE(job_stage, '—')
+                 )
+                 ORDER BY escalation_time
+                 SEPARATOR ' / '
+               ) AS job_stage_history
+          FROM tbl_job_escalation_info
+         GROUP BY job_id
+      ) j1 ON j1.job_id = j.job_id
+    `;
+
+    const { pool } = require('../../db');
+    const [rows] = await pool.query(
+      `SELECT
+         e.table_id, e.job_id, j.job_status, j.fk_easyfixter_id,
+         e.escalated_time, e.resolved_time, e.escalation_closed_time,
+         e.escalated_by, u.user_name AS escalated_by_name,
+         e.escalated_comments, e.no_of_escalations, e.escalated_from,
+         e.closed_action, e.completed_action, e.inprogress_action,
+         j.requested_date_time, j.job_reference_id, j.client_ref_id, j.sub_job_id,
+         cl.client_name, c.city_name,
+         j1.job_stage_history
+       ${baseFrom}
+       ${where}
+       ORDER BY e.escalated_time DESC, e.table_id DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total ${baseFrom} ${where}`, params
+    );
+    modernOk(res, { items: rows, total, limit, offset });
+  } catch (e) { next(e); }
+});
+
+/*
+ * PATCH /api/admin/jobs/escalated/:tableId
+ *
+ * Updates one escalation workflow row (`tbl_easyfixer_rating_by_customer`).
+ * Drives the inline Team Action / Completed Action / Closed Action +
+ * Comment controls in the EscalatedJobsModal. Allowed fields:
+ *
+ *   inprogress_action : 1..5 (Team Action enum, legacy values from
+ *                       escalateSearchResult.vm:64-71)
+ *   completed_action  : 11..12 (Completed Action enum)
+ *   closed_action     : 15 (Resolved) | 16 (Re-Open)
+ *   escalated_comments: free text appended/replaced (legacy let
+ *                       supply team add an inline comment per row)
+ *
+ * When closed_action transitions to 15 (Resolved), also stamp
+ * escalation_closed_time = NOW(). When set to 16 (Re-Open), clear
+ * the closed_time so the row goes back to the "open" filter.
+ */
+router.patch('/escalated/:tableId', async (req, res, next) => {
+  try {
+    const { pool } = require('../../db');
+    const tableId = Number(req.params.tableId);
+    if (!Number.isInteger(tableId) || tableId <= 0) {
+      return modernError(res, 400, 'invalid tableId');
+    }
+    const sets = [];
+    const params = [];
+    const b = req.body || {};
+
+    // Team Action — `inprogress_action` column.
+    if (b.inprogress_action !== undefined) {
+      const v = Number(b.inprogress_action);
+      if (!Number.isInteger(v) || v < 0 || v > 5) {
+        return modernError(res, 400, 'inprogress_action must be 0..5');
+      }
+      sets.push('inprogress_action = ?');
+      params.push(v || null);
+    }
+    // Completed Action.
+    if (b.completed_action !== undefined) {
+      const v = Number(b.completed_action);
+      if (!Number.isInteger(v) || (v !== 0 && v !== 11 && v !== 12)) {
+        return modernError(res, 400, 'completed_action must be 11 or 12');
+      }
+      sets.push('completed_action = ?');
+      params.push(v || null);
+    }
+    // Closed Action — also stamps / clears escalation_closed_time.
+    if (b.closed_action !== undefined) {
+      const v = Number(b.closed_action);
+      if (!Number.isInteger(v) || (v !== 0 && v !== 15 && v !== 16)) {
+        return modernError(res, 400, 'closed_action must be 15 (Resolved) or 16 (Re-Open)');
+      }
+      sets.push('closed_action = ?');
+      params.push(v || null);
+      if (v === 15) {
+        sets.push('escalation_closed_time = NOW()');
+        // also mark resolved_time so the "closed" filter picks it up
+        sets.push('resolved_time = COALESCE(resolved_time, NOW())');
+      } else if (v === 16) {
+        // Re-Open: clear closed_time + bump no_of_escalations so the
+        // row falls back into the "open" filter. Legacy did the same.
+        sets.push('escalation_closed_time = NULL');
+        sets.push('no_of_escalations = COALESCE(no_of_escalations, 0) + 1');
+        sets.push('escalated_time = NOW()');
+      }
+    }
+    if (b.escalated_comments !== undefined) {
+      const txt = String(b.escalated_comments || '').slice(0, 2000);
+      sets.push('escalated_comments = ?');
+      params.push(txt || null);
+    }
+    if (sets.length === 0) {
+      return modernError(res, 400, 'no editable fields supplied');
+    }
+    params.push(tableId);
+    const [r] = await pool.query(
+      `UPDATE tbl_easyfixer_rating_by_customer SET ${sets.join(', ')} WHERE table_id = ?`,
+      params
+    );
+    if (r.affectedRows === 0) {
+      return modernError(res, 404, 'escalation row not found');
+    }
+    modernOk(res, { updated: true });
+  } catch (e) { next(e); }
+});
+
 router.get('/:id', validate(idParam, 'params'), scopedJob, async (req, res) => {
   modernOk(res, req.scopedJob);
 });

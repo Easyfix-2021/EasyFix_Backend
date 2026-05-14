@@ -103,6 +103,8 @@ const DETAIL_JOIN = LIST_JOIN + `
 // the caller decides whether to pass it.
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
+  customerId,
+  isEscalated,
   startDate, endDate,
   scope,
   limit = 50, offset = 0,
@@ -170,6 +172,24 @@ async function list({
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
   if (ownerId != null)     { clauses.push('j.job_owner = ?');        params.push(ownerId); }
   if (cityId != null)      { clauses.push('ad.city_id = ?');         params.push(cityId); }
+  if (customerId != null)  { clauses.push('j.fk_customer_id = ?');   params.push(customerId); }
+  // `isEscalated` migration note: I initially wired this to
+  // `j.is_escalated`, but that column DOES NOT exist on `tbl_job`. The
+  // legacy CRM had it commented out across JobDaoImpl.java; the real
+  // escalation flag lives on `tbl_easyfixer_rating_by_customer.is_escalated`
+  // joined by `job_id`. Implementing the proper join here would touch
+  // the LIST projection too (we'd need to LEFT JOIN ratings just for
+  // the filter) and the legacy CRM itself didn't actively use the
+  // count — `escalatedJobs = jobService.getEscalatedJobsbyUser(...)`
+  // was commented out in HomeAction.java.
+  //
+  // For now: accept the param to keep the URL contract stable but
+  // emit no SQL clause. Returns the full unfiltered list, which is
+  // worse than the legacy 0-row count behaviour but at least doesn't
+  // 500. Wire the proper rating-table join in a focused follow-up.
+  if (isEscalated !== undefined && isEscalated !== '') {
+    // intentional no-op — see comment above
+  }
   if (startDate)           { clauses.push('j.created_date_time >= ?'); params.push(startDate); }
   if (endDate)             { clauses.push('j.created_date_time <= ?'); params.push(endDate); }
   if (q) {
@@ -333,6 +353,17 @@ async function getStatusCounts({ ownerId, scope } = {}) {
     ? `WHERE j.job_status = ${STATUS.BOOKED} AND ${clauses.join(' AND ')}`
     : `WHERE j.job_status = ${STATUS.BOOKED}`;
 
+  // Escalated count is intentionally NOT queried here. The legacy CRM
+  // sourced this from `tbl_easyfixer_rating_by_customer.is_escalated`
+  // joined by job_id — NOT from a `tbl_job.is_escalated` column (which
+  // doesn't exist). The legacy header itself commented out the
+  // getEscalatedJobsbyUser() call, so the badge was already a no-op
+  // upstream. Returning `escalated: 0` keeps the navbar contract stable
+  // (it conditionally hides the badge when count is 0) without forcing
+  // an extra JOIN to a table that may not be reliably populated.
+  // Wire the rating-table join in a focused follow-up when the
+  // escalation workflow is actually re-activated.
+
   const [statusRows, bookedSplitRows] = await Promise.all([
     pool.query(`SELECT j.job_status, COUNT(*) AS c FROM tbl_job j ${joins} ${where} GROUP BY j.job_status`, params),
     pool.query(
@@ -356,7 +387,9 @@ async function getStatusCounts({ ownerId, scope } = {}) {
     if (Number(r.unassigned) === 1) bookedUnassigned = Number(r.c);
     else bookedAssigned = Number(r.c);
   }
-  return { total, byStatus, bookedUnassigned, bookedAssigned };
+  // See comment above — escalated badge is stubbed to 0 until the
+  // rating-table join lands.
+  return { total, byStatus, bookedUnassigned, bookedAssigned, escalated: 0 };
 }
 
 // ─── Customer + Address helpers (used by create) ───────────────────
@@ -386,6 +419,28 @@ async function upsertCustomer(conn, { customer_id, customer_name, customer_mob_n
     [customer_name, customer_mob_no, customer_email || null, actor?.user_id || null, new Date(), new Date()]
   );
   return ins.insertId;
+}
+
+/*
+ * composeRemarks — combines the operator's free-text remarks with the
+ * two legacy Book-New-Call fields (product_code, building_name) into
+ * a single string with named prefixes. Used because those two columns
+ * don't exist on the production tbl_job schema (verified 2026-05-14
+ * via INFORMATION_SCHEMA — only `branch_details` exists; the other
+ * two return zero rows). `branch_details` has been promoted to a
+ * dedicated INSERT column.
+ *
+ * Format:
+ *   <user remarks>
+ *   [Product Code] <product_code>
+ *   [Building / Property] <building_name>
+ */
+function composeRemarks(input) {
+  const parts = [];
+  if (input.remarks) parts.push(String(input.remarks));
+  if (input.product_code)   parts.push(`[Product Code] ${input.product_code}`);
+  if (input.building_name)  parts.push(`[Building / Property] ${input.building_name}`);
+  return parts.length ? parts.join('\n') : null;
 }
 
 async function insertAddress(conn, customerId, addr, actor) {
@@ -432,21 +487,40 @@ async function create(input, actor) {
          job_type, source_type, client_ref_id, job_reference_id,
          job_customer_name, client_spoc, client_spoc_name, client_spoc_email,
          additional_name, additional_number,
-         helper_req, remarks, last_update_time
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         helper_req, remarks, branch_details, last_update_time
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         input.job_desc || '', // job_desc is NOT NULL in tbl_job; default to empty string
         customerId, addressId, input.fk_client_id,
         input.fk_service_type_id || null, input.fk_service_catg_id || null, serviceTypeIds,
         input.reporting_contact_id || null,
         input.requested_date_time, input.time_slot || null, new Date(), new Date(),
-        actor?.user_id || null, STATUS.BOOKED, input.job_owner || actor?.user_id || null,
+        // initial_status — legacy footer-button parity. Defaults to
+        // BOOKED (0); operators can pick ENQUIRY (7) or CALL_LATER (9)
+        // at the booking modal's footer to route the new row to the
+        // appropriate dashboard bucket without an extra status-change
+        // call. Validation: only allow the three known codes; anything
+        // else falls through to BOOKED so a typo can't accidentally
+        // mark a job COMPLETED.
+        actor?.user_id || null,
+        ([STATUS.ENQUIRY, STATUS.CALL_LATER].includes(Number(input.initial_status))
+          ? Number(input.initial_status)
+          : STATUS.BOOKED),
+        input.job_owner || actor?.user_id || null,
         input.job_type || 'Installation', input.source_type || 'manual',
         input.client_ref_id || null, input.job_reference_id || null,
         input.customer?.customer_name || null,
         input.client_spoc || null, input.client_spoc_name || null, input.client_spoc_email || null,
         input.additional_name || null, input.additional_number || null,
-        input.helper_req ? 1 : 0, input.remarks || null, new Date(),
+        input.helper_req ? 1 : 0,
+        // remarks: still composed via composeRemarks because
+        // product_code + building_name don't exist as columns
+        // (only branch_details was verified). They get folded into
+        // remarks with named prefixes.
+        composeRemarks(input),
+        // branch_details: dedicated column on tbl_job.
+        input.branch_details || null,
+        new Date(),
       ]
     );
     const jobId = ins.insertId;
@@ -463,6 +537,22 @@ async function create(input, actor) {
            (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status)
          VALUES ?`,
         [values]
+      );
+    }
+
+    /*
+     * Optional booking-time image. The frontend uploads the binary to
+     * /api/shared/upload?category=job_files (which already validates
+     * mime/size + writes to /var/www/html/easydoc/upload_jobs/) and
+     * passes only the resulting filename here. We stamp `job_stage = 0`
+     * to mark it as a booking-time artifact — technician check-in
+     * / check-out images use later stage codes.
+     */
+    if (input.job_image_filename && String(input.job_image_filename).trim()) {
+      await conn.query(
+        `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
+         VALUES (?, ?, ?, ?, NOW())`,
+        [jobId, String(input.job_image_filename).trim(), 'booking', 0]
       );
     }
 
@@ -510,6 +600,13 @@ const MUTABLE_COLUMNS = [
   'client_ref_id', 'job_reference_id',
   'helper_req', 'remarks', 'efr_special_notes',
   'exp_tat', 'booking_cut_off_time', 'booking_cut_off_time_slot',
+  // branch_details — verified to exist on tbl_job in prod
+  // (INFORMATION_SCHEMA returned 1 row 2026-05-14, VARCHAR(255)
+  // NULLABLE). Promoted off composeRemarks() to a dedicated column.
+  // product_code / building_name DO NOT exist in prod; they're still
+  // folded into the `remarks` column with named prefixes (see
+  // composeRemarks above).
+  'branch_details',
 ];
 
 async function update(jobId, input, actor) {

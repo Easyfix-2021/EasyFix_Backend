@@ -65,4 +65,176 @@ router.get('/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * GET /admin/customers/by-mobile?mobile=9999999999
+ *
+ * Drives the legacy "Book New Call" mobile-first flow: operator types
+ * the customer's mobile, the modal looks up whether a customer exists,
+ * and either pre-fills their details + lists their addresses (existing
+ * customer) or returns 404 so the caller knows to render fresh-customer
+ * fields. Mirrors legacy `getCustomerDetailsForJob?mobileNo=X`.
+ *
+ * Response shape on hit: { customer_id, customer_name, customer_email,
+ * customer_mob_no, is_active, addresses: [...] }.
+ * On miss: 404 with `customer not found` so the frontend can branch
+ * cleanly without parsing an empty-array payload.
+ */
+router.get('/by-mobile/lookup', async (req, res, next) => {
+  try {
+    const mobile = String(req.query.mobile || '').trim();
+    if (!/^[0-9]{10}$/.test(mobile)) {
+      return modernError(res, 400, 'mobile must be exactly 10 digits');
+    }
+    // Prefer ACTIVE rows but fall back to inactive ones if the only
+    // match is deactivated — legacy CRM let an operator re-activate
+    // by re-using the same mobile in the booking flow.
+    const [rows] = await pool.query(
+      `SELECT customer_id, customer_name, customer_mob_no, customer_email, is_active
+         FROM tbl_customer
+        WHERE customer_mob_no = ?
+        ORDER BY is_active DESC, customer_id DESC
+        LIMIT 1`,
+      [mobile]
+    );
+    if (!rows.length) return modernError(res, 404, 'customer not found');
+    const customer = rows[0];
+    // Real columns on tbl_address (verified against insertAddress in
+    // services/job.service.js): address, building, landmark, locality,
+    // city_id, pin_code, gps_location, mobile_number. Earlier I aliased
+    // a non-existent `a.area` + wrong `a.pincode` — both fixed here.
+    const [addresses] = await pool.query(
+      `SELECT a.address_id, a.address, a.building, a.landmark, a.locality,
+              a.city_id, a.pin_code, a.gps_location,
+              c.city_name
+         FROM tbl_address a
+         LEFT JOIN tbl_city c ON c.city_id = a.city_id
+        WHERE a.customer_id = ?
+        ORDER BY a.address_id DESC
+        LIMIT 50`,
+      [customer.customer_id]
+    );
+    return modernOk(res, { ...customer, addresses });
+  } catch (e) { next(e); }
+});
+
+/*
+ * PATCH /admin/customers/:id/addresses/:addrId
+ *
+ * Updates one tbl_address row in place. Used by the "Book New Call"
+ * address picker's pencil-edit button — operator opens a small
+ * inline form pre-filled with the saved address, edits, saves, and
+ * the row updates without creating a duplicate.
+ *
+ * Same column whitelist + validation shape as `insertAddress()` in
+ * services/job.service.js. We deliberately don't allow swapping
+ * customer_id (that would silently transfer an address between
+ * customers — instant data-integrity bug); the URL-path customer_id
+ * is the authoritative owner check.
+ *
+ * gps_location is stored as "lat,lng" string per legacy convention.
+ */
+const addressEditBody = Joi.object({
+  address:       Joi.string().min(1).max(1000).required(),
+  building:      Joi.string().max(200).allow('', null).optional(),
+  landmark:      Joi.string().max(200).allow('', null).optional(),
+  locality:      Joi.string().max(200).allow('', null).optional(),
+  city_id:       Joi.number().integer().positive().required(),
+  pin_code:      Joi.string().pattern(/^[0-9]{6}$/).required(),
+  gps_location:  Joi.string().max(100).allow('', null).optional(),
+  mobile_number: Joi.string().pattern(/^[0-9]{10}$/).allow('', null).optional(),
+});
+
+router.patch('/:id/addresses/:addrId', validate(addressEditBody), async (req, res, next) => {
+  try {
+    const customerId = Number(req.params.id);
+    const addrId = Number(req.params.addrId);
+    if (!Number.isInteger(customerId) || !Number.isInteger(addrId)) {
+      return modernError(res, 400, 'invalid id');
+    }
+    // Ownership check — refuse to patch an address that belongs to a
+    // different customer (could be an operator-side URL tamper or a
+    // race condition with a deleted+recreated row).
+    const [[addr]] = await pool.query(
+      'SELECT address_id FROM tbl_address WHERE address_id = ? AND customer_id = ? LIMIT 1',
+      [addrId, customerId]
+    );
+    if (!addr) return modernError(res, 404, 'address not found for this customer');
+
+    const b = req.body;
+    const [r] = await pool.query(
+      `UPDATE tbl_address
+          SET address = ?, building = ?, landmark = ?, locality = ?,
+              city_id = ?, pin_code = ?, gps_location = ?, mobile_number = ?,
+              update_date = NOW()
+        WHERE address_id = ? AND customer_id = ?`,
+      [
+        b.address,
+        b.building || null, b.landmark || null, b.locality || null,
+        b.city_id, b.pin_code, b.gps_location || null,
+        b.mobile_number || null,
+        addrId, customerId,
+      ]
+    );
+    if (r.affectedRows === 0) return modernError(res, 404, 'no rows updated');
+
+    // Return the fresh row (with city_name joined) so the caller can
+    // patch its local state without a follow-up fetch.
+    const [[row]] = await pool.query(
+      `SELECT a.address_id, a.address, a.building, a.landmark, a.locality,
+              a.city_id, a.pin_code, a.gps_location,
+              c.city_name
+         FROM tbl_address a
+         LEFT JOIN tbl_city c ON c.city_id = a.city_id
+        WHERE a.address_id = ?
+        LIMIT 1`,
+      [addrId]
+    );
+    modernOk(res, row);
+  } catch (e) { next(e); }
+});
+
+/*
+ * DELETE /admin/customers/:id/addresses/:addrId
+ *
+ * Hard-deletes a single tbl_address row for a customer. Used by the
+ * "Book New Call" mobile-gate's address picker × delete button.
+ *
+ * Guardrails:
+ *   - Address must belong to the supplied customer (defence against
+ *     IDs from another customer being passed through).
+ *   - If the address is referenced by any tbl_job (fk_address_id),
+ *     refuse the delete — operator must reassign those jobs first.
+ *     Hard-deleting an address with linked jobs would orphan their
+ *     `fk_address_id` FK.
+ */
+router.delete('/:id/addresses/:addrId', async (req, res, next) => {
+  try {
+    const customerId = Number(req.params.id);
+    const addrId = Number(req.params.addrId);
+    if (!Number.isInteger(customerId) || !Number.isInteger(addrId)) {
+      return modernError(res, 400, 'invalid id');
+    }
+    // Ensure address belongs to this customer.
+    const [[addr]] = await pool.query(
+      'SELECT address_id FROM tbl_address WHERE address_id = ? AND customer_id = ? LIMIT 1',
+      [addrId, customerId]
+    );
+    if (!addr) return modernError(res, 404, 'address not found for this customer');
+    // FK guard — if any job references this address, refuse.
+    const [[{ refCount }]] = await pool.query(
+      'SELECT COUNT(*) AS refCount FROM tbl_job WHERE fk_address_id = ?',
+      [addrId]
+    );
+    if (refCount > 0) {
+      return modernError(
+        res,
+        409,
+        `address is referenced by ${refCount} job${refCount === 1 ? '' : 's'} — reassign those before deleting`
+      );
+    }
+    await pool.query('DELETE FROM tbl_address WHERE address_id = ?', [addrId]);
+    modernOk(res, { deleted: true });
+  } catch (e) { next(e); }
+});
+
 module.exports = router;

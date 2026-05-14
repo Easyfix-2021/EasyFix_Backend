@@ -23,10 +23,18 @@ const listQuery = Joi.object({
   // Used by the dashboard's BOOKED split. Accepts bool OR the string form that
   // URLSearchParams produces.
   assigned: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
+  // `isEscalated` — drives the legacy CRM header's "Escalated Jobs" filter.
+  // Same accepted shape as `assigned` for URLSearchParams compatibility.
+  isEscalated: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
   clientId: intId.optional(),
   cityId: intId.optional(),
   ownerId: intId.optional(),
   easyfixerId: intId.optional(),
+  // customerId — drives the "View History" panel in the Book-New-Call
+  // modal. Looks up every previous job booked for the same tbl_customer
+  // row so the operator can see whether the caller is a repeat / which
+  // services they've taken before / outstanding revisits.
+  customerId: intId.optional(),
   startDate: Joi.date().iso().optional(),
   endDate: Joi.date().iso().optional(),
   limit: Joi.number().integer().min(1).max(500).default(50),
@@ -80,6 +88,27 @@ const createBody = Joi.object({
   additional_number: mobile.optional(),
   helper_req: Joi.boolean().default(false),
   remarks: Joi.string().max(2000).optional(),
+  // initial_status — legacy footer-button parity. Routes the new job
+  // to BOOKED (default), ENQUIRY (7), or CALL_LATER (9) at creation
+  // time. Service-layer also defends against unexpected values.
+  initial_status: Joi.number().integer().valid(0, 7, 9).optional(),
+  // Legacy Book-New-Call form fields. All optional; nullable strings.
+  // branch_details is the only one that lands in a real tbl_job
+  // column (verified 2026-05-14). product_code + building_name are
+  // folded into `remarks` server-side via composeRemarks().
+  branch_details: Joi.string().max(255).allow('', null).optional(),
+  product_code:   Joi.string().max(255).allow('', null).optional(),
+  building_name:  Joi.string().max(500).allow('', null).optional(),
+  // Per-client questionnaire FK. Stored against tbl_questionaire when
+  // the schema supports it; treated as passive otherwise (no-op).
+  c_questionaire_id: intId.optional(),
+  // job_image_filename — uploaded separately to /shared/upload?category=
+  // job_files first; the resulting filename gets persisted to
+  // tbl_job_image after the main tbl_job INSERT. Optional; legacy
+  // workflows still book jobs with no image. Validated as a filename
+  // (no slashes / nulls) by file-storage on the upload step, so by the
+  // time it reaches here it's safe to round-trip.
+  job_image_filename: Joi.string().max(255).allow('', null).optional(),
   customer: customerBlock,
   address: addressBlock,
   services: Joi.array().items(serviceItem).optional(),

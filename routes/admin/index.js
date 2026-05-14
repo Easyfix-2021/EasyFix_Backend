@@ -44,6 +44,8 @@ router.use('/jobs',          require('./jobs'));
 router.use('/auto-assign',   require('./auto-assign'));
 router.use('/notifications', require('./notifications'));
 router.use('/webhooks',        require('./webhooks'));
+router.use('/quicksight',      require('./quicksight'));
+router.use('/maps',            require('./maps'));
 router.use('/finance',         require('./finance'));
 router.use('/advances',        require('./advances'));
 router.use('/clients',         require('./clients'));
