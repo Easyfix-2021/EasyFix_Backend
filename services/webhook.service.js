@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const s3Storage = require('../utils/s3-storage');
 
 /*
  * Webhook delivery service.
@@ -195,10 +196,46 @@ async function buildJobPayload(jobId) {
       customerEmail: job.customer_email || '',
       customerMobileNo: job.customer_mob_no || '',
     },
-    jobImage: images.map((img) => ({
-      // Legacy stores absolute URLs; preserve that.
-      image: img.image?.startsWith('http') ? img.image : `${IMAGE_URL_BASE}/upload_jobs/${img.image}`,
-      image_category: img.image_category || '',
+    /*
+     * Resolve image URLs for outbound webhook payloads. Three shapes
+     * exist in tbl_job_image.image after the 2026-05-14 S3 migration:
+     *
+     *   1. Absolute URL (legacy import — preserve verbatim).
+     *   2. S3 key like "Job_Images/<jobId>_<seq>" — mint a presigned
+     *      URL on the spot. External clients consume this URL later,
+     *      so we generate a LONGER TTL than the 5-min UI default —
+     *      see WEBHOOK_S3_PRESIGN_TTL_SEC override.
+     *   3. Bare filename — legacy local file under /easydoc/upload_jobs/.
+     */
+    jobImage: await Promise.all(images.map(async (img) => {
+      const stored = String(img.image || '');
+      let url;
+      if (stored.startsWith('http')) {
+        url = stored;
+      } else if (s3Storage.isEnabled() && stored.startsWith('Job_Images/')) {
+        // Webhook receivers (Decathlon etc.) may consume the URL hours
+        // after delivery; bump TTL to 24h. Falls back to local URL if
+        // S3 lookup fails so the receiver still gets something usable.
+        const ttl = Number(process.env.WEBHOOK_S3_PRESIGN_TTL_SEC) || 24 * 3600;
+        try {
+          // eslint-disable-next-line no-shadow
+          const { GetObjectCommand } = require('@aws-sdk/client-s3');
+          const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+          const { S3Client } = require('@aws-sdk/client-s3');
+          const cli = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+          url = await getSignedUrl(cli, new GetObjectCommand({
+            Bucket: s3Storage.bucketName(),
+            Key: stored,
+          }), { expiresIn: ttl });
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn('webhook: S3 presign failed for', stored, e?.message);
+          url = `${IMAGE_URL_BASE}/upload_jobs/${stored}`;
+        }
+      } else {
+        url = `${IMAGE_URL_BASE}/upload_jobs/${stored}`;
+      }
+      return { image: url, image_category: img.image_category || '' };
     })),
     clientSpoc: {
       name: job.spoc_name || '',

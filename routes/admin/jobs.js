@@ -635,4 +635,179 @@ router.put('/:id/feedback',
   }
 );
 
+/*
+ * ─── Job Image upload (S3 with local fallback) ─────────────────────
+ *
+ * POST /api/admin/jobs/:id/images   multipart/form-data; field=file
+ *   - Uploads the binary to S3 at Job_Images/<jobId>_<seq>.
+ *   - seq is computed server-side as (current_image_count + 1) so the
+ *     keys line up deterministically with the ops spec.
+ *   - INSERTs into tbl_job_image with the FULL S3 key in the `image`
+ *     column; this is what distinguishes S3-stored rows from legacy
+ *     bare-filename rows on read.
+ *   - If S3 is disabled (no S3_BUCKET_NAME), falls back to the local
+ *     writeBuffer() path under UPLOAD_JOB_FILES so dev / single-host
+ *     deploys keep working.
+ *
+ * GET  /api/admin/jobs/images/:imageId/file
+ *   - 302-redirects to either the S3 presigned URL (if the file
+ *     exists in the bucket) or the local /easydoc/upload_jobs/<file>
+ *     URL. Read priority: S3 first, then local — matches the ops
+ *     migration rule of 2026-05-14.
+ *   - Imageid is global (not scoped to a job) because every image row
+ *     carries its own job_id which we resolve internally; this keeps
+ *     the URL simple for <img src="…"> bindings.
+ */
+const multerForImages = require('multer');
+const { pool: imagePool } = require('../../db');
+const { writeBuffer } = require('../../utils/file-storage');
+const s3Storage = require('../../utils/s3-storage');
+const imageUpload = multerForImages({
+  storage: multerForImages.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
+
+router.post(
+  '/:id/images',
+  validate(idParam, 'params'),
+  scopedJob,
+  imageUpload.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!req.file) return modernError(res, 400, 'missing "file" upload');
+      const jobId = Number(req.params.id);
+
+      // Compute the next seq from existing rows. Off-by-one safe: if
+      // there are 0 existing rows, seq=1. Two concurrent uploads can
+      // race here; we accept that risk because (a) it's the ops UI
+      // single-uploading per booking, (b) S3 PutObject is idempotent
+      // by key (last-write wins), and (c) the seq is just for
+      // human-readable keys, not a uniqueness constraint.
+      const [[{ existing }]] = await imagePool.query(
+        'SELECT COUNT(*) AS existing FROM tbl_job_image WHERE job_id = ?',
+        [jobId]
+      );
+      const seq = Number(existing || 0) + 1;
+
+      let imageValue;
+      let usedStorage;
+
+      if (s3Storage.isEnabled()) {
+        // Happy path: S3. Store the canonical key in the DB so
+        // resolveImageUrl() reads it back as an S3 object.
+        try {
+          imageValue = await s3Storage.putJobImage({
+            jobId, seq,
+            buffer: req.file.buffer,
+            contentType: req.file.mimetype,
+            originalName: req.file.originalname,
+          });
+          usedStorage = 's3';
+        } catch (e) {
+          // S3 failed mid-flight — fall back to local writeBuffer so
+          // the booking image isn't lost. The next reader will use
+          // the local URL automatically.
+          // eslint-disable-next-line no-console
+          console.warn('S3 putJobImage failed, falling back to local:', e?.message);
+          const saved = writeBuffer('job_files', req.file.buffer, req.file.originalname, req.file.mimetype);
+          imageValue = saved.filename;
+          usedStorage = 'local-fallback';
+        }
+      } else {
+        // S3 not configured — pure local path (dev / small deploys).
+        const saved = writeBuffer('job_files', req.file.buffer, req.file.originalname, req.file.mimetype);
+        imageValue = saved.filename;
+        usedStorage = 'local';
+      }
+
+      const [ins] = await imagePool.query(
+        `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
+         VALUES (?, ?, ?, ?, NOW())`,
+        [jobId, imageValue, 'booking', 0]
+      );
+
+      modernOk(res, {
+        image_id: ins.insertId,
+        job_id: jobId,
+        image: imageValue,
+        image_category: 'booking',
+        job_stage: 0,
+        seq,
+        storage: usedStorage,
+      }, 'image uploaded');
+    } catch (e) {
+      if (e?.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+      next(e);
+    }
+  }
+);
+
+router.get('/images/:imageId/file', async (req, res, next) => {
+  try {
+    const imageId = Number(req.params.imageId);
+    if (!Number.isInteger(imageId) || imageId <= 0) {
+      return modernError(res, 400, 'invalid imageId');
+    }
+    const [[row]] = await imagePool.query(
+      'SELECT image_id, job_id, image FROM tbl_job_image WHERE image_id = ? LIMIT 1',
+      [imageId]
+    );
+    if (!row || !row.image) return modernError(res, 404, 'image not found');
+
+    // RBAC: confirm the job is in this user's scope. Reuse the
+    // existing per-job scope assertion so out-of-scope ids 404 the
+    // same as an unknown imageId would.
+    const j = await job.getById(row.job_id);
+    if (!j) return modernError(res, 404, 'image not found');
+    const guard = assertEntityInScope(req, {
+      client_id:   j.fk_client_id,
+      city_id:     j.city_id,
+      vertical_id: j.vertical_id,
+    });
+    if (!guard.ok) return modernError(res, 404, 'image not found');
+
+    /*
+     * Opt-in lazy migration. When S3_MIGRATE_LEGACY_TO_S3=true and the
+     * row still has a bare filename (legacy local-only), upload the
+     * local file to S3 at Job_Images/<jobId>_<seq>, UPDATE the row
+     * to point at the new key, and (inside migrateLegacyToS3) unlink
+     * the local file. The next read of this image will hit S3.
+     *
+     * `seq` is this row's 1-based ordinal among its job's images
+     * ordered by image_id. Counting `image_id <= row.image_id` keeps
+     * the seq stable across re-renders even when sibling rows
+     * migrate at different times.
+     *
+     * Migration failure is non-fatal: we fall through and serve the
+     * local URL. resolveImageUrl already handles that case. The
+     * local-file unlink itself is also best-effort — see
+     * utils/s3-storage.js::migrateLegacyToS3 for the cleanup contract.
+     */
+    if (s3Storage.shouldMigrateLegacy() && !String(row.image).includes('/')) {
+      const [[{ seq }]] = await imagePool.query(
+        `SELECT COUNT(*) AS seq
+           FROM tbl_job_image
+          WHERE job_id = ? AND image_id <= ?`,
+        [row.job_id, row.image_id]
+      );
+      const newKey = await s3Storage.migrateLegacyToS3({
+        storedValue: row.image,
+        jobId: row.job_id,
+        seq: Number(seq) || 1,
+      });
+      if (newKey) {
+        await imagePool.query(
+          'UPDATE tbl_job_image SET image = ? WHERE image_id = ?',
+          [newKey, row.image_id]
+        );
+        row.image = newKey;
+      }
+    }
+
+    const url = await s3Storage.resolveImageUrl(row.image);
+    if (!url) return modernError(res, 404, 'image url unresolvable');
+    return res.redirect(url);
+  } catch (e) { next(e); }
+});
+
 module.exports = router;

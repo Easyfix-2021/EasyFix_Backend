@@ -1,0 +1,317 @@
+/*
+ * S3 storage helper — Job Image upload + retrieval.
+ *
+ * Path convention (per ops 2026-05-14):
+ *   s3://<S3_BUCKET_NAME>/Job_Images/<jobId>_<seq>
+ *
+ * `seq` is the next available sequence number for that job (counted
+ * from existing tbl_job_image rows), so a job's images line up as
+ * `Job_Images/123_1`, `Job_Images/123_2`, …. The stored DB value
+ * (`tbl_job_image.image`) is the FULL S3 key (`Job_Images/123_1`) so
+ * the read path can tell S3-stored images apart from legacy
+ * filesystem-only images (`whatever.jpg`).
+ *
+ * Disabled gracefully: if `S3_BUCKET_NAME` is unset (local dev without
+ * AWS creds), `isEnabled()` returns false and every caller falls back
+ * to the local filesystem path under UPLOAD_JOB_FILES — matches
+ * pre-S3 behaviour exactly so dev doesn't break on missing creds.
+ *
+ * Credentials: standard AWS SDK chain (env / shared file / IAM role).
+ *   - AWS_REGION             — e.g. ap-south-1
+ *   - AWS_ACCESS_KEY_ID      — when running outside EC2/ECS
+ *   - AWS_SECRET_ACCESS_KEY  — ditto
+ *   On Container Apps / ECS / EC2, omit the keys and attach an IAM role
+ *   with s3:PutObject / s3:GetObject / s3:HeadObject on the bucket.
+ */
+
+const path = require('path');
+
+const BUCKET = process.env.S3_BUCKET_NAME || '';
+const REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'ap-south-1';
+const PRESIGN_TTL_SEC = Number(process.env.S3_PRESIGN_TTL_SEC) || 300; // 5-min default
+
+// Lazy SDK init so a misconfigured-but-disabled S3 doesn't crash boot.
+let _client = null;
+let _presigner = null;
+function client() {
+  if (_client) return _client;
+  const { S3Client } = require('@aws-sdk/client-s3');
+  _client = new S3Client({ region: REGION });
+  return _client;
+}
+function presigner() {
+  if (_presigner) return _presigner;
+  const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+  _presigner = getSignedUrl;
+  return _presigner;
+}
+
+function isEnabled() { return !!BUCKET; }
+function bucketName() { return BUCKET; }
+
+/*
+ * Opt-in migration flag. When TRUE (and S3 is enabled), the
+ * read-path endpoint promotes a legacy local-filesystem image into
+ * S3 on first access — read once from /var/www/html/easydoc/upload_jobs,
+ * write to s3://<bucket>/Job_Images/<jobId>_<seq>, UPDATE the DB row
+ * to point at the new key. Subsequent reads serve from S3.
+ *
+ * Default OFF. Operators turn this on temporarily (set
+ * S3_MIGRATE_LEGACY_TO_S3=true and bounce the service) to drain
+ * legacy local files into S3 organically as users view jobs, then
+ * turn it OFF once `tbl_job_image` no longer has any bare-filename
+ * rows. Keeps S3 cost predictable — every migration is a single
+ * PutObject paid lazily on demand rather than a big batch job.
+ */
+function shouldMigrateLegacy() {
+  return String(process.env.S3_MIGRATE_LEGACY_TO_S3 || '').toLowerCase() === 'true';
+}
+
+/*
+ * Build the canonical S3 key for a job image.
+ * Example: keyFor(12345, 2)  →  "Job_Images/12345_2"
+ *
+ * No file extension — the user spec is `<JobId>_<seq>` flat. The
+ * Content-Type is preserved as object metadata at upload time so
+ * browsers still render the file correctly when fetched.
+ */
+function keyFor(jobId, seq) {
+  if (!Number.isInteger(Number(jobId)) || Number(jobId) <= 0) {
+    throw new Error('keyFor: invalid jobId');
+  }
+  if (!Number.isInteger(Number(seq)) || Number(seq) <= 0) {
+    throw new Error('keyFor: invalid seq');
+  }
+  return `Job_Images/${Number(jobId)}_${Number(seq)}`;
+}
+
+/*
+ * Upload a buffer to S3 at the canonical key. Returns the stored
+ * key (so callers can persist it on tbl_job_image.image).
+ *
+ * Throws if S3 isn't enabled — callers must guard with isEnabled()
+ * first and pick their fallback path. (We don't auto-fall-back to
+ * local disk here because the caller already has the buffer and
+ * the choice belongs to the route handler.)
+ */
+async function putJobImage({ jobId, seq, buffer, contentType, originalName }) {
+  if (!isEnabled()) throw new Error('S3 is not configured (S3_BUCKET_NAME unset)');
+  const { PutObjectCommand } = require('@aws-sdk/client-s3');
+  const Key = keyFor(jobId, seq);
+  const Metadata = {};
+  if (originalName) {
+    // Store the original filename in object metadata so admin tooling
+    // can recover it later. S3 lowercases header names but preserves
+    // values verbatim. Filenames may contain non-ASCII chars — strip
+    // those defensively since SDK puts them in HTTP headers.
+    const safe = String(originalName).replace(/[^\x20-\x7E]/g, '_').slice(0, 200);
+    Metadata['original-filename'] = safe;
+  }
+  await client().send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key,
+    Body: buffer,
+    ContentType: contentType || 'application/octet-stream',
+    Metadata,
+  }));
+  return Key;
+}
+
+/*
+ * Check whether an object exists at `key`. Returns true/false; any
+ * error other than NotFound bubbles so the caller can log it (S3
+ * outages shouldn't be silently treated as "file missing").
+ */
+async function exists(key) {
+  if (!isEnabled()) return false;
+  const { HeadObjectCommand } = require('@aws-sdk/client-s3');
+  try {
+    await client().send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+    return true;
+  } catch (e) {
+    if (e?.$metadata?.httpStatusCode === 404 || e?.name === 'NotFound' || e?.Code === 'NotFound') return false;
+    throw e;
+  }
+}
+
+/*
+ * Mint a presigned GET URL the browser can hit directly. TTL is
+ * intentionally short (5 min) — long enough to render images in a
+ * page session, short enough that a leaked URL ages out before it's
+ * abusable. Re-mint on every image render.
+ */
+async function getPresignedUrl(key) {
+  if (!isEnabled()) throw new Error('S3 is not configured');
+  const { GetObjectCommand } = require('@aws-sdk/client-s3');
+  const cmd = new GetObjectCommand({ Bucket: BUCKET, Key: key });
+  return await presigner()(client(), cmd, { expiresIn: PRESIGN_TTL_SEC });
+}
+
+/*
+ * Resolve a stored `tbl_job_image.image` value to a public URL.
+ *
+ * Read priority (per ops 2026-05-14): check S3 first, then fall back
+ * to the local filesystem path. Cases:
+ *
+ *   1. Stored value already looks like an S3 key (`Job_Images/...`):
+ *      - If exists in S3 → presigned URL.
+ *      - Else → fall through to local (same basename under
+ *        UPLOAD_JOB_FILES).
+ *
+ *   2. Stored value is a bare filename (legacy: pre-S3 row):
+ *      - Try S3 at `Job_Images/<filename>` first in case the file
+ *        was migrated. If exists → presigned URL.
+ *      - Else → local URL under /easydoc/upload_jobs/.
+ *
+ * Callers (read paths) receive the resolved absolute URL; the bare
+ * stored value stays untouched in the DB.
+ */
+async function resolveImageUrl(storedValue) {
+  const stored = String(storedValue || '').trim();
+  if (!stored) return null;
+
+  const fileBase = process.env.FILE_BASE_URL || '/easydoc';
+  const localUrl = stored.includes('/')
+    ? `${fileBase}/${stored.replace(/^\/+/, '')}`            // already a relative path
+    : `${fileBase}/upload_jobs/${stored}`;                    // bare filename → legacy layout
+
+  if (!isEnabled()) return localUrl;
+
+  // Two S3 keys to try: the stored value verbatim (already a key) and
+  // the legacy migration shape (Job_Images/<basename>).
+  const candidateKeys = [stored];
+  if (!stored.startsWith('Job_Images/')) {
+    candidateKeys.push(`Job_Images/${path.basename(stored)}`);
+  }
+
+  for (const key of candidateKeys) {
+    try {
+      if (await exists(key)) return await getPresignedUrl(key);
+    } catch (e) {
+      // S3 outage / permission error — don't fail the whole image
+      // listing; log and fall through to local URL so the user still
+      // sees what was previously stored on disk.
+      // eslint-disable-next-line no-console
+      console.warn('s3-storage.resolveImageUrl: S3 lookup failed, falling back to local', { key, err: e?.message });
+      break;
+    }
+  }
+  return localUrl;
+}
+
+/*
+ * Lazy migration of a single legacy row. Called from the read-path
+ * endpoint when the migration flag is on and the stored value is a
+ * bare filename (no `/`). Resolves the local file, uploads its
+ * contents to S3 at the CANONICAL key `Job_Images/<jobId>_<seq>`
+ * (the original legacy filename like `1736245821123-a4b9_camera.jpg`
+ * is intentionally discarded — every migrated image conforms to the
+ * ops spec naming), then DELETES the local copy so the server stops
+ * carrying duplicate state. Returns the new S3 key on success; null
+ * when the migration is a no-op (flag off, S3 off, value already
+ * keyed, local file missing, etc.) — caller doesn't UPDATE the DB
+ * in that case.
+ *
+ *   storedValue : current `tbl_job_image.image` value (bare filename)
+ *   jobId       : the job this row belongs to (drives the S3 key)
+ *   seq         : 1-based ordinal of this row among the job's images
+ *                 — compute as COUNT(*) WHERE job_id=? AND image_id <= ?
+ *                 so the seq stays stable across re-renders even when
+ *                 some siblings migrate and others don't.
+ *
+ * Path-traversal guarded: the resolved local path MUST sit under
+ * UPLOAD_JOB_FILES — refuses to read or unlink anything outside.
+ *
+ * Local-file delete policy (2026-05-14):
+ *   - On successful S3 upload, the local file is fs.unlinkSync()'d
+ *     so the server doesn't keep accumulating dead files. The DB
+ *     row's `image` column gets rewritten to the new S3 key by the
+ *     caller, so any reader following the redirect endpoint will
+ *     hit S3 from then on.
+ *   - The unlink is best-effort: a permission error / mount issue
+ *     is logged but does NOT roll back the migration (the S3 copy
+ *     is already canonical, so retaining the local file is just a
+ *     cleanup tax, not a correctness risk).
+ */
+async function migrateLegacyToS3({ storedValue, jobId, seq }) {
+  if (!isEnabled() || !shouldMigrateLegacy()) return null;
+  const stored = String(storedValue || '').trim();
+  // Already an S3 key (or any path with a slash): not a legacy row.
+  if (!stored || stored.includes('/')) return null;
+
+  const fs = require('fs');
+  const root = process.env.UPLOAD_JOB_FILES;
+  if (!root) return null;
+  const resolvedRoot = path.resolve(root);
+  const localPath = path.resolve(resolvedRoot, stored);
+  // Path-traversal guard — anything outside the UPLOAD_JOB_FILES
+  // root is refused even if `stored` got crafted with `..`.
+  if (!localPath.startsWith(resolvedRoot + path.sep) && localPath !== resolvedRoot) {
+    return null;
+  }
+  let buffer;
+  try {
+    buffer = fs.readFileSync(localPath);
+  } catch {
+    // Local file gone (already migrated by hand, or never existed).
+    // Treat as a no-op; the resolveImageUrl fallback will surface a
+    // broken-link state for ops to investigate.
+    return null;
+  }
+
+  const ext = path.extname(stored).toLowerCase();
+  const contentTypeByExt = {
+    '.jpg':  'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png':  'image/png',
+    '.gif':  'image/gif',
+    '.webp': 'image/webp',
+    '.pdf':  'application/pdf',
+  };
+  const contentType = contentTypeByExt[ext] || 'application/octet-stream';
+
+  let newKey;
+  try {
+    // Canonical S3 key is Job_Images/<jobId>_<seq> — see keyFor().
+    // The original `stored` filename is preserved only in S3 object
+    // metadata (original-filename) for traceability, NOT in the key.
+    newKey = await putJobImage({
+      jobId, seq, buffer, contentType, originalName: stored,
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('s3-storage.migrateLegacyToS3: PutObject failed', { stored, jobId, seq, err: e?.message });
+    return null;
+  }
+
+  // Cleanup: drop the local copy now that S3 holds the canonical
+  // file. Best-effort — log and continue on failure.
+  try {
+    fs.unlinkSync(localPath);
+  } catch (e) {
+    // EACCES / EBUSY / ENOENT are non-fatal here. ENOENT in particular
+    // is benign (file already gone, e.g. a concurrent migration of
+    // the same row from another request). Logging keeps the audit
+    // trail honest without surfacing a user-visible error.
+    if (e?.code !== 'ENOENT') {
+      // eslint-disable-next-line no-console
+      console.warn('s3-storage.migrateLegacyToS3: local unlink failed (S3 copy is canonical, leaving local stub)', {
+        localPath, err: e?.message,
+      });
+    }
+  }
+
+  return newKey;
+}
+
+module.exports = {
+  isEnabled,
+  bucketName,
+  keyFor,
+  putJobImage,
+  exists,
+  getPresignedUrl,
+  resolveImageUrl,
+  shouldMigrateLegacy,
+  migrateLegacyToS3,
+};

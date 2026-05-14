@@ -541,12 +541,18 @@ async function create(input, actor) {
     }
 
     /*
-     * Optional booking-time image. The frontend uploads the binary to
-     * /api/shared/upload?category=job_files (which already validates
-     * mime/size + writes to /var/www/html/easydoc/upload_jobs/) and
-     * passes only the resulting filename here. We stamp `job_stage = 0`
-     * to mark it as a booking-time artifact — technician check-in
-     * / check-out images use later stage codes.
+     * Optional booking-time image (LEGACY path).
+     *
+     * 2026-05-14 update: the canonical job-image upload moved to the
+     * dedicated endpoint `POST /admin/jobs/:id/images` which writes
+     * to S3 at Job_Images/<jobId>_<seq>. The frontend uses that
+     * endpoint as a SECOND step after this create() commits.
+     *
+     * This inline branch stays in place ONLY for any caller still
+     * sending the legacy `job_image_filename` field (e.g. shell
+     * scripts, integration tests). The dedicated endpoint is the
+     * supported path going forward; new code should not set this
+     * field on the create payload.
      */
     if (input.job_image_filename && String(input.job_image_filename).trim()) {
       await conn.query(
