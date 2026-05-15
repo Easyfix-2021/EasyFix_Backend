@@ -1,15 +1,36 @@
 /*
  * S3 storage helper — Job Image upload + retrieval.
  *
- * Path convention (per ops 2026-05-14):
- *   s3://<S3_BUCKET_NAME>/Job_Images/<jobId>_<seq>
+ * Path convention (per ops 2026-05-15, supersedes the 2026-05-14 rule):
+ *   s3://<S3_BUCKET_NAME>/JobSupportings/<JobCategory>_<jobId>_<seq>
  *
- * `seq` is the next available sequence number for that job (counted
- * from existing tbl_job_image rows), so a job's images line up as
- * `Job_Images/123_1`, `Job_Images/123_2`, …. The stored DB value
- * (`tbl_job_image.image`) is the FULL S3 key (`Job_Images/123_1`) so
- * the read path can tell S3-stored images apart from legacy
- * filesystem-only images (`whatever.jpg`).
+ *   - <JobCategory>  PascalCase tag for the lifecycle stage that owns
+ *                    the upload: `Booking` (Book-New-Call), `Completion`,
+ *                    `Reschedule`, `Cancellation`, …
+ *   - <seq>          1-based ordinal across that job's existing rows
+ *                    (`tbl_job_image` row count + 1 at upload time)
+ *
+ * The S3 key intentionally does NOT carry the file extension — the
+ * file's real extension/MIME type is preserved on the object's
+ * `Content-Type` header at PutObject time, and the original filename
+ * (with its extension) is stashed in object metadata under
+ * `original-filename` for audit/recovery. Browsers fetching the
+ * presigned URL render correctly because Content-Type is authoritative.
+ *
+ * Examples (the actual stored object is just the key on the left; the
+ * extension on the right of `→` is metadata for context, not part of
+ * the key):
+ *   JobSupportings/Booking_18421_1          (.jpg in metadata)
+ *   JobSupportings/Booking_18421_2          (.pdf in metadata)
+ *   JobSupportings/Completion_18421_1       (.png in metadata)
+ *
+ * The stored DB value (`tbl_job_image.image`) is the FULL S3 key so the
+ * read path can tell S3-stored images apart from legacy filesystem-only
+ * images (`whatever.jpg`).
+ *
+ * Back-compat: rows still pointing at the old `Job_Images/<jobId>_<seq>`
+ * prefix continue to resolve correctly via `resolveImageUrl` — both
+ * prefixes are recognised on read. New writes always use the new prefix.
  *
  * Disabled gracefully: if `S3_BUCKET_NAME` is unset (local dev without
  * AWS creds), `isEnabled()` returns false and every caller falls back
@@ -69,20 +90,30 @@ function shouldMigrateLegacy() {
 
 /*
  * Build the canonical S3 key for a job image.
- * Example: keyFor(12345, 2)  →  "Job_Images/12345_2"
+ *   keyFor(12345, 2, { category: 'Booking' })
+ *     →  "JobSupportings/Booking_12345_2"
  *
- * No file extension — the user spec is `<JobId>_<seq>` flat. The
- * Content-Type is preserved as object metadata at upload time so
- * browsers still render the file correctly when fetched.
+ * Validates:
+ *   - jobId / seq positive integers
+ *   - category matches PascalCase word-chars only (`Booking`, `Completion`, …);
+ *     prevents path injection via crafted category strings
+ *
+ * NB: no file extension is appended. The file's real extension / MIME
+ * is preserved via the object's Content-Type header and the
+ * `original-filename` metadata field at PutObject time.
  */
-function keyFor(jobId, seq) {
+function keyFor(jobId, seq, opts) {
   if (!Number.isInteger(Number(jobId)) || Number(jobId) <= 0) {
     throw new Error('keyFor: invalid jobId');
   }
   if (!Number.isInteger(Number(seq)) || Number(seq) <= 0) {
     throw new Error('keyFor: invalid seq');
   }
-  return `Job_Images/${Number(jobId)}_${Number(seq)}`;
+  const category = String((opts && opts.category) || 'Booking');
+  if (!/^[A-Za-z][A-Za-z0-9]*$/.test(category)) {
+    throw new Error('keyFor: invalid category (PascalCase word-chars only)');
+  }
+  return `JobSupportings/${category}_${Number(jobId)}_${Number(seq)}`;
 }
 
 /*
@@ -94,10 +125,10 @@ function keyFor(jobId, seq) {
  * local disk here because the caller already has the buffer and
  * the choice belongs to the route handler.)
  */
-async function putJobImage({ jobId, seq, buffer, contentType, originalName }) {
+async function putJobImage({ jobId, seq, buffer, contentType, originalName, category }) {
   if (!isEnabled()) throw new Error('S3 is not configured (S3_BUCKET_NAME unset)');
   const { PutObjectCommand } = require('@aws-sdk/client-s3');
-  const Key = keyFor(jobId, seq);
+  const Key = keyFor(jobId, seq, { category: category || 'Booking' });
   const Metadata = {};
   if (originalName) {
     // Store the original filename in object metadata so admin tooling
@@ -177,10 +208,16 @@ async function resolveImageUrl(storedValue) {
 
   if (!isEnabled()) return localUrl;
 
-  // Two S3 keys to try: the stored value verbatim (already a key) and
-  // the legacy migration shape (Job_Images/<basename>).
+  // S3 keys to try, in order:
+  //   1. the stored value verbatim (already a key — covers both old
+  //      `Job_Images/...` rows and new `JobSupportings/...` rows)
+  //   2. legacy migration shape `Job_Images/<basename>` (pre-S3 bare
+  //      filenames promoted by the migration flag)
+  //   3. new-convention shape `JobSupportings/<basename>` for forward
+  //      compat with any manually-renamed objects
   const candidateKeys = [stored];
-  if (!stored.startsWith('Job_Images/')) {
+  if (!stored.startsWith('Job_Images/') && !stored.startsWith('JobSupportings/')) {
+    candidateKeys.push(`JobSupportings/${path.basename(stored)}`);
     candidateKeys.push(`Job_Images/${path.basename(stored)}`);
   }
 
@@ -203,10 +240,13 @@ async function resolveImageUrl(storedValue) {
  * Lazy migration of a single legacy row. Called from the read-path
  * endpoint when the migration flag is on and the stored value is a
  * bare filename (no `/`). Resolves the local file, uploads its
- * contents to S3 at the CANONICAL key `Job_Images/<jobId>_<seq>`
- * (the original legacy filename like `1736245821123-a4b9_camera.jpg`
- * is intentionally discarded — every migrated image conforms to the
- * ops spec naming), then DELETES the local copy so the server stops
+ * contents to S3 at the CANONICAL key
+ * `JobSupportings/Booking_<jobId>_<seq>` — legacy rows are assumed
+ * Booking-category since the legacy flow only captured Book-New-Call
+ * attachments (the original legacy filename like
+ * `1736245821123-a4b9_camera.jpg` is intentionally discarded — every
+ * migrated image conforms to the new ops spec naming), then DELETES
+ * the local copy so the server stops
  * carrying duplicate state. Returns the new S3 key on success; null
  * when the migration is a no-op (flag off, S3 off, value already
  * keyed, local file missing, etc.) — caller doesn't UPDATE the DB
@@ -272,11 +312,17 @@ async function migrateLegacyToS3({ storedValue, jobId, seq }) {
 
   let newKey;
   try {
-    // Canonical S3 key is Job_Images/<jobId>_<seq> — see keyFor().
-    // The original `stored` filename is preserved only in S3 object
-    // metadata (original-filename) for traceability, NOT in the key.
+    // Canonical S3 key is JobSupportings/Booking_<jobId>_<seq> — see
+    // keyFor(). `category: 'Booking'` is the only correct value for
+    // legacy migration because the legacy `tbl_job_image` flow only
+    // captured booking-time attachments. The original `stored`
+    // filename (with its extension) is preserved only in S3 object
+    // metadata (`original-filename`) for traceability, NOT in the
+    // key. Content-Type was derived above from the legacy file's
+    // extension and is set on the S3 object so browsers render
+    // correctly.
     newKey = await putJobImage({
-      jobId, seq, buffer, contentType, originalName: stored,
+      jobId, seq, buffer, contentType, originalName: stored, category: 'Booking',
     });
   } catch (e) {
     // eslint-disable-next-line no-console
