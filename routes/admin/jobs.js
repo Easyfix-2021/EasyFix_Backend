@@ -8,6 +8,7 @@ const {
   listQuery, createBody, updateBody, statusBody, assignBody, ownerBody, idParam,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
+const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
 
 /*
  * Row-level scope guard for every /:id endpoint. Fetches the job once,
@@ -237,6 +238,227 @@ router.get('/escalated', async (req, res, next) => {
       `SELECT COUNT(*) AS total ${baseFrom} ${where}`, params
     );
     modernOk(res, { items: rows, total, limit, offset });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/escalated/export.xlsx
+ *
+ * Styled XLSX export of the escalated-jobs list. Same SQL as the list
+ * endpoint above (JOINs + status filter + RBAC scope) — only the
+ * pagination is dropped: the export always returns the entire status-
+ * filtered set up to a 5,000-row safety ceiling.
+ *
+ * Filter param `status` ∈ {open, closed, pending}. Free-text `q` is
+ * intentionally NOT honoured here — the FE search box is a UI-only
+ * filter over the loaded page (matches the CallInfoModal contract:
+ * "exports reflect the dataset the operator asked the BACKEND for,
+ * not the in-table search").
+ *
+ * Output shape is hand-translated for readability — action enums →
+ * human labels, escalated duration humanised, date/time split into
+ * two columns. The styled workbook uses the shared
+ * utils/xlsx-styled-export recipe so the brand band, header band, and
+ * row banding match Call History.
+ */
+router.get('/escalated/export.xlsx', async (req, res, next) => {
+  try {
+    const status = String(req.query.status || 'open').toLowerCase();
+
+    const clauses = ['e.is_escalated = 1', 'e.escalated_time IS NOT NULL'];
+    const params = [];
+
+    if (status === 'open') {
+      clauses.push('(e.resolved_time IS NULL OR e.escalated_time > e.resolved_time OR e.closed_action = 16)');
+    } else if (status === 'closed') {
+      clauses.push('e.resolved_time IS NOT NULL');
+      clauses.push('e.escalation_closed_time IS NOT NULL');
+      clauses.push('(e.closed_action IS NULL OR e.closed_action != 16)');
+    } else if (status === 'pending') {
+      clauses.push('e.resolved_time IS NOT NULL');
+      clauses.push('e.escalated_time < e.resolved_time');
+      clauses.push('(e.escalation_closed_time IS NULL OR e.closed_action != 15)');
+    }
+
+    // Same RBAC clauses as the list endpoint — keep these in sync if
+    // either is ever changed. (Pulling into a helper is overkill until
+    // a third escalation route appears.)
+    const sc = req.scope;
+    if (sc) {
+      if (sc.clients) {
+        if (sc.clients.mode === 'none') clauses.push('1=0');
+        else if (sc.clients.mode === 'allow' && sc.clients.ids.length) {
+          clauses.push(`j.fk_client_id IN (${sc.clients.ids.map(() => '?').join(',')})`);
+          params.push(...sc.clients.ids);
+        }
+      }
+      if (sc.cities) {
+        if (sc.cities.mode === 'none') clauses.push('1=0');
+        else if (sc.cities.mode === 'allow' && sc.cities.ids.length) {
+          clauses.push(`a.city_id IN (${sc.cities.ids.map(() => '?').join(',')})`);
+          params.push(...sc.cities.ids);
+        }
+      }
+      if (sc.verticals) {
+        if (sc.verticals.mode === 'none') clauses.push('1=0');
+        else if (sc.verticals.mode === 'allow' && sc.verticals.ids.length) {
+          clauses.push(`cl.vertical_id IN (${sc.verticals.ids.map(() => '?').join(',')})`);
+          params.push(...sc.verticals.ids);
+        }
+      }
+    }
+
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const baseFrom = `
+      FROM tbl_easyfixer_rating_by_customer e
+      LEFT JOIN tbl_job     j  ON j.job_id = e.job_id
+      LEFT JOIN tbl_address a  ON a.address_id = j.fk_address_id
+      LEFT JOIN tbl_city    c  ON c.city_id = a.city_id
+      LEFT JOIN tbl_client  cl ON cl.client_id = j.fk_client_id
+      LEFT JOIN tbl_user    u  ON u.user_id = e.escalated_by
+      LEFT JOIN (
+        SELECT job_id,
+               GROUP_CONCAT(
+                 CONCAT(
+                   DATE_FORMAT(escalation_time, '%d %M %Y %h:%i %p'),
+                   ' · ', COALESCE(job_stage, '—')
+                 )
+                 ORDER BY escalation_time
+                 SEPARATOR ' / '
+               ) AS job_stage_history
+          FROM tbl_job_escalation_info
+         GROUP BY job_id
+      ) j1 ON j1.job_id = j.job_id
+    `;
+
+    const { pool } = require('../../db');
+    const [rows] = await pool.query(
+      `SELECT
+         e.table_id, e.job_id, j.job_status, j.fk_easyfixter_id,
+         e.escalated_time, e.resolved_time, e.escalation_closed_time,
+         e.escalated_by, u.user_name AS escalated_by_name,
+         e.escalated_comments, e.no_of_escalations, e.escalated_from,
+         e.closed_action, e.completed_action, e.inprogress_action,
+         j.requested_date_time,
+         cl.client_name, c.city_name,
+         j1.job_stage_history
+       ${baseFrom}
+       ${where}
+       ORDER BY e.escalated_time DESC, e.table_id DESC
+       LIMIT 5000`,
+      params
+    );
+
+    // Enum-to-label maps mirror the FE's TEAM_ACTIONS / COMPLETED_ACTIONS /
+    // CLOSED_ACTIONS in EscalatedJobsModal.tsx. If either list changes,
+    // both ends need updating — the values are stamped legacy enums
+    // from escalateSearchResult.vm so they shouldn't drift.
+    const TEAM_LABEL = {
+      1: 'Easy Fixer is Scheduled',
+      2: 'Convinced Customer For New Date',
+      3: 'Pending from client',
+      4: 'Fake Reschedule & OTA expected',
+      5: 'Customer Reschedule',
+    };
+    const COMPLETED_LABEL = {
+      11: 'Work Completed',
+      12: 'Grievance Resolved & on-the-same-page',
+    };
+    const CLOSED_LABEL = { 15: 'Resolved', 16: 'Re-Open' };
+    const STATUS_LABEL = {
+      0: 'Booked', 1: 'Scheduled', 2: 'In Progress',
+      3: 'Completed', 5: 'Completed', 6: 'Cancelled',
+      7: 'Enquiry', 9: 'Unconfirmed', 10: 'Revisit',
+      15: 'Estimate Pending', 20: 'Pending to Close', 21: 'Followup',
+    };
+
+    // Humanise an ISO/MySQL DATETIME → "29 Apr 2026" and "10:07 am"
+    // pieces so the XLSX shows the same two-line layout the modal does.
+    function dateOnly(d) {
+      if (!d) return '';
+      const dt = new Date(d);
+      if (Number.isNaN(+dt)) return String(d);
+      return dt.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    }
+    function timeOnly(d) {
+      if (!d) return '';
+      const dt = new Date(d);
+      if (Number.isNaN(+dt)) return '';
+      return dt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: true });
+    }
+    function durationLabel(start, end) {
+      if (!start) return '';
+      const s = new Date(start);
+      if (Number.isNaN(+s)) return '';
+      const e = end ? new Date(end) : new Date();
+      const ms = Math.max(0, +e - +s);
+      const totalMins = Math.floor(ms / 60000);
+      const days = Math.floor(totalMins / (60 * 24));
+      const hours = Math.floor((totalMins % (60 * 24)) / 60);
+      const mins = totalMins % 60;
+      if (days > 0) return `${days} day${days === 1 ? '' : 's'} ${hours} hour${hours === 1 ? '' : 's'}`;
+      if (hours > 0) return `${hours} hour${hours === 1 ? '' : 's'} ${mins} min${mins === 1 ? '' : 's'}`;
+      return `${mins} min${mins === 1 ? '' : 's'}`;
+    }
+
+    const xlsxRows = rows.map((r) => ({
+      date_escalated:  dateOnly(r.escalated_time),
+      time_escalated:  timeOnly(r.escalated_time),
+      job_id:          r.job_id ?? '',
+      client:          r.client_name || '',
+      city:            r.city_name || '',
+      job_stage:       r.job_stage_history || '',
+      current_status:  r.job_status != null
+        ? (STATUS_LABEL[r.job_status] || `Status ${r.job_status}`)
+        : '',
+      no_of_escal:     r.no_of_escalations ?? 0,
+      escalated_from:  r.escalated_from || '',
+      reason:          r.escalated_comments || '',
+      escalated_by:    r.escalated_by_name || '',
+      team_action:      TEAM_LABEL[r.inprogress_action] || '',
+      completed_action: COMPLETED_LABEL[r.completed_action] || '',
+      closed_action:    CLOSED_LABEL[r.closed_action] || '',
+      escalated_hours:  durationLabel(r.escalated_time, r.resolved_time),
+      orig_appt_date:   r.requested_date_time ? dateOnly(r.requested_date_time) : '',
+      orig_appt_time:   r.requested_date_time ? timeOnly(r.requested_date_time) : '',
+      reopened:         (r.no_of_escalations ?? 0) > 1 ? 'Yes' : '',
+    }));
+
+    const today = new Date().toISOString().slice(0, 10);
+    const statusTitle = status.charAt(0).toUpperCase() + status.slice(1);
+    const meta = [
+      `Status: ${statusTitle}`,
+      `Generated: ${new Date().toLocaleString('en-IN')}`,
+      `Total: ${xlsxRows.length} escalation${xlsxRows.length === 1 ? '' : 's'}`,
+    ].join('    ·    ');
+
+    await streamStyledXlsx(res, `escalated-jobs_${status}_${today}.xlsx`, {
+      title: 'EasyFix  ·  Escalated Jobs',
+      meta,
+      sheetName: 'Escalated Jobs',
+      columns: [
+        { header: 'Date Escalated',          key: 'date_escalated',   width: 14, align: 'left' },
+        { header: 'Time Escalated',          key: 'time_escalated',   width: 12, align: 'center' },
+        { header: 'Job ID',                  key: 'job_id',           width: 10, align: 'center' },
+        { header: 'Client',                  key: 'client',           width: 24, align: 'left' },
+        { header: 'City',                    key: 'city',             width: 16, align: 'left' },
+        { header: 'Job Stage',               key: 'job_stage',        width: 42, align: 'left' },
+        { header: 'Current Status',          key: 'current_status',   width: 14, align: 'center' },
+        { header: 'No of Escalations',       key: 'no_of_escal',      width: 12, align: 'center' },
+        { header: 'Escalated From',          key: 'escalated_from',   width: 16, align: 'left' },
+        { header: 'Reason For Escalation',   key: 'reason',           width: 42, align: 'left' },
+        { header: 'Escalated By',            key: 'escalated_by',     width: 20, align: 'left' },
+        { header: 'Team Action',             key: 'team_action',      width: 28, align: 'left' },
+        { header: 'Completed Action',        key: 'completed_action', width: 30, align: 'left' },
+        { header: 'Closed Action',           key: 'closed_action',    width: 14, align: 'center' },
+        { header: 'Escalated Hours',         key: 'escalated_hours',  width: 18, align: 'left' },
+        { header: 'Original Appointment Date', key: 'orig_appt_date', width: 14, align: 'left' },
+        { header: 'Original Appointment Time', key: 'orig_appt_time', width: 12, align: 'center' },
+        { header: 'Reopened',                key: 'reopened',         width: 10, align: 'center' },
+      ],
+      rows: xlsxRows,
+      emptyMessage: `No ${status} escalations found.`,
+    });
   } catch (e) { next(e); }
 });
 
