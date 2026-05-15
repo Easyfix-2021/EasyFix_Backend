@@ -116,7 +116,8 @@ async function clients({ q, limit = 100, offset = 0, includeInactive = false, sc
   params.push(Number(limit), Number(offset));
   const [rows] = await pool.query(
     `SELECT client_id, client_name, client_email, client_status,
-            client_city_id, client_type, reference_code
+            client_city_id, client_type, reference_code,
+            vertical_id
        FROM tbl_client ${where}
        ORDER BY client_name ASC LIMIT ? OFFSET ?`,
     params
