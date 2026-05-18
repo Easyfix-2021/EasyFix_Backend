@@ -147,10 +147,55 @@ router.post('/:clientId/billing', async (req, res, next) => {
 });
 
 // ─── Client Custom Properties ──────────────────────────────────────
+/*
+ * GET /api/admin/clients/:clientId/custom-properties
+ *
+ * Returns an array of the client's configured custom properties,
+ * normalised to a stable shape regardless of underlying column-name
+ * conventions in `tbl_client_custom_properties`.
+ *
+ * Response shape (per row):
+ *   { name: string, label: string | null, mandatory: boolean,
+ *     value: string | null, raw: <original row> }
+ *
+ *   - `name` is lowercased + trimmed for case-insensitive lookup
+ *     on the FE. Common variants accepted: property_name / name /
+ *     key / field_name.
+ *   - `mandatory` accepts: is_mandatory / mandatory / required /
+ *     is_required. Coerced to boolean (1/0, true/false, "1"/"0",
+ *     "yes"/"no" all handled).
+ *   - `label` is optional display text. Falls back to null; the FE
+ *     decides the user-facing label per property name.
+ *   - `value` is the configured property value (if any). May drive
+ *     things like "preferred Collected By" — see the dedicated
+ *     `/collected-by-preference` endpoint for that case.
+ *   - `raw` is the entire DB row, kept so future fields don't need
+ *     a BE change to surface — FE can drill in.
+ *
+ * Drives in the Book-New-Call flow:
+ *   - Whether to render the "Branch Details", "Property / Building
+ *     Name", "Product Code" inputs at all (only when the
+ *     corresponding property row exists for this client).
+ *   - Whether each rendered input is required (driven by `mandatory`).
+ */
 router.get('/:clientId/custom-properties', async (req, res, next) => {
   try {
     const [rows] = await pool.query('SELECT * FROM tbl_client_custom_properties WHERE client_id = ?', [req.params.clientId]);
-    modernOk(res, rows);
+    const truthy = (v) => {
+      if (v == null) return false;
+      if (typeof v === 'boolean') return v;
+      if (typeof v === 'number') return v !== 0;
+      const s = String(v).trim().toLowerCase();
+      return s === '1' || s === 'true' || s === 'yes' || s === 'y';
+    };
+    const normalised = rows.map((r) => ({
+      name: String(r.property_name ?? r.name ?? r.key ?? r.field_name ?? '').toLowerCase().trim(),
+      label: r.property_label ?? r.label ?? r.display_name ?? null,
+      mandatory: truthy(r.is_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field),
+      value: r.property_value ?? r.value ?? r.field_value ?? null,
+      raw: r,
+    })).filter((p) => p.name);
+    modernOk(res, normalised);
   } catch (e) { next(e); }
 });
 
