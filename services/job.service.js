@@ -88,6 +88,39 @@ const LIST_JOIN = `
   LEFT JOIN tbl_user        ow ON ow.user_id     = j.job_owner
 `;
 
+/*
+ * `tbl_client.vertical_id` is referenced by the verticals-scope filter
+ * below. Some DB instances don't have this column — the canonical
+ * client↔vertical mapping there lives in `tbl_vertical_mapping`
+ * instead. We probe at startup, cache the answer, and silently skip
+ * the vertical filter when the column is absent rather than 500ing
+ * the entire jobs list.
+ *
+ * If your DB uses tbl_vertical_mapping, vertical filtering for the
+ * jobs list is unavailable until that JOIN is wired (separate
+ * follow-up). Admin-group users bypass scope entirely so this
+ * affects only operators with verticals = 'allow' in their RBAC
+ * scope.
+ */
+let _hasClientVerticalIdColumn = null;
+async function hasClientVerticalIdColumn() {
+  if (_hasClientVerticalIdColumn !== null) return _hasClientVerticalIdColumn;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_client LIKE 'vertical_id'");
+    _hasClientVerticalIdColumn = rows.length > 0;
+  } catch (e) {
+    // SHOW COLUMNS itself failed — be conservative and treat as missing.
+    // eslint-disable-next-line no-console
+    console.warn('[job.service] could not probe tbl_client.vertical_id:', e?.message);
+    _hasClientVerticalIdColumn = false;
+  }
+  if (!_hasClientVerticalIdColumn) {
+    // eslint-disable-next-line no-console
+    console.warn('[job.service] tbl_client.vertical_id not present — verticals scope filter will be skipped on jobs list/count queries. Client→vertical mapping may live in tbl_vertical_mapping; wire that JOIN if vertical-based RBAC matters.');
+  }
+  return _hasClientVerticalIdColumn;
+}
+
 // Kept for getById(), which does select these as part of the full detail payload.
 const DETAIL_JOIN = LIST_JOIN + `
   LEFT JOIN tbl_user        cr ON cr.user_id     = j.fk_created_by
@@ -112,6 +145,10 @@ async function list({
   const clauses = [];
   const params = [];
 
+  // Probe ONCE per process for tbl_client.vertical_id presence.
+  // See declaration above for the rationale.
+  const hasVerticalCol = await hasClientVerticalIdColumn();
+
   // Apply RBAC scope FIRST so any explicit clientId/cityId filter
   // narrows within the allowed set (caller can't widen scope by passing
   // a clientId outside their manage_clients).
@@ -133,9 +170,11 @@ async function list({
     }
     if (v) {
       if (v.mode === 'none') { clauses.push('1=0'); }
-      else if (v.mode === 'allow' && v.ids.length) {
+      else if (v.mode === 'allow' && v.ids.length && hasVerticalCol) {
         // Vertical lives on tbl_client; LIST_JOIN already pulls
-        // tbl_client cl, so cl.vertical_id is reachable.
+        // tbl_client cl, so cl.vertical_id is reachable. Only
+        // applied when the column exists in this DB (see
+        // hasClientVerticalIdColumn).
         clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
         params.push(...v.ids);
       }
@@ -205,10 +244,18 @@ async function list({
   // a single-table indexed scan vs. a full 6-way join.
   const needsCu = /\bcu\./.test(where);
   const needsAd = /\bad\./.test(where);
+  const needsCl = /\bcl\./.test(where);
+  const needsCi = /\bci\./.test(where);
+  const needsEf = /\bef\./.test(where);
+  const needsOw = /\bow\./.test(where);
   const countJoin = `
     FROM tbl_job j
     ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
-    ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id'  : ''}
+    ${needsAd || needsCi ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+    ${needsCi ? 'LEFT JOIN tbl_city     ci ON ci.city_id     = ad.city_id' : ''}
+    ${needsCl ? 'LEFT JOIN tbl_client   cl ON cl.client_id   = j.fk_client_id' : ''}
+    ${needsEf ? 'LEFT JOIN tbl_easyfixer ef ON ef.efr_id     = j.fk_easyfixter_id' : ''}
+    ${needsOw ? 'LEFT JOIN tbl_user     ow ON ow.user_id     = j.job_owner' : ''}
   `;
 
   // Run COUNT and data query in parallel — they're independent, no reason to
@@ -237,13 +284,23 @@ async function list({
  * for those lookups when we're about to 404.
  */
 async function getById(jobId) {
+  // Gate `cl.vertical_id` in the SELECT projection on column presence.
+  // When the column isn't on this DB's tbl_client, fall back to a NULL
+  // alias so the projection stays stable for downstream consumers
+  // (image redirect endpoint reads `j.vertical_id` for scope assert).
+  // Without this gate, getById() throws "Unknown column" and EVERY
+  // job-detail-dependent flow (view modal, image redirect, etc.)
+  // 500s for this DB.
+  const hasVerticalCol = await hasClientVerticalIdColumn();
+  const verticalSelect = hasVerticalCol ? 'cl.vertical_id' : 'NULL AS vertical_id';
+
   const [jobRows, services, images] = await Promise.all([
     pool.query(
       `SELECT j.*,
               cu.customer_name, cu.customer_mob_no, cu.customer_email,
               ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
               ad.gps_location, ad.city_id, ci.city_name,
-              cl.client_name, cl.client_email, cl.vertical_id,
+              cl.client_name, cl.client_email, ${verticalSelect},
               ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
               ow.user_name AS owner_name,
               cr.user_name AS created_by_name
@@ -320,6 +377,10 @@ async function getStatusCounts({ ownerId, scope } = {}) {
   const clauses = [];
   const params = [];
 
+  // Probe tbl_client.vertical_id presence — same as list(). See the
+  // declaration up top for the full rationale.
+  const hasVerticalCol = await hasClientVerticalIdColumn();
+
   if (ownerId) { clauses.push('j.job_owner = ?'); params.push(ownerId); }
   if (scope) {
     const c = scope.clients, ci = scope.cities, v = scope.verticals;
@@ -334,7 +395,7 @@ async function getStatusCounts({ ownerId, scope } = {}) {
       clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
       params.push(...ci.ids);
     }
-    if (v && v.mode === 'allow' && v.ids.length) {
+    if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
       clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
       params.push(...v.ids);
     }
@@ -342,7 +403,7 @@ async function getStatusCounts({ ownerId, scope } = {}) {
 
   // Only JOIN tables we actually filter against — cheap on the indexed FKs.
   const needsAd = scope?.cities?.mode === 'allow';
-  const needsCl = scope?.verticals?.mode === 'allow';
+  const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
   const joins = [
     needsAd ? 'LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id' : '',
     needsCl ? 'LEFT JOIN tbl_client  cl ON cl.client_id  = j.fk_client_id'  : '',
@@ -1016,4 +1077,5 @@ module.exports = {
   list, getById, getStatusCounts, create, update, setStatus, assign, changeOwner,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
+  hasClientVerticalIdColumn,
 };

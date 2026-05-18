@@ -184,8 +184,12 @@ router.get('/escalated', async (req, res, next) => {
       if (sc.verticals) {
         if (sc.verticals.mode === 'none') clauses.push('1=0');
         else if (sc.verticals.mode === 'allow' && sc.verticals.ids.length) {
-          clauses.push(`cl.vertical_id IN (${sc.verticals.ids.map(() => '?').join(',')})`);
-          params.push(...sc.verticals.ids);
+          // Guarded: only emit the WHERE clause when tbl_client.vertical_id
+          // actually exists on this DB. Same probe as services/job.service.js.
+          if (await job.hasClientVerticalIdColumn()) {
+            clauses.push(`cl.vertical_id IN (${sc.verticals.ids.map(() => '?').join(',')})`);
+            params.push(...sc.verticals.ids);
+          }
         }
       }
     }
@@ -302,8 +306,12 @@ router.get('/escalated/export.xlsx', async (req, res, next) => {
       if (sc.verticals) {
         if (sc.verticals.mode === 'none') clauses.push('1=0');
         else if (sc.verticals.mode === 'allow' && sc.verticals.ids.length) {
-          clauses.push(`cl.vertical_id IN (${sc.verticals.ids.map(() => '?').join(',')})`);
-          params.push(...sc.verticals.ids);
+          // Guarded: only emit the WHERE clause when tbl_client.vertical_id
+          // actually exists on this DB. Same probe as services/job.service.js.
+          if (await job.hasClientVerticalIdColumn()) {
+            clauses.push(`cl.vertical_id IN (${sc.verticals.ids.map(() => '?').join(',')})`);
+            params.push(...sc.verticals.ids);
+          }
         }
       }
     }
@@ -546,6 +554,53 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
       return modernError(res, 404, 'escalation row not found');
     }
     modernOk(res, { updated: true });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/action-reasons?type=<unreachable|enquiry>
+ *
+ * Drives the dropdown inside the Book-New-Call "Job Unreachable" /
+ * "Job Enquiry" popup (legacy CRM parity). Reasons come from
+ * `action_taken_reason` joined to `action_type`.
+ *
+ * Schema (verified 2026-05-18 against easyfix DB):
+ *   action_type         { id, type ("Un Reachable"|"Enquiry"|...), description }
+ *   action_taken_reason { id, action_type (FK→action_type.id), action_desc,
+ *                         status (1=active), user_type, is_new }
+ *
+ * Route-order note: declared BEFORE `/:id` so Express doesn't try to
+ * validate the literal string "action-reasons" as a numeric job id —
+ * same gotcha as `/bulk` vs `/:jobId` in routes/admin/auto-assign.js.
+ */
+router.get('/action-reasons', async (req, res, next) => {
+  try {
+    const type = String(req.query.type || '').trim().toLowerCase();
+    if (!type) return modernError(res, 400, 'type is required (unreachable|enquiry)');
+
+    // Strip spaces/underscores/dashes on both sides so the URL token
+    // "unreachable" matches the DB value "Un Reachable", "enquiry"
+    // matches "Enquiry", etc.
+    const needle = type.replace(/[\s_-]/g, '');
+    const [typeRows] = await pool.query(
+      `SELECT id, type FROM action_type
+        WHERE LOWER(REPLACE(REPLACE(REPLACE(type, ' ', ''), '_', ''), '-', '')) = ?
+        ORDER BY id DESC LIMIT 1`,
+      [needle],
+    );
+    if (!typeRows.length) return modernOk(res, []);
+    const typeId = typeRows[0].id;
+
+    const [reasonRows] = await pool.query(
+      `SELECT id, action_desc FROM action_taken_reason
+        WHERE action_type = ? AND (status IS NULL OR status = 1)
+        ORDER BY id ASC`,
+      [typeId],
+    );
+    const items = reasonRows
+      .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
+      .filter((x) => x.label);
+    modernOk(res, items);
   } catch (e) { next(e); }
 });
 
