@@ -154,4 +154,69 @@ router.get('/:clientId/custom-properties', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * GET /api/admin/clients/:clientId/collected-by-preference
+ *
+ * Returns the client's preferred "Collected By" setting for new
+ * bookings. Drives the lock state of the "Collected By" dropdown in
+ * the Book-New-Call modal:
+ *   - preferred = null                 → dropdown enabled, all options
+ *   - preferred = "Easyfixer"          → preselected + disabled
+ *   - preferred = "Easyfix"            → preselected + disabled
+ *   - preferred = "Client"             → preselected + disabled
+ *
+ * Source: `tbl_client.collected_by` integer column. Confirmed by ops
+ * 2026-05-18 via `SELECT DISTINCT collected_by FROM tbl_client`:
+ *   0 = any  (no lock — operator picks)
+ *   1 = Easyfixer
+ *   2 = Easyfix
+ *   3 = Client
+ * Anything else (NULL, unknown value) → treated as "any" so a future
+ * code value doesn't break the booking flow before this map is
+ * updated.
+ */
+const COLLECTED_BY_MAP = {
+  1: 'Easyfixer',
+  2: 'Easyfix',
+  3: 'Client',
+};
+
+router.get('/:clientId/collected-by-preference', async (req, res, next) => {
+  try {
+    const clientId = Number(req.params.clientId);
+    if (!Number.isInteger(clientId) || clientId <= 0) {
+      return modernError(res, 400, 'invalid clientId');
+    }
+
+    let preferred = null;
+    let source = 'default';
+    try {
+      const [rows] = await pool.query(
+        'SELECT collected_by FROM tbl_client WHERE client_id = ? LIMIT 1',
+        [clientId],
+      );
+      if (rows.length) {
+        const code = Number(rows[0].collected_by);
+        if (Number.isFinite(code) && COLLECTED_BY_MAP[code]) {
+          preferred = COLLECTED_BY_MAP[code];
+          source = 'client';
+        } else if (code === 0) {
+          // Explicit "any" — still a configured value, not the absence
+          // of one. Surfaced as source=client so callers can tell the
+          // difference vs. an unknown/missing field.
+          preferred = null;
+          source = 'client';
+        }
+      }
+    } catch (e) {
+      // Defensive: if the `collected_by` column doesn't exist on this
+      // DB's `tbl_client`, fall back to "any" rather than 500.
+      // eslint-disable-next-line no-console
+      console.warn('[collected-by-pref] tbl_client.collected_by read failed — falling back to "any":', e?.message);
+    }
+
+    modernOk(res, { preferred, source });
+  } catch (e) { next(e); }
+});
+
 module.exports = router;
