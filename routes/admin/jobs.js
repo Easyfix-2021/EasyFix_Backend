@@ -1128,9 +1128,99 @@ router.get('/images/:imageId/file', async (req, res, next) => {
       }
     }
 
-    const url = await s3Storage.resolveImageUrl(row.image);
-    if (!url) return modernError(res, 404, 'image url unresolvable');
-    return res.redirect(url);
+    /*
+     * Resolution order (fixed 2026-05-18 — dev was 404ing on every
+     * locally-stored image because the old `/easydoc/...` redirect
+     * target has no handler outside production Nginx):
+     *
+     *   1. If S3 has the object (either at the stored key or under
+     *      `JobSupportings/<basename>` / `Job_Images/<basename>` for
+     *      legacy rows) → 302 to a presigned URL. Browser fetches
+     *      directly from S3.
+     *
+     *   2. Else if a local file exists for the stored value (this
+     *      includes images that were uploaded via the local-fallback
+     *      path when S3 was transiently unreachable) → stream it
+     *      directly with res.sendFile. Works in dev AND prod without
+     *      a separate static handler.
+     *
+     *   3. Else if FILE_BASE_URL is set to an ABSOLUTE URL (production
+     *      with Nginx-served /easydoc) → 302 to that absolute URL so
+     *      the browser hits Nginx. Skipped when FILE_BASE_URL is the
+     *      default relative `/easydoc` because that would redirect to
+     *      the BE origin itself (which has no handler).
+     *
+     *   4. Else → 404 with a clear message instead of a redirect-to-
+     *      nowhere that surfaces as a broken-image icon.
+     */
+    const fs = require('fs');
+    const path = require('path');
+    const stored = String(row.image || '').trim();
+
+    // (1) S3 attempt — keep the existing presigned-URL behaviour.
+    if (s3Storage.isEnabled()) {
+      const candidates = [stored];
+      if (!stored.startsWith('Job_Images/') && !stored.startsWith('JobSupportings/')) {
+        candidates.push(`JobSupportings/${path.basename(stored)}`);
+        candidates.push(`Job_Images/${path.basename(stored)}`);
+      }
+      for (const key of candidates) {
+        try {
+          if (await s3Storage.exists(key)) {
+            const url = await s3Storage.getPresignedUrl(key);
+            return res.redirect(url);
+          }
+        } catch (e) {
+          uploadLogger.warn({ key, err: e?.message }, 's3 lookup failed during image redirect — falling through to local');
+          break;
+        }
+      }
+    }
+
+    // (2) Local-file streaming — covers writeBuffer-fallback uploads
+    // and pre-S3 legacy files. Try the configured job-files dir AND a
+    // few common siblings so older rows (some written to `general` /
+    // `easyfixer_documents`) still resolve.
+    const rootCandidates = [
+      process.env.UPLOAD_JOB_FILES,
+      process.env.UPLOAD_ROOT_PATH,
+      './uploads/upload_jobs',
+      './uploads',
+    ].filter(Boolean);
+    // If the stored value contains a slash it's already a sub-path
+    // (e.g. `upload_jobs/foo.jpg`); try it under each root verbatim
+    // before falling back to basename-only resolution.
+    const relForms = [stored, path.basename(stored)];
+    for (const root of rootCandidates) {
+      const absRoot = path.resolve(root);
+      for (const rel of relForms) {
+        const candidate = path.resolve(absRoot, rel.replace(/^\/+/, ''));
+        // Path-traversal guard: candidate MUST sit inside absRoot.
+        if (!candidate.startsWith(absRoot + path.sep) && candidate !== absRoot) continue;
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          return res.sendFile(candidate);
+        }
+      }
+    }
+
+    // (3) Absolute FILE_BASE_URL (prod Nginx) — only redirect when the
+    // base is absolute, never to a relative `/easydoc` that bounces
+    // back to this BE.
+    const fileBase = process.env.FILE_BASE_URL || '';
+    if (/^https?:\/\//i.test(fileBase)) {
+      const url = stored.includes('/')
+        ? `${fileBase.replace(/\/+$/, '')}/${stored.replace(/^\/+/, '')}`
+        : `${fileBase.replace(/\/+$/, '')}/upload_jobs/${stored}`;
+      return res.redirect(url);
+    }
+
+    // (4) Genuinely unresolvable. 404 instead of a redirect-to-nowhere
+    // so the FE renders the empty state instead of a broken-image icon.
+    uploadLogger.warn(
+      { imageId, jobId: row.job_id, stored, s3Enabled: s3Storage.isEnabled(), fileBase },
+      'job image unresolvable — not in S3, no local file, no absolute FILE_BASE_URL',
+    );
+    return modernError(res, 404, 'image file not found in S3 or on local disk');
   } catch (e) { next(e); }
 });
 
