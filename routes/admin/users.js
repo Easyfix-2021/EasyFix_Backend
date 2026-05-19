@@ -64,6 +64,13 @@ const updateBody = Joi.object({
   is_active:         Joi.boolean().optional(),
 }).min(1);
 
+// ─── Bulk-update sub-router ──────────────────────────────────────────
+// Mounted FIRST so the bulk routes (/bulk-lookups, /bulk-upload-template,
+// /bulk-upload) resolve before the dynamic /:userId param route would
+// otherwise catch them. Same Express ordering rule as /escalated,
+// /action-reasons, /transaction etc.
+router.use(require('./users-bulk'));
+
 // ─── Real-time mobile uniqueness probe ──────────────────────────────
 // Mounted BEFORE /:userId so Express doesn't try to parse "check-mobile"
 // as an integer user id. Used by the Add/Edit User form for inline
@@ -77,6 +84,25 @@ router.get('/check-mobile', validate(checkMobileQuery, 'query'), async (req, res
   try {
     const result = await userService.isMobileTakenByAnother(
       req.query.mobile, req.query.excludeUserId
+    );
+    modernOk(res, result);
+  } catch (e) { next(e); }
+});
+
+// ─── Real-time email uniqueness probe ───────────────────────────────
+// Same shape as /check-mobile. When `name` is supplied AND the email is
+// taken, the response also carries a `suggestion` field with the next
+// free <first>.<last>[<n>]@easyfix.in slot so the FE can offer
+// one-click adoption of an available address.
+const checkEmailQuery = Joi.object({
+  email:         Joi.string().trim().lowercase().email().max(255).required(),
+  excludeUserId: Joi.number().integer().positive().optional(),
+  name:          Joi.string().trim().max(200).allow('', null).optional(),
+});
+router.get('/check-email', validate(checkEmailQuery, 'query'), async (req, res, next) => {
+  try {
+    const result = await userService.isEmailTakenByAnother(
+      req.query.email, req.query.excludeUserId, req.query.name
     );
     modernOk(res, result);
   } catch (e) { next(e); }
@@ -144,6 +170,91 @@ router.patch('/:userId',
     }
   }
 );
+
+/*
+ * POST /api/admin/users/bulk-update
+ *
+ * Apply the same scope fields to N users in one shot — drives the
+ * "Select Users & Apply" tab of the Bulk Update modal on Manage Users.
+ *
+ * Body:
+ *   {
+ *     userIds: [121, 122, 123],
+ *     fields:  {
+ *       manage_verticals: "1,4,6" | "0",   // "0" = All
+ *       manage_clients:   "5,10,12" | "0",
+ *       manage_states:    "1,2" | "0",
+ *       manage_cities:    "5,12,28" | "0",
+ *       reporting_manager: 22,             // user_id (single)
+ *       city_id:           5,              // Home City (single)
+ *     }
+ *   }
+ *
+ * Only fields present in `fields` are touched. Mandatory rule from ops:
+ * if `manage_verticals` is being changed, `manage_clients` MUST also
+ * be supplied (non-empty / "0"). Prevents the bug where ops narrows
+ * the vertical but forgets to re-pick clients, leaving the user with
+ * the old client list under a new vertical.
+ *
+ * Returns per-user results so the UI can surface partial failures.
+ */
+const bulkUpdateBody = Joi.object({
+  userIds: Joi.array().items(Joi.number().integer().positive()).min(1).max(500).required(),
+  fields: Joi.object({
+    manage_verticals:  Joi.string().allow('', null).optional(),
+    manage_clients:    Joi.string().allow('', null).optional(),
+    manage_states:     Joi.string().allow('', null).optional(),
+    manage_cities:     Joi.string().allow('', null).optional(),
+    reporting_manager: Joi.number().integer().positive().allow(null).optional(),
+    city_id:           Joi.number().integer().positive().allow(null).optional(),
+  }).min(1).required(),
+});
+router.post('/bulk-update', roleByName(['Admin']), validate(bulkUpdateBody), async (req, res, next) => {
+  try {
+    const { userIds, fields } = req.body;
+
+    // Vertical-without-client guard. `manage_verticals` being touched
+    // requires `manage_clients` to be co-supplied (any value, including
+    // "0" / "All"). Returns 400 BEFORE any DB write so the caller fixes
+    // their form rather than rolling back N successful rows.
+    if (Object.prototype.hasOwnProperty.call(fields, 'manage_verticals')
+        && !Object.prototype.hasOwnProperty.call(fields, 'manage_clients')) {
+      return modernError(
+        res, 400,
+        'When manage_verticals is changed, manage_clients must also be supplied (use "0" for All).',
+      );
+    }
+
+    const results = [];
+    let updated = 0; let failed = 0; let unchanged = 0;
+    for (const userId of userIds) {
+      try {
+        const result = await userService.updateUser(Number(userId), fields, req.user?.user_id);
+        if (result && result.__unchanged) {
+          unchanged++;
+          results.push({ userId, status: 'unchanged' });
+        } else {
+          updated++;
+          results.push({ userId, status: 'updated' });
+        }
+      } catch (e) {
+        failed++;
+        results.push({
+          userId,
+          status: 'failed',
+          error: e.status ? e.message : 'update failed',
+        });
+      }
+    }
+    modernOk(res, {
+      summary: { total: userIds.length, updated, unchanged, failed },
+      results,
+    }, 'Bulk update complete');
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
 
 router.delete('/:userId', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
   try {

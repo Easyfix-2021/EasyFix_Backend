@@ -196,15 +196,53 @@ async function createUser({
 }
 
 // ─── Update ──────────────────────────────────────────────────────────
-async function updateUser(userId, fields, updatedBy) {
-  // Confirm target exists + is internal — keeps callers from accidentally
-  // editing a client/technician row through this endpoint. Also load
-  // the current mobile so we can skip the uniqueness check when the
-  // PATCH body re-sends the same mobile unchanged (legacy data has
-  // multiple active users sharing the same number — historical drift
-  // we shouldn't penalise on every save).
+/*
+ * Per-column value-equality used by updateUser to short-circuit writes
+ * when the incoming PATCH would be a no-op against the current row.
+ *
+ *   - Numeric FKs (user_role, city_id, reporting_manager) compare as
+ *     numbers; '' / null collapse to null.
+ *   - Scope CSVs (manage_*) compare as canonical sorted-int sets so
+ *     "5,10" and "10,5" both match an existing "5,10". The literal
+ *     "0" wildcard stays its own value (matches only itself).
+ *   - String columns (mobile_no, alternate_no) trim + compare; ''
+ *     collapses to null.
+ */
+function normaliseForCompare(key, val) {
+  const csvKeys = new Set(['manage_clients', 'manage_cities', 'manage_states', 'manage_verticals']);
+  const numKeys = new Set(['user_role', 'city_id', 'reporting_manager']);
+  if (val === undefined || val === null) return null;
+  if (csvKeys.has(key)) {
+    const s = String(val).trim();
+    if (s === '' || s === null) return '';
+    if (s === '0') return '0';
+    const ids = s.split(',').map((x) => x.trim()).filter(Boolean).map(Number).filter((n) => !Number.isNaN(n));
+    return Array.from(new Set(ids)).sort((a, b) => a - b).join(',');
+  }
+  if (numKeys.has(key)) {
+    if (val === '' || val === null) return null;
+    const n = Number(val);
+    return Number.isNaN(n) ? null : n;
+  }
+  // string column
+  const s = String(val).trim();
+  return s === '' ? null : s;
+}
+
+async function updateUser(userId, fields, updatedBy, opts = {}) {
+  const { dryRun = false } = opts;
+
+  // Load every column we might compare against. The single round-trip
+  // replaces the older mobile-only SELECT and unlocks the "skip-on-no-
+  // change" path: if every supplied field already matches the row, we
+  // never issue an UPDATE (no update_date bump, no updated_by churn,
+  // no idempotent re-application of the same data on re-uploads).
   const [[me]] = await pool.query(
-    'SELECT user_id, user_type_id, mobile_no FROM tbl_user WHERE user_id = ? LIMIT 1',
+    `SELECT user_id, user_type_id, mobile_no, alternate_no,
+            user_role, city_id,
+            manage_clients, manage_cities, manage_states, manage_verticals,
+            reporting_manager, user_status
+       FROM tbl_user WHERE user_id = ? LIMIT 1`,
     [userId]
   );
   if (!me) throw mkErr(404, 'User not found');
@@ -214,9 +252,18 @@ async function updateUser(userId, fields, updatedBy) {
 
   const sets   = [];
   const params = [];
+  let suppliedCount = 0;
 
   for (const key of MUTABLE_COLUMNS) {
     if (fields[key] === undefined) continue;
+    suppliedCount++;
+
+    // Skip the column entirely when the incoming value already matches
+    // the persisted value. This is the core of the no-change short-
+    // circuit — without it, every re-upload bumps update_date even
+    // though no business data changed.
+    if (normaliseForCompare(key, fields[key]) === normaliseForCompare(key, me[key])) continue;
+
     let val = fields[key];
     if (key === 'user_role' && val) {
       const role = await roleService.getRoleById(val);
@@ -228,21 +275,15 @@ async function updateUser(userId, fields, updatedBy) {
     }
     if (key === 'mobile_no' && val) {
       const mob = String(val).trim();
-      // Only enforce uniqueness if the mobile is actually changing.
-      // Editing a user with the SAME mobile they already have must
-      // never fire a 409 — that's a save-without-changes operation.
-      // Legacy production data has duplicate mobiles across active
-      // internal users we can't clean up retroactively from this code
-      // path; we'd block ALL edits to those rows otherwise.
-      if (mob !== String(me.mobile_no || '')) {
-        const [[dup]] = await pool.query(
-          `SELECT user_id FROM tbl_user
-            WHERE mobile_no = ? AND user_status = 1 AND user_type_id = ?
-              AND user_id <> ? LIMIT 1`,
-          [mob, INTERNAL_USER_TYPE_ID, userId]
-        );
-        if (dup) throw mkErr(409, `Another active user already uses mobile "${mob}"`);
-      }
+      // Mobile is actually changing here (the equality short-circuit
+      // above guarantees that), so the uniqueness probe is meaningful.
+      const [[dup]] = await pool.query(
+        `SELECT user_id FROM tbl_user
+          WHERE mobile_no = ? AND user_status = 1 AND user_type_id = ?
+            AND user_id <> ? LIMIT 1`,
+        [mob, INTERNAL_USER_TYPE_ID, userId]
+      );
+      if (dup) throw mkErr(409, `Another active user already uses mobile "${mob}"`);
       val = mob;
     }
     sets.push(`${key} = ?`);
@@ -250,11 +291,32 @@ async function updateUser(userId, fields, updatedBy) {
   }
 
   if (fields.is_active !== undefined) {
-    sets.push('user_status = ?');
-    params.push(fields.is_active ? 1 : 0);
+    suppliedCount++;
+    const wantActive = fields.is_active ? 1 : 0;
+    if (wantActive !== me.user_status) {
+      sets.push('user_status = ?');
+      params.push(wantActive);
+    }
   }
 
-  if (!sets.length) throw mkErr(400, 'No mutable fields supplied');
+  // Distinguish "operator sent nothing" (real 400) from "operator sent
+  // values that all match" (no-op, return unchanged sentinel).
+  if (suppliedCount === 0) throw mkErr(400, 'No mutable fields supplied');
+  if (!sets.length) {
+    const row = await getUserById(userId);
+    if (row) row.__unchanged = true;
+    return row;
+  }
+
+  // Dry-run path — diff has happened, we KNOW this would mutate the
+  // row, but we don't want to actually write. Returns a sentinel the
+  // bulk-upload route uses to report 'valid' (vs 'unchanged') so the
+  // operator gets an accurate preview.
+  if (dryRun) {
+    const row = await getUserById(userId);
+    if (row) row.__wouldUpdate = true;
+    return row;
+  }
 
   sets.push('update_date = NOW()', 'updated_by = ?');
   params.push(updatedBy || null, userId);
@@ -398,6 +460,69 @@ async function isMobileTakenByAnother(mobile, excludeUserId) {
   return { available: false, takenBy: { user_id: row.user_id, user_name: row.user_name } };
 }
 
+/*
+ * Real-time email-uniqueness probe — drives the Add User form's inline
+ * validation so the operator finds out BEFORE clicking Save that the
+ * address is already taken. When `name` is supplied we also generate a
+ * suggestion in the legacy convention `<first>.<last>[<n>]@easyfix.in`,
+ * bumping the numeric suffix until a free slot is found (looked up in a
+ * single `WHERE official_email IN (...)` query to avoid an N+1 loop).
+ */
+async function isEmailTakenByAnother(email, excludeUserId, name) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!/^\S+@\S+\.\S+$/.test(e)) return { available: false, reason: 'invalid' };
+  const params = [e, INTERNAL_USER_TYPE_ID];
+  let sql = `SELECT user_id, user_name FROM tbl_user
+              WHERE LOWER(official_email) = ? AND user_status = 1 AND user_type_id = ?`;
+  if (excludeUserId) { sql += ' AND user_id <> ?'; params.push(Number(excludeUserId)); }
+  sql += ' LIMIT 1';
+  const [[row]] = await pool.query(sql, params);
+  const taken = !!row;
+
+  let suggestion = null;
+  if (taken && name && String(name).trim()) {
+    suggestion = await suggestAvailableEmail(name, excludeUserId);
+  }
+
+  if (!taken) return { available: true };
+  return {
+    available: false,
+    takenBy: { user_id: row.user_id, user_name: row.user_name },
+    ...(suggestion ? { suggestion } : {}),
+  };
+}
+
+/*
+ * Build a deterministic `<first>.<last>[<n>]@easyfix.in` candidate and
+ * return the first unused variant. Strategy:
+ *   1. Tokenise name → [first, last]. Single-token name uses just that
+ *      token. 3+ tokens use first + last (skip middles).
+ *   2. Sanitise each token (lowercase, strip non a-z0-9).
+ *   3. Generate candidates: base, base1, base2, ... base50.
+ *   4. SELECT all taken emails in that set in one query, pick the first
+ *      candidate not in the result.
+ */
+async function suggestAvailableEmail(name, excludeUserId) {
+  const sanitise = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const toks = String(name).trim().split(/\s+/).filter(Boolean).map(sanitise).filter(Boolean);
+  if (toks.length === 0) return null;
+  const base = toks.length === 1
+    ? toks[0]
+    : `${toks[0]}.${toks[toks.length - 1]}`;
+  const candidates = [`${base}@easyfix.in`];
+  for (let i = 1; i <= 50; i++) candidates.push(`${base}${i}@easyfix.in`);
+
+  const placeholders = candidates.map(() => '?').join(',');
+  const params = [...candidates, INTERNAL_USER_TYPE_ID];
+  let sql = `SELECT LOWER(official_email) AS email FROM tbl_user
+              WHERE LOWER(official_email) IN (${placeholders})
+                AND user_status = 1 AND user_type_id = ?`;
+  if (excludeUserId) { sql += ' AND user_id <> ?'; params.push(Number(excludeUserId)); }
+  const [rows] = await pool.query(sql, params);
+  const taken = new Set(rows.map((r) => r.email));
+  return candidates.find((c) => !taken.has(c)) || null;
+}
+
 async function deactivateUser(userId, updatedBy) {
   const [r] = await pool.query(
     `UPDATE tbl_user
@@ -415,6 +540,8 @@ module.exports = {
   updateUser,
   deactivateUser,
   isMobileTakenByAnother,
+  isEmailTakenByAnother,
+  suggestAvailableEmail,
   findDescendantUserIds,
   buildHierarchyTree,
   SORTABLE_COLUMNS,
