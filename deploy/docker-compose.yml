@@ -8,10 +8,11 @@
 # Image tags come from /opt/easyfix/.env (auto-loaded by docker compose):
 #   BACKEND_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/backend:qa-<sha>
 #   CRM_UI_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/crm-ui:qa-<sha>
+#   CLIENT_UI_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/client-ui:qa-<sha>
 #
 # The workflows update the relevant variable on each deploy via
-# `sed -i` over /opt/easyfix/.env — backend deploys never touch the
-# CRM_UI_IMAGE line and vice versa.
+# `sed -i` over /opt/easyfix/.env — each service's deploy touches only
+# its own *_IMAGE line; the others are untouched.
 #
 # ECR pull authenticates via the EC2 instance profile's
 # AmazonEC2ContainerRegistryReadOnly policy + the
@@ -69,6 +70,38 @@ services:
         condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5180/login", "-O", "/dev/null"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  client-ui:
+    image: ${CLIENT_UI_IMAGE}
+    container_name: easyfix-client-ui
+    restart: unless-stopped
+    # Same baking model as crm-ui — NEXT_PUBLIC_API_URL is compiled into
+    # the bundle at build time. No env_file needed. The Client_UI portal
+    # serves SPOC users at /api/client/* on the backend.
+    environment:
+      NODE_ENV: production
+      PORT: "5181"
+    ports:
+      - "5181:5181"
+    networks:
+      - easyfix-net
+    depends_on:
+      # Soft dep — same reasoning as crm-ui (SSR fetches at boot).
+      backend:
+        condition: service_started
+    healthcheck:
+      # Client_UI's sign-in page is at `/` (rendered by app/page.tsx —
+      # no `/login` route, unlike CRM_UI).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5181/", "-O", "/dev/null"]
       interval: 30s
       timeout: 5s
       start_period: 60s
