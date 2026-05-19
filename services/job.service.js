@@ -674,6 +674,13 @@ const MUTABLE_COLUMNS = [
   'additional_name', 'additional_number',
   'client_ref_id', 'job_reference_id',
   'helper_req', 'remarks', 'efr_special_notes',
+  // job_customer_name — Confirm-mode edits write to this job-row
+  // copy of the customer name instead of mutating the master
+  // tbl_customer.customer_name. Lets the same mobile carry a
+  // different per-job display name (legacy parity + the new bulk-
+  // upload flow where the sheet supplies a name distinct from the
+  // master record).
+  'job_customer_name',
   'exp_tat', 'booking_cut_off_time', 'booking_cut_off_time_slot',
   // branch_details — verified to exist on tbl_job in prod
   // (INFORMATION_SCHEMA returned 1 row 2026-05-14, VARCHAR(255)
