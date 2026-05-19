@@ -40,6 +40,62 @@ router.use(requireSpocAuth);
 
 router.get('/me', (req, res) => modernOk(res, { spoc: req.spoc }));
 
+/*
+ * GET /api/client/me/custom-properties
+ *
+ * Per-tenant extra fields configured in tbl_client_custom_properties.
+ * Mirrors the admin /clients/:clientId/custom-properties normalisation
+ * (column-name variants, mandatory flag coercion) but scoped to the
+ * authenticated SPOC's own client_id. Powers the dynamic "Custom
+ * Properties" section of the New Order form.
+ *
+ * Response: { items: [{ name, label, mandatory }] }
+ *  - name      lowercased + trimmed, used as the stable key
+ *  - label     display string; falls back to humanized `name` on FE
+ *  - mandatory boolean, drives required-field validation
+ */
+router.get('/me/custom-properties', async (req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM tbl_client_custom_properties WHERE client_id = ?',
+      [req.spoc.client_id]
+    );
+    const truthy = (v) => {
+      if (v == null) return false;
+      if (typeof v === 'boolean') return v;
+      if (typeof v === 'number') return v !== 0;
+      const s = String(v).trim().toLowerCase();
+      return s === '1' || s === 'true' || s === 'yes' || s === 'y';
+    };
+    const items = rows.map((r) => ({
+      name: String(r.property_name ?? r.name ?? r.key ?? r.field_name ?? '').toLowerCase().trim(),
+      label: r.property_label ?? r.label ?? r.display_name ?? r.property_name ?? null,
+      mandatory: truthy(r.is_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field),
+    })).filter((p) => p.name);
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+// Service categories scoped to the SPOC's client. Reads tbl_client_service
+// (joined with tbl_service_catg) so each tenant sees only the categories
+// they've actually contracted for. Powers the "New Order" form dropdown
+// and keeps parity with the legacy /clients/{id}/service-categories route.
+router.get('/lookup/service-categories', async (req, res, next) => {
+  try {
+    const lookup = require('../../services/lookup.service');
+    const services = await lookup.clientServices({ clientId: req.spoc.client_id });
+    const seen = new Map();
+    for (const s of services) {
+      if (s.service_catg_id && !seen.has(s.service_catg_id)) {
+        seen.set(s.service_catg_id, { id: s.service_catg_id, name: s.service_catg_name });
+      }
+    }
+    const items = Array.from(seen.values()).sort((a, b) =>
+      String(a.name || '').localeCompare(String(b.name || '')));
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
 router.get('/dashboard', async (req, res, next) => {
   try {
     const [[stats]] = await pool.query(`
