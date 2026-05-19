@@ -558,6 +558,214 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
 });
 
 /*
+ * GET /api/admin/jobs/comment-reasons?dueTo=customer|client|easyfix|technician
+ *
+ * Reason list for the legacy "Job CheckOut Remarks" popup
+ * (surfaced as the "Add Remarks" button on the Job Transaction view).
+ *
+ * Source-of-truth (confirmed by ops 2026-05-19):
+ *   SELECT * FROM action_taken_reason WHERE action_type = 5 AND user_type = ?
+ *
+ *   action_type = 5 is the legacy Job CheckOut bucket (its `type`
+ *   column literally reads 'test' but it IS the right bucket — verified
+ *   by exact-label match against the legacy dropdown screenshot).
+ *
+ *   user_type is tied 1:1 to the operator's "Open Due To" radio:
+ *     user_type = 1 → Customer   (e.g. "Customer is not responding")
+ *     user_type = 2 → Client     (e.g. "Phone not reachable",
+ *                                  "Reschedule – CX request")
+ *     user_type = 3 → EasyFix    (e.g. "Spare not available",
+ *                                  "Pending Authorisation")
+ *     user_type = 4 → Technician (e.g. "Tx No-Show",
+ *                                  "Estimate not received from Technician")
+ *
+ *   The FE refetches whenever the radio changes so the dropdown
+ *   narrows to the bucket the operator just picked. If no `dueTo`
+ *   query param is supplied we default to user_type=2 (Client) to
+ *   match what legacy shows on initial popup mount.
+ *
+ * Route-order: declared BEFORE `/:id` (same gotcha as /transaction,
+ * /action-reasons, /escalated).
+ */
+const DUE_TO_USER_TYPE = { customer: 1, client: 2, easyfix: 3, technician: 4 };
+router.get('/comment-reasons', async (req, res, next) => {
+  try {
+    const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default
+    const [rows] = await imagePool.query(
+      `SELECT id, action_desc FROM action_taken_reason
+        WHERE action_type = 5 AND user_type = ?
+              AND (status IS NULL OR status = 1)
+        ORDER BY id ASC`,
+      [userType]
+    );
+    const items = rows
+      .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
+      .filter((x) => x.label);
+    modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/:id/transaction
+ *
+ * Read-only, all-data payload for the legacy "Job Transaction" view
+ * surfaced on Unconfirmed orders in CRM_UI. Wraps `getById` and
+ * enriches with feedback, comments, quotations, scheduling history,
+ * reschedule count, decoded enum reasons, and images-bucketed-by-stage.
+ *
+ * Route order: declared BEFORE `/:id` so Express doesn't capture the
+ * literal "transaction" segment as a job id and try to validate it
+ * against `idParam` (same gotcha as `/escalated`, `/action-reasons`,
+ * `/bulk` in auto-assign).
+ *
+ * Defensive: each enrichment runs in its own try/catch via
+ * Promise.allSettled. A failing sub-query logs a warn and yields the
+ * neutral fallback (`[]` / `null`) — the page can render every other
+ * section even if (e.g.) `quotation_details` is empty.
+ *
+ * Schema notes (verified 2026-05-19 against easyfix DB):
+ *   scheduling_history columns: id, job_id, schedule_time, easyfixer_id,
+ *                                reason_id, reschedule_reason
+ *   quotation_details   columns: id, job_id, name, type, status (bit),
+ *                                sent_on, sent_by, ... (no `attachment`)
+ *   tbl_job_image       columns: image_id, job_id, job_stage (int),
+ *                                image_category (text), image, ...
+ *   tbl_customer_feedback: feedback_id, job_id, easyfixer_rating,
+ *                          easyfix_rating, happy_with_service, ...
+ */
+router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  const jobId = Number(req.params.id);
+  try {
+    const detail = req.scopedJob; // populated by `scopedJob` middleware
+
+    // Image-stage bucketing key. Prefer the text `image_category`
+    // column when it carries a recognisable label; fall back to the
+    // numeric `job_stage` enum. Buckets that don't appear in the rows
+    // stay as `[]` in the response.
+    const STAGE_MAP = {
+      0: 'start_job',     start_job: 'start_job',
+      1: 'site_inspection', site_inspection: 'site_inspection', siteinspection: 'site_inspection',
+      2: 'job_sheet',     job_sheet: 'job_sheet', jobsheet: 'job_sheet',
+      3: 'material_used', material_used: 'material_used', material: 'material_used',
+      4: 'signature',     signature: 'signature', cx_sign: 'signature', cxsign: 'signature',
+      5: 'checkout',      checkout: 'checkout', checkin: 'start_job',
+    };
+    const bucketFor = (row) => {
+      const cat = String(row.image_category || '').toLowerCase().replace(/\s+/g, '_');
+      if (cat && STAGE_MAP[cat]) return STAGE_MAP[cat];
+      const st = Number(row.job_stage);
+      return STAGE_MAP[st] || 'start_job';
+    };
+
+    const [
+      feedbackRes, commentsRes, quotesRes, rescheduleCountRes,
+      imagesRes, openReasonRes, revisitReasonRes, historyRes,
+    ] = await Promise.allSettled([
+      // feedback
+      require('../../services/job-feedback.service').getFeedback(jobId),
+      // comments
+      require('../../services/job-comment.service').listComments(jobId),
+      // quotations
+      imagePool.query(
+        `SELECT id, job_id, name, type, status, sent_on, action_on, client_charge, easyfxer_id AS easyfixer_id
+           FROM quotation_details WHERE job_id = ? ORDER BY id DESC`,
+        [jobId]
+      ),
+      // reschedule count
+      imagePool.query(
+        `SELECT COUNT(*) AS c FROM scheduling_history
+          WHERE job_id = ? AND reschedule_reason IS NOT NULL AND reschedule_reason <> ''`,
+        [jobId]
+      ),
+      // images (we'll bucket below)
+      imagePool.query(
+        `SELECT image_id, job_id, job_stage, image_category, image, created_date
+           FROM tbl_job_image WHERE job_id = ? ORDER BY image_id ASC`,
+        [jobId]
+      ),
+      // open job reason (decode enquiry_reason_id)
+      detail?.enquiry_reason_id
+        ? imagePool.query(
+            'SELECT enum_desc FROM tbl_enum_reason WHERE enum_id = ? LIMIT 1',
+            [detail.enquiry_reason_id]
+          )
+        : Promise.resolve([[]]),
+      // revisit reason (decode revisit_reason_id)
+      detail?.revisit_reason_id
+        ? imagePool.query(
+            'SELECT enum_desc FROM tbl_enum_reason WHERE enum_id = ? LIMIT 1',
+            [detail.revisit_reason_id]
+          )
+        : Promise.resolve([[]]),
+      // scheduling history — no fk_scheduled_by column; just enumerate
+      // (sub-)schedules and the easyfixer they targeted.
+      imagePool.query(
+        `SELECT sh.id AS table_id, sh.job_id, sh.schedule_time AS scheduled_date_time,
+                sh.easyfixer_id, sh.reason_id, sh.reschedule_reason,
+                ef.efr_name AS easyfixer_name
+           FROM scheduling_history sh
+           LEFT JOIN tbl_easyfixer ef ON ef.efr_id = sh.easyfixer_id
+          WHERE sh.job_id = ?
+          ORDER BY sh.schedule_time DESC, sh.id DESC`,
+        [jobId]
+      ),
+    ]);
+
+    function safe(res, fallback, label) {
+      if (res.status === 'fulfilled') return res.value;
+      uploadLogger.warn({ err: res.reason?.message, label, jobId }, 'job/transaction enrichment failed');
+      return fallback;
+    }
+
+    const feedback = safe(feedbackRes, null, 'feedback');
+    const comments = safe(commentsRes, [], 'comments');
+    const quotesRows = safe(quotesRes, [[]], 'quotations')[0] || [];
+    const rescheduleRows = safe(rescheduleCountRes, [[]], 'rescheduleCount')[0] || [];
+    const imageRows = safe(imagesRes, [[]], 'images')[0] || [];
+    const openRows = safe(openReasonRes, [[]], 'open_reason')[0] || [];
+    const revisitRows = safe(revisitReasonRes, [[]], 'revisit_reason')[0] || [];
+    const historyRows = safe(historyRes, [[]], 'scheduling_history')[0] || [];
+
+    // Quotation status is BIT(1) → boolean after the typeCast in db.js.
+    // Render as a human label so the FE doesn't need to know the codes.
+    const quotations = quotesRows.map((q) => ({
+      id: q.id,
+      attachment: q.name || null, // legacy stored the filename in `name`
+      type: q.type || null,
+      date: q.sent_on || q.action_on || null,
+      status: q.status === true ? 'Approved' : q.status === false ? 'Pending' : null,
+      easyfixer_id: q.easyfixer_id || null,
+      client_charge: q.client_charge ?? null,
+    }));
+
+    // Bucket images by stage. Empty buckets retained so the FE always
+    // has the same key set to read against — fewer null guards.
+    const images_by_stage = {
+      start_job: [], site_inspection: [], job_sheet: [],
+      material_used: [], signature: [], checkout: [],
+    };
+    for (const r of imageRows) {
+      const k = bucketFor(r);
+      if (!images_by_stage[k]) images_by_stage[k] = [];
+      images_by_stage[k].push(r);
+    }
+
+    modernOk(res, {
+      job: detail,
+      feedback,
+      rescheduledCount: Number(rescheduleRows[0]?.c || 0),
+      quotations,
+      comments,
+      images_by_stage,
+      open_job_reason: openRows[0]?.enum_desc || null,
+      revisit_reason: revisitRows[0]?.enum_desc || null,
+      scheduling_history: historyRows,
+    });
+  } catch (e) { next(e); }
+});
+
+/*
  * GET /api/admin/jobs/action-reasons?type=<unreachable|enquiry>
  *
  * Drives the dropdown inside the Book-New-Call "Job Unreachable" /
