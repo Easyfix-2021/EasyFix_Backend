@@ -59,12 +59,20 @@ const CLOSED_STATES = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT]);
 const COMPLETED_STATES = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT]);
 
 // ─── Projections ────────────────────────────────────────────────────
+// Note: extra columns (ticket_created_date_time, time_slot, client_spoc*,
+// remarks) are included on the LIST projection because the Unconfirmed
+// tab on /jobs and /my-orders surfaces them in dedicated columns. All
+// fields live on tbl_job — no extra JOINs needed. Kept on the default
+// LIST to avoid having to split the projection per tab.
 const LIST_COLUMNS = `
   j.job_id, j.job_reference_id, j.client_ref_id,
   j.job_status, j.job_type, j.source_type,
   LEFT(j.job_desc, 200) AS job_desc,
   j.created_date_time, j.requested_date_time, j.scheduled_date_time,
   j.checkin_date_time, j.checkout_date_time,
+  j.ticket_created_date_time, j.time_slot,
+  j.client_spoc, j.client_spoc_name,
+  LEFT(j.remarks, 500) AS remarks,
   j.fk_customer_id, cu.customer_name, cu.customer_mob_no,
   j.fk_client_id, cl.client_name,
   j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
