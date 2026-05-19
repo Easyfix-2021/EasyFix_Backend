@@ -99,9 +99,10 @@ services:
       backend:
         condition: service_started
     healthcheck:
-      # Client_UI's sign-in page is at `/` (rendered by app/page.tsx —
-      # no `/login` route, unlike CRM_UI).
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5181/", "-O", "/dev/null"]
+      # Dedicated /healthcheck route handler (src/app/healthcheck/route.ts
+      # in Easyfix_client_UI). Cheaper than rendering `/`, and gives an
+      # explicit JSON contract: { status: "ok", service: "client-ui", ts }.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5181/healthcheck", "-O", "/dev/null"]
       interval: 30s
       timeout: 5s
       start_period: 60s
