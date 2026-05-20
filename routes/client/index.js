@@ -124,6 +124,11 @@ router.get('/jobs', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Bulk upload sub-router (POST /jobs/upload + GET /jobs/upload-template).
+// Declared BEFORE /jobs/:id so Express matches the literal `upload`
+// segment first — `/jobs/:id` would otherwise capture "upload" as the id.
+router.use('/jobs', require('./jobs-upload'));
+
 router.get('/jobs/:id', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
