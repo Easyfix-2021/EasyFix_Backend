@@ -207,6 +207,10 @@ const bulkUpdateBody = Joi.object({
     manage_cities:     Joi.string().allow('', null).optional(),
     reporting_manager: Joi.number().integer().positive().allow(null).optional(),
     city_id:           Joi.number().integer().positive().allow(null).optional(),
+    // Role is validated by userService.updateUser — it rejects
+    // non-admin-group roles with a 400 — so we only enforce shape
+    // here. Joi.integer().positive keeps obvious garbage out.
+    user_role:         Joi.number().integer().positive().optional(),
   }).min(1).required(),
 });
 router.post('/bulk-update', roleByName(['Admin']), validate(bulkUpdateBody), async (req, res, next) => {

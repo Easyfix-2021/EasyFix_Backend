@@ -7,6 +7,7 @@ const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const { pool } = require('../../db');
 const userService = require('../../services/user.service');
+const roleService = require('../../services/role.service');
 const { modernOk, modernError } = require('../../utils/response');
 
 /*
@@ -60,7 +61,7 @@ const upload = multer({
  */
 router.get('/bulk-lookups', async (req, res, next) => {
   try {
-    const [verticals, clients, states, cities, users] = await Promise.all([
+    const [verticals, clients, states, cities, users, roles] = await Promise.all([
       pool.query(
         `SELECT vertical_id AS id, vertical_name AS name
            FROM tbl_vertical WHERE status = 1 ORDER BY vertical_name ASC`,
@@ -112,8 +113,19 @@ router.get('/bulk-lookups', async (req, res, next) => {
             AND (u.user_role IS NULL OR u.user_role <> 19)
           ORDER BY u.user_name ASC`,
       ).then(([r]) => r),
+      // Admin-group roles only — these are the ones a CRM user can be
+      // assigned to via updateUser() (the service rejects non-admin
+      // groups with a 400 anyway). Mirrors createUser/updateUser's
+      // own admin-group enforcement so the FE picker never offers a
+      // value the backend would then reject.
+      pool.query(
+        `SELECT role_id AS id, role_name AS name
+           FROM tbl_role WHERE role_status = 1 ORDER BY role_name ASC`,
+      ).then(([r]) => r.filter(
+        (row) => roleService.ROLE_ID_TO_GROUP[row.id] === 'admin'
+      )),
     ]);
-    modernOk(res, { verticals, clients, states, cities, users });
+    modernOk(res, { verticals, clients, states, cities, users, roles });
   } catch (e) { next(e); }
 });
 
@@ -347,7 +359,7 @@ router.get('/bulk-upload-template', async (req, res, next) => {
     // CSVs still write through. The cascading slice is therefore a
     // helpful single-pick affordance, not a hard gate.
     const [
-      [vRows], [cRows], [sRows], [ctRows], [uRows], [vmRows], [scRows],
+      [vRows], [cRows], [sRows], [ctRows], [uRows], [vmRows], [scRows], [roleRowsAll],
     ] = await Promise.all([
       pool.query('SELECT vertical_id AS id, vertical_name AS name FROM tbl_vertical WHERE status = 1 ORDER BY vertical_name ASC'),
       pool.query('SELECT client_id   AS id, client_name   AS name FROM tbl_client   WHERE client_status = 1 ORDER BY client_name ASC'),
@@ -371,7 +383,17 @@ router.get('/bulk-upload-template', async (req, res, next) => {
           WHERE c.city_status = 1
           ORDER BY s.state_name, c.city_name`
       ),
+      // Admin-group role master — filter happens client-side because
+      // ROLE_ID_TO_GROUP lives in JS (matches the bulk-lookups path).
+      pool.query('SELECT role_id AS id, role_name AS name FROM tbl_role WHERE role_status = 1 ORDER BY role_name ASC'),
     ]);
+    // Filter to admin-group only — same gate the FE picker honours +
+    // the bulk-update parser enforces. Keeps the template from
+    // offering Default User / Technician / Client roles operators
+    // shouldn't be assigning here.
+    const rRows = roleRowsAll.filter(
+      (row) => roleService.ROLE_ID_TO_GROUP[row.id] === 'admin'
+    );
 
     // Flat veryHidden vocab sheets (legacy refs kept for the bulk-pick
     // unconditional fallback and for the Reporting Manager / Home City
@@ -386,6 +408,7 @@ router.get('/bulk-upload-template', async (req, res, next) => {
     const sCount  = addVocab('voc_states',    sRows.map((x) => x.name));
     const ctCount = addVocab('voc_cities',    ctRows.map((x) => x.name));
     const uCount  = addVocab('voc_users',     uRows.map((x) => x.name));
+    const rCount  = addVocab('voc_roles',     rRows.map((x) => x.name));
 
     // Name → id maps (two columns) so per-row INDIRECT can do
     //   VLOOKUP(E2, voc_v_id_map!A:B, 2, FALSE) → vertical_id → "vCli_<id>"
@@ -486,6 +509,14 @@ router.get('/bulk-upload-template', async (req, res, next) => {
     const vIdMapRange = `voc_v_id_map!$A:$B`;
     const sIdMapRange = `voc_s_id_map!$A:$B`;
     for (let r = 2; r <= 1000; r++) {
+      // Role (col C) — single-pick from active admin-group roles.
+      ws.getCell(`C${r}`).dataValidation = {
+        type: 'list', allowBlank: true,
+        formulae: [`=voc_roles!$A$1:$A$${rCount}`],
+        showErrorMessage: true, errorStyle: 'error',
+        errorTitle: 'Invalid value',
+        error: 'Pick an admin-group role from the list.',
+      };
       // Reporting Manager (col D) — single-pick from active users.
       ws.getCell(`D${r}`).dataValidation = {
         type: 'list', allowBlank: true,
@@ -595,20 +626,28 @@ router.post('/bulk-upload',
       // for case-insensitive matching.
       const lc = (s) => String(s || '').trim().toLowerCase();
       const [
-        [verticals], [clients], [states], [cities], [users],
+        [verticals], [clients], [states], [cities], [users], [roleRows],
       ] = await Promise.all([
         pool.query('SELECT vertical_id AS id, LOWER(vertical_name) AS name FROM tbl_vertical WHERE status = 1'),
         pool.query('SELECT client_id   AS id, LOWER(client_name)   AS name FROM tbl_client   WHERE client_status = 1'),
         pool.query('SELECT state_id    AS id, LOWER(state_name)    AS name FROM tbl_state'),
         pool.query('SELECT city_id     AS id, LOWER(city_name)     AS name FROM tbl_city     WHERE city_status = 1'),
         pool.query("SELECT user_id AS id, LOWER(user_name) AS name FROM tbl_user WHERE user_status = 1 AND user_type_id = 5"),
+        // Admin-group roles only — match the bulk-lookups filter so the
+        // upload can't smuggle in a Default-User or Technician role
+        // that the FE picker would never offer.
+        pool.query('SELECT role_id AS id, LOWER(role_name) AS name FROM tbl_role WHERE role_status = 1'),
       ]);
+      const adminRoles = roleRows.filter(
+        (row) => roleService.ROLE_ID_TO_GROUP[row.id] === 'admin'
+      );
       const maps = {
         v:  new Map(verticals.map((x) => [x.name, x.id])),
         c:  new Map(clients.map((x)   => [x.name, x.id])),
         s:  new Map(states.map((x)    => [x.name, x.id])),
         ct: new Map(cities.map((x)    => [x.name, x.id])),
         u:  new Map(users.map((x)     => [x.name, x.id])),
+        r:  new Map(adminRoles.map((x) => [x.name, x.id])),
       };
 
       // Multi-CSV → id-CSV. Returns:
@@ -665,6 +704,11 @@ router.post('/bulk-upload',
           continue;
         }
 
+        // Col C is Role — single-pick, admin-group only. Empty cell
+        // means "don't touch the existing role" (consistent with every
+        // other column). "All" is explicitly NOT a valid value for
+        // role (every user has exactly one).
+        const role = resolveSingle(cells(3), maps.r,  'Role', false);
         const rm   = resolveSingle(cells(4), maps.u,  'Reporting Manager');
         const v    = resolveMulti(cells(5), maps.v, 'Vertical');
         const c    = resolveMulti(cells(6), maps.c, 'Client');
@@ -672,7 +716,7 @@ router.post('/bulk-upload',
         const cty  = resolveMulti(cells(8), maps.ct, 'City');
         const home = resolveSingle(cells(9), maps.ct, 'Home City', false);
 
-        const errs = [rm, v, c, st, cty, home].filter((x) => x.error).map((x) => x.error);
+        const errs = [role, rm, v, c, st, cty, home].filter((x) => x.error).map((x) => x.error);
         if (errs.length) {
           failed++;
           results.push({ rowNumber: rIdx, userId, status: 'failed', errors: errs });
@@ -682,6 +726,7 @@ router.post('/bulk-upload',
         // Build the PATCH payload — only include keys the operator
         // actually filled in. `empty: true` means "don't touch".
         const fields = {};
+        if (!role.empty) fields.user_role         = role.value;
         if (!v.empty)    fields.manage_verticals  = v.value;
         if (!c.empty)    fields.manage_clients    = c.value;
         if (!st.empty)   fields.manage_states     = st.value;
