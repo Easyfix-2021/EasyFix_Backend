@@ -36,6 +36,13 @@ router.get('/verticals',          async (_req, res, next) => {
   try { modernOk(res, await lookup.verticals()); } catch (e) { next(e); }
 });
 
+// Zones — drives the Manage Jobs "Zonal" filter dropdown. Lives here
+// (not under /admin) because the Manage Jobs page calls /shared/lookup/*
+// for all its filter options and consistency is cheap.
+router.get('/zones',              async (_req, res, next) => {
+  try { modernOk(res, await lookup.zones()); } catch (e) { next(e); }
+});
+
 router.get('/service-categories', validate(simpleIncludeInactive, 'query'), async (req, res, next) => {
   try { modernOk(res, await lookup.serviceCategories(req.query)); } catch (e) { next(e); }
 });

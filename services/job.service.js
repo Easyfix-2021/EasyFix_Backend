@@ -142,10 +142,44 @@ const DETAIL_JOIN = LIST_JOIN + `
 // dimension; mode='none' returns zero rows; mode='allow' adds an
 // IN(...) clause. See lib/scope.js. Admin/Finance bypass scope —
 // the caller decides whether to pass it.
+/*
+ * `dateType` controls which column `startDate` / `endDate` are applied
+ * to. Matches the legacy CRM's Date Type filter:
+ *   booked    → j.created_date_time (default, backward-compat)
+ *   scheduled → j.scheduled_date_time
+ *   completed → j.checkout_date_time
+ *   ticket    → j.ticket_created_date_time
+ *   requested → j.requested_date_time
+ * Unknown values silently fall back to `created_date_time` rather
+ * than 400 — keeps URL bookmarks robust across vocab changes.
+ */
+const DATE_TYPE_COLUMN = {
+  booked:    'j.created_date_time',
+  scheduled: 'j.scheduled_date_time',
+  completed: 'j.checkout_date_time',
+  ticket:    'j.ticket_created_date_time',
+  requested: 'j.requested_date_time',
+};
+
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
   customerId,
   isEscalated,
+  // New filter params (2026-05-19) — match the legacy CRM "Filter Job"
+  // panel. See the validator + the FE filter card.
+  customerQ,                 // text — separate from `q`, narrower scope
+  clientRef,                 // text — LIKE on j.client_ref_id
+  efrMobile,                 // text — LIKE on tbl_easyfixer.efr_no
+  pin,                       // text — LIKE on tbl_address.pin_code
+  stateId,                   // FK   — tbl_city.state_id
+  categoryId,                // FK   — j.fk_service_catg_id
+  verticalId,                // FK   — via EXISTS on tbl_vertical_mapping
+  dateType,                  // enum — see DATE_TYPE_COLUMN above
+  // Phase-2 filters (2026-05-19).
+  rating,                    // 1..5 — tbl_easyfixer_rating_by_customer.customer_rating
+  reopen,                    // bool — tbl_job.job_reopen_flag = 1
+  dueTo,                     // enum — customer|client|easyfix|technician
+  zonalId,                   // FK   — tbl_zone_master via tbl_zone_city_mapping
   startDate, endDate,
   scope,
   limit = 50, offset = 0,
@@ -220,6 +254,88 @@ async function list({
   if (ownerId != null)     { clauses.push('j.job_owner = ?');        params.push(ownerId); }
   if (cityId != null)      { clauses.push('ad.city_id = ?');         params.push(cityId); }
   if (customerId != null)  { clauses.push('j.fk_customer_id = ?');   params.push(customerId); }
+  if (categoryId != null)  { clauses.push('j.fk_service_catg_id = ?'); params.push(categoryId); }
+  if (stateId != null)     { clauses.push('ci.state_id = ?');        params.push(stateId); }
+  // Vertical filter — tbl_vertical_mapping is many-to-many across
+  // (client_id, vertical_id, [user_id]). EXISTS is cheaper than a
+  // JOIN because it short-circuits on first match per row and avoids
+  // row multiplication when a client maps to multiple verticals.
+  if (verticalId != null) {
+    clauses.push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id = ?)');
+    params.push(verticalId);
+  }
+  // Text LIKE filters — use the customary `%val%` wrap. Each adds its
+  // referenced alias to the COUNT-join detection regex below via the
+  // `ad.` / `ef.` / `cu.` literal in the SQL string.
+  if (clientRef) {
+    clauses.push('j.client_ref_id LIKE ?');
+    params.push(`%${clientRef}%`);
+  }
+  if (efrMobile) {
+    clauses.push('ef.efr_no LIKE ?');
+    params.push(`%${efrMobile}%`);
+  }
+  if (pin) {
+    clauses.push('ad.pin_code LIKE ?');
+    params.push(`%${pin}%`);
+  }
+  if (customerQ) {
+    clauses.push('(cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+    params.push(`%${customerQ}%`, `%${customerQ}%`);
+  }
+  // Reopen — direct column on tbl_job, super cheap. Accepts boolean or
+  // its URLSearchParams string form (matches `assigned`/`isEscalated`).
+  if (reopen !== undefined && reopen !== '' && reopen !== null) {
+    const wantReopen = reopen === true || reopen === 'true' || reopen === '1' || reopen === 1;
+    clauses.push(wantReopen ? 'j.job_reopen_flag = 1' : '(j.job_reopen_flag = 0 OR j.job_reopen_flag IS NULL)');
+  }
+  // Rating — EXISTS keeps row cardinality stable (a job can have
+  // multiple rating rows over its lifetime; we want jobs that ever
+  // received the given rating, not duplicated rows). Restricts to
+  // tbl_easyfixer_rating_by_customer.customer_rating exact match.
+  if (rating != null) {
+    clauses.push('EXISTS (SELECT 1 FROM tbl_easyfixer_rating_by_customer ercf WHERE ercf.job_id = j.job_id AND ercf.customer_rating = ?)');
+    params.push(Number(rating));
+  }
+  // Zonal — the zone lives on the EASYFIXER, not on the address.
+  // `tbl_easyfixer.efr_zone_city_id` FKs to
+  // `tbl_zone_city_mapping.city_zone_id` (the PK of the mapping row,
+  // confusingly named), and that row's `zone_id` is the actual zone.
+  //
+  // Why the address mapping is wrong: `tbl_zone_city_mapping` carries
+  // 57,750 rows where every city is mapped to every zone (legacy data
+  // bug — the earlier version of this filter used `city_id = ad.city_id`
+  // and every zone returned all 453,656 jobs because the mapping is
+  // effectively a cross-join). The real zone-of-record is the
+  // technician's `efr_zone_city_id` — verified 2026-05-19: 3,004
+  // easyfixers carry 1,016 distinct values.
+  //
+  // Trade-off: jobs WITHOUT an assigned technician (Pending for
+  // Scheduling) won't match any zone filter — which is correct because
+  // those jobs have no zone of record yet.
+  if (zonalId != null) {
+    clauses.push('EXISTS (SELECT 1 FROM tbl_zone_city_mapping zcm WHERE zcm.city_zone_id = ef.efr_zone_city_id AND zcm.zone_id = ?)');
+    params.push(Number(zonalId));
+  }
+  // Open Due To — accepts both shapes of remark:
+  //   (a) Structured tag from the AddRemarks dialog:
+  //       "[Unreachable · Pending Due To: Client · Reason: …] free text"
+  //   (b) Loose legacy free-text: "… due to client said no …"
+  // MySQL default collation is case-insensitive, so the LIKE comparison
+  // matches "Due to Client" / "DUE TO CLIENT" / "due to client" alike.
+  // The loose-match arm risks false positives ("due to customer issue"
+  // for dueTo=customer) — acceptable given the legacy data has no
+  // structured tag yet; tightening to brackets-only would zero-out the
+  // filter entirely until the AddRemarks-dialog data lands.
+  if (dueTo) {
+    const lower = String(dueTo).toLowerCase();
+    const label = lower === 'easyfix' ? 'EasyFix'
+      : lower.charAt(0).toUpperCase() + lower.slice(1);
+    clauses.push('(j.remarks LIKE ? OR j.remarks LIKE ?)');
+    //   1st: structured tag exact ("Due To: Client")
+    //   2nd: loose free-text ("due to client")
+    params.push(`%Due To: ${label}%`, `%due to ${lower}%`);
+  }
   // `isEscalated` migration note: I initially wired this to
   // `j.is_escalated`, but that column DOES NOT exist on `tbl_job`. The
   // legacy CRM had it commented out across JobDaoImpl.java; the real
@@ -237,8 +353,12 @@ async function list({
   if (isEscalated !== undefined && isEscalated !== '') {
     // intentional no-op — see comment above
   }
-  if (startDate)           { clauses.push('j.created_date_time >= ?'); params.push(startDate); }
-  if (endDate)             { clauses.push('j.created_date_time <= ?'); params.push(endDate); }
+  // `dateType` selects which date column the start/end range applies
+  // to. Defaults to `created_date_time` for backward-compat with
+  // callers that don't pass dateType.
+  const dateCol = DATE_TYPE_COLUMN[String(dateType || '').toLowerCase()] || 'j.created_date_time';
+  if (startDate)           { clauses.push(`${dateCol} >= ?`); params.push(startDate); }
+  if (endDate)             { clauses.push(`${dateCol} <= ?`); params.push(endDate); }
   if (q) {
     clauses.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
     params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);

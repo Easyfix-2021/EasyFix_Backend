@@ -78,6 +78,138 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
 });
 
 /*
+ * GET /api/admin/jobs/export.xlsx
+ *
+ * Styled XLSX export of the Filter-Job panel result set. Accepts every
+ * filter the list endpoint accepts (validated by the same listQuery
+ * schema, with pagination params dropped) and applies the same RBAC
+ * scope, so the operator's export reflects exactly what they see in
+ * the table — minus the page boundary.
+ *
+ * Soft cap: 100,000 rows. Lifted from the original 5,000 limit so
+ * operators can export the entire active dataset without first
+ * narrowing the filters — the legacy CRM didn't enforce a cap at all
+ * here. 100k is still bounded (a styled xlsx for that count writes
+ * ~50-80MB and finishes in ~30s), but the BE response includes a
+ * `truncated` flag when the cap is hit so the FE can warn the
+ * operator that not every matching row landed in the file.
+ * Free-text `q` is honoured here unlike the escalated export — on the
+ * jobs list `q` IS the operator-supplied filter, not an in-table
+ * client-side search.
+ *
+ * Mounted BEFORE `/:id` so Express doesn't try to parse "export" as a
+ * job id (same gotcha as `/counts`, `/escalated`, `/comment-reasons`).
+ */
+router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) => {
+  try {
+    const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+    const { pool } = require('../../db');
+    const scope = await buildRequestScopeWithHierarchy(req, pool);
+
+    // Reuse the list() builder. Strip pagination — we want the
+    // complete filtered set up to the safety ceiling.
+    const EXPORT_CAP = 100000;
+    const { rows, total } = await job.list({
+      ...req.query,
+      limit: EXPORT_CAP,
+      offset: 0,
+      scope,
+    });
+    const truncated = total > EXPORT_CAP;
+
+    // Status enum → human label. Mirrors STATUS_LABEL in
+    // /escalated/export.xlsx + the FE statusLabel utility.
+    const STATUS_LABEL = {
+      0: 'Booked', 1: 'Scheduled', 2: 'In Progress',
+      3: 'Completed', 5: 'Completed', 6: 'Cancelled',
+      7: 'Enquiry', 9: 'Unconfirmed', 10: 'Revisit',
+      15: 'Estimate Pending', 20: 'Pending to Close', 21: 'Followup',
+    };
+    const dateOnly = (d) => {
+      if (!d) return '';
+      const dt = new Date(d);
+      if (Number.isNaN(+dt)) return String(d);
+      return dt.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    };
+    const timeOnly = (d) => {
+      if (!d) return '';
+      const dt = new Date(d);
+      if (Number.isNaN(+dt)) return '';
+      return dt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: true });
+    };
+
+    const xlsxRows = rows.map((r) => ({
+      job_id:        r.job_id,
+      job_ref:       r.job_reference_id || '',
+      client_ref:    r.client_ref_id || '',
+      status:        STATUS_LABEL[r.job_status] || `Status ${r.job_status}`,
+      job_type:      r.job_type || '',
+      source:        r.source_type || '',
+      customer_name: r.customer_name || '',
+      customer_mob:  r.customer_mob_no || '',
+      client:        r.client_name || '',
+      city:          r.city_name || '',
+      easyfixer:     r.easyfixer_name || '',
+      job_owner:     r.owner_name || '',
+      booked_date:   dateOnly(r.created_date_time),
+      booked_time:   timeOnly(r.created_date_time),
+      appt_date:     dateOnly(r.requested_date_time),
+      appt_time:     timeOnly(r.requested_date_time),
+      scheduled:     r.scheduled_date_time ? dateOnly(r.scheduled_date_time) : '',
+      checkout:      r.checkout_date_time ? dateOnly(r.checkout_date_time) : '',
+      time_slot:     r.time_slot || '',
+      remarks:       r.remarks || '',
+    }));
+
+    const today = new Date().toISOString().slice(0, 10);
+    const filterBits = [];
+    if (req.query.status     != null) filterBits.push(`Status ${STATUS_LABEL[req.query.status] || req.query.status}`);
+    if (req.query.statuses   != null) filterBits.push(`Statuses ${req.query.statuses}`);
+    if (req.query.clientId   != null) filterBits.push(`Client #${req.query.clientId}`);
+    if (req.query.cityId     != null) filterBits.push(`City #${req.query.cityId}`);
+    if (req.query.stateId    != null) filterBits.push(`State #${req.query.stateId}`);
+    if (req.query.startDate)          filterBits.push(`From ${dateOnly(req.query.startDate)}`);
+    if (req.query.endDate)            filterBits.push(`To ${dateOnly(req.query.endDate)}`);
+    if (req.query.q)                  filterBits.push(`Search "${req.query.q}"`);
+    const meta = [
+      filterBits.length ? `Filters: ${filterBits.join(', ')}` : 'Filters: none',
+      `Generated: ${new Date().toLocaleString('en-IN')}`,
+      `Total: ${xlsxRows.length.toLocaleString('en-IN')} job${xlsxRows.length === 1 ? '' : 's'}${truncated ? ` (truncated — ${total.toLocaleString('en-IN')} match)` : ''}`,
+    ].join('    ·    ');
+
+    await streamStyledXlsx(res, `jobs_${today}.xlsx`, {
+      title: 'EasyFix  ·  Jobs',
+      meta,
+      sheetName: 'Jobs',
+      columns: [
+        { header: 'Job ID',         key: 'job_id',        width: 10, align: 'center' },
+        { header: 'Job Ref',        key: 'job_ref',       width: 16, align: 'left'   },
+        { header: 'Client Ref',     key: 'client_ref',    width: 18, align: 'left'   },
+        { header: 'Status',         key: 'status',        width: 14, align: 'center' },
+        { header: 'Type',           key: 'job_type',      width: 14, align: 'left'   },
+        { header: 'Source',         key: 'source',        width: 12, align: 'left'   },
+        { header: 'Customer',       key: 'customer_name', width: 22, align: 'left'   },
+        { header: 'Customer Mob',   key: 'customer_mob',  width: 14, align: 'left'   },
+        { header: 'Client',         key: 'client',        width: 22, align: 'left'   },
+        { header: 'City',           key: 'city',          width: 16, align: 'left'   },
+        { header: 'EasyFixer',      key: 'easyfixer',     width: 22, align: 'left'   },
+        { header: 'Job Owner',      key: 'job_owner',     width: 20, align: 'left'   },
+        { header: 'Booked Date',    key: 'booked_date',   width: 14, align: 'left'   },
+        { header: 'Booked Time',    key: 'booked_time',   width: 12, align: 'center' },
+        { header: 'Appt Date',      key: 'appt_date',     width: 14, align: 'left'   },
+        { header: 'Appt Time',      key: 'appt_time',     width: 12, align: 'center' },
+        { header: 'Scheduled',      key: 'scheduled',     width: 14, align: 'left'   },
+        { header: 'Checkout',       key: 'checkout',      width: 14, align: 'left'   },
+        { header: 'Time Slot',      key: 'time_slot',     width: 14, align: 'left'   },
+        { header: 'Remarks',        key: 'remarks',       width: 42, align: 'left'   },
+      ],
+      rows: xlsxRows,
+      emptyMessage: 'No jobs matched the current filters.',
+    });
+  } catch (e) { next(e); }
+});
+
+/*
  * GET /api/admin/jobs/counts
  * Returns status-bucket totals + grand total in ONE query. Replaces the
  * dashboard's 6 parallel list-with-limit-1 calls (which each spent 2 DB
@@ -867,6 +999,117 @@ router.patch('/:id/owner', validate(idParam, 'params'), validate(ownerBody), sco
     modernOk(res, updated, 'job owner changed');
   } catch (e) { next(e); }
 });
+
+/*
+ * POST /api/admin/jobs/bulk-owner-transfer
+ *
+ * Admin-only bulk variant of the single-job /owner endpoint. Two
+ * modes of selecting which jobs to transfer:
+ *   - `jobIds: [.., ..]`  — explicit list (max 500 per call)
+ *   - `filters: {...}`     — same shape as the listQuery validator;
+ *                            applies the same WHERE clauses + RBAC
+ *                            scope as the LIST endpoint, then
+ *                            iterates up to a 1000-row cap.
+ *
+ * Both modes require `fromOwnerId` and `toOwnerId`. fromOwnerId
+ * narrows so an operator can't accidentally transfer jobs that
+ * AREN'T currently owned by the source user (defends against ops
+ * mistakes when the filter set crosses owners).
+ *
+ * Per-row results so partial failures are visible. We never roll
+ * back successful transfers — each is its own changeOwner() call.
+ *
+ * Mounted via roleByName(['Admin']) — only the canonical Admin role
+ * can bulk-transfer ownership. Other admin-group roles (Project
+ * Manager, Finance, etc.) see the list but not the button.
+ */
+const bulkOwnerBody = require('joi').object({
+  fromOwnerId: require('joi').number().integer().positive().required(),
+  toOwnerId:   require('joi').number().integer().positive().required(),
+  reason:      require('joi').string().trim().min(2).max(500).required(),
+  jobIds:      require('joi').array().items(require('joi').number().integer().positive()).min(1).max(500).optional(),
+  filters:     require('joi').object().optional(),
+}).xor('jobIds', 'filters');
+router.post('/bulk-owner-transfer',
+  require('../../middleware/role').roleByName(['Admin']),
+  validate(bulkOwnerBody),
+  async (req, res, next) => {
+    try {
+      const { fromOwnerId, toOwnerId, reason, jobIds, filters: bodyFilters } = req.body;
+      if (fromOwnerId === toOwnerId) {
+        return modernError(res, 400, 'fromOwnerId and toOwnerId cannot be the same');
+      }
+
+      // Resolve the target job set. Explicit jobIds short-circuit;
+      // filters mode reuses service.list() with the same RBAC scope
+      // the LIST endpoint applies.
+      let targetIds = [];
+      if (Array.isArray(jobIds) && jobIds.length) {
+        targetIds = jobIds;
+      } else {
+        const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+        const { pool } = require('../../db');
+        const scope = await buildRequestScopeWithHierarchy(req, pool);
+        const { rows } = await job.list({
+          ...bodyFilters,
+          ownerId: fromOwnerId, // pin to source owner — see comment above
+          limit: 1000,
+          offset: 0,
+          scope,
+        });
+        targetIds = rows.map((r) => r.job_id);
+      }
+
+      if (targetIds.length === 0) {
+        return modernOk(res, {
+          summary: { total: 0, transferred: 0, failed: 0, skipped: 0 },
+          results: [],
+        }, 'no jobs matched');
+      }
+
+      const results = [];
+      let transferred = 0; let failed = 0; let skipped = 0;
+      for (const id of targetIds) {
+        try {
+          // service.changeOwner validates the source ownership via
+          // the existing job_owner column — if the row's current
+          // owner doesn't match fromOwnerId, we skip rather than
+          // throw. Lets the explicit-jobIds caller pass mixed sets
+          // without aborting on the first mismatch.
+          const { pool } = require('../../db');
+          const [[row]] = await pool.query(
+            'SELECT job_owner FROM tbl_job WHERE job_id = ? LIMIT 1',
+            [id]
+          );
+          if (!row) {
+            skipped++;
+            results.push({ jobId: id, status: 'skipped', reason: 'not found' });
+            continue;
+          }
+          if (row.job_owner !== fromOwnerId) {
+            skipped++;
+            results.push({ jobId: id, status: 'skipped', reason: `current owner ${row.job_owner ?? 'NULL'} ≠ source ${fromOwnerId}` });
+            continue;
+          }
+          await job.changeOwner(id, { newOwnerId: toOwnerId, reason }, req.user);
+          transferred++;
+          results.push({ jobId: id, status: 'transferred' });
+        } catch (e) {
+          failed++;
+          results.push({ jobId: id, status: 'failed', error: e.status ? e.message : 'transfer failed' });
+        }
+      }
+
+      modernOk(res, {
+        summary: { total: targetIds.length, transferred, failed, skipped },
+        results,
+      }, 'bulk owner transfer complete');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  }
+);
 
 // ─── Fulfillment hold ───────────────────────────────────────────────
 // Mirrors legacy `addEditFullFillmentHold` + `confirmFullfillmentHold`.

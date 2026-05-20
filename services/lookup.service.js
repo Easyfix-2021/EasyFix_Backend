@@ -51,6 +51,19 @@ async function verticals() {
   return rows;
 }
 
+// Zones — drives the Manage Jobs "Zonal" filter. tbl_zone_master has
+// no canonical active flag, but legacy convention treats every row as
+// usable. tbl_zone_city_mapping does the actual zone↔city resolution
+// at filter time; this endpoint is purely for the dropdown options.
+async function zones() {
+  const [rows] = await pool.query(
+    `SELECT zone_id, zone_name
+       FROM tbl_zone_master
+      ORDER BY zone_name ASC`
+  );
+  return rows;
+}
+
 // ─── Services ───────────────────────────────────────────────────────
 async function serviceCategories({ includeInactive = false } = {}) {
   const where = includeInactive ? '' : 'WHERE service_catg_status = 1';
@@ -356,4 +369,5 @@ module.exports = {
   banks,
   documentTypes,
   verticals,
+  zones,
 };

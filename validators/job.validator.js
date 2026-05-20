@@ -35,6 +35,26 @@ const listQuery = Joi.object({
   // row so the operator can see whether the caller is a repeat / which
   // services they've taken before / outstanding revisits.
   customerId: intId.optional(),
+  // Legacy "Filter Job" panel parity (2026-05-19). Each one is
+  // narrow + cheap (single column LIKE or FK eq). See service.list().
+  customerQ:  Joi.string().min(1).max(100).optional(),
+  clientRef:  Joi.string().min(1).max(100).optional(),
+  efrMobile:  Joi.string().min(1).max(20).optional(),
+  pin:        Joi.string().min(1).max(10).optional(),
+  stateId:    intId.optional(),
+  categoryId: intId.optional(),
+  verticalId: intId.optional(),
+  dateType:   Joi.string().valid('booked', 'scheduled', 'completed', 'ticket', 'requested').optional(),
+  // Phase-2 filters (2026-05-19).
+  //   rating  — exact match against tbl_easyfixer_rating_by_customer.customer_rating
+  //   reopen  — boolean: jobs with job_reopen_flag = 1
+  //   dueTo   — text token (customer|client|easyfix|technician) parsed
+  //             from the structured remarks prefix on tbl_job.remarks
+  //   zonalId — FK to tbl_zone_master via tbl_zone_city_mapping
+  rating:     Joi.number().integer().min(1).max(5).optional(),
+  reopen:     Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false', '1', '0')).optional(),
+  dueTo:      Joi.string().valid('customer', 'client', 'easyfix', 'technician').optional(),
+  zonalId:    intId.optional(),
   startDate: Joi.date().iso().optional(),
   endDate: Joi.date().iso().optional(),
   limit: Joi.number().integer().min(1).max(500).default(50),
