@@ -16,7 +16,14 @@ const logger = require('../logger');
  * Method is tinted so the eye can find it fast:
  *   GET cyan · POST green · PATCH/PUT yellow · DELETE red · OPTIONS gray
  *
- * CORS preflight (OPTIONS 2xx) suppressed unless LOG_LEVEL=debug.
+ * CORS preflight (OPTIONS 2xx) is suppressed UNCONDITIONALLY by default —
+ * automatic browser-level traffic with no application semantic and the
+ * loudest source of dev-log noise (every actual request gets a paired
+ * OPTIONS line on a different-origin frontend). To re-enable for
+ * debugging a CORS misconfiguration set `LOG_OPTIONS=true` in the env;
+ * a `LOG_LEVEL=debug` env alone is no longer enough (that gate was the
+ * old behaviour and still leaked OPTIONS when devs had debug on for
+ * other reasons).
  */
 
 const isTTY = process.stdout.isTTY;
@@ -50,7 +57,12 @@ module.exports = function httpLog(req, res, next) {
     const status = res.statusCode;
 
     if (req.method === 'OPTIONS' && status < 400) {
-      if (process.env.LOG_LEVEL === 'debug') logger.debug(`${status} OPTIONS ${path} (${duration} ms)`);
+      // Dedicated env knob — LOG_LEVEL=debug used to enable this and
+      // ended up making everyday dev logs unreadable. The new flag is
+      // off by default; flip to 'true' only when chasing a CORS bug.
+      if (String(process.env.LOG_OPTIONS).toLowerCase() === 'true') {
+        logger.debug(`${status} OPTIONS ${path} (${duration} ms)`);
+      }
       return;
     }
 
