@@ -93,23 +93,34 @@ router.get('/bulk-lookups', async (req, res, next) => {
       // + role_name so the FE can show "Name · Role" labels and the
       // operator can find the right row at a glance.
       //
-      // History: this used to go through userService.listUsers, which
-      // applies a hard `user_type_id = 5` filter and was capped at 1000.
-      // That hid real active users (e.g. sundeep@easyfix.in, user_id=2,
-      // role 1 / Default User) from the bulk-apply list. The operator
-      // explicitly asked for the full SELECT * FROM tbl_user WHERE
-      // user_status = 1 set, so we hit tbl_user directly. We still
-      // exclude role_id = 19 (Technician) because the CRM-side
-      // `tbl_user` rows for technicians are documented ghost accounts
-      // (~4,700 rows) — the real technician records live in
-      // tbl_easyfixer (see CLAUDE.md "Role model" + "tbl_easyfixer
-      // glossary"). Bulk-updating those ghosts would be meaningless.
+      // History (2026-05-21 — reversed):
+      //   We briefly hit tbl_user with only `user_status = 1` to expose
+      //   active rows that fell outside `user_type_id = 5` (e.g.
+      //   sundeep@easyfix.in, user_id=2 / Default User). Operator asked
+      //   us to revert: the Bulk Update Users list must only show
+      //   CRM-staff rows (`user_type_id = 5`). Legacy active accounts
+      //   like sundeep that don't carry user_type_id=5 are intentionally
+      //   hidden from this list now — bulk-applying CRM-shaped fields
+      //   (manage_clients, manage_states, etc.) to them was never
+      //   meaningful anyway.
+      //
+      //   The hardcoded `5` mirrors `INTERNAL_USER_TYPE_ID` in
+      //   services/user.service.js (kept inline rather than importing
+      //   to avoid a one-symbol cross-service require).
+      //
+      //   role_id = 19 (Technician) exclusion stays — those rows are
+      //   documented ghost accounts (~4,700) whose real records live
+      //   in tbl_easyfixer (see backend CLAUDE.md "Role model"). With
+      //   the user_type_id=5 filter on, this is largely redundant
+      //   (technician ghosts typically aren't user_type_id=5), but
+      //   it's a cheap safety belt.
       pool.query(
         `SELECT u.user_id AS id, u.user_name AS name,
                 u.official_email, r.role_name
            FROM tbl_user u
            LEFT JOIN tbl_role r ON r.role_id = u.user_role
           WHERE u.user_status = 1
+            AND u.user_type_id = 5
             AND (u.user_role IS NULL OR u.user_role <> 19)
           ORDER BY u.user_name ASC`,
       ).then(([r]) => r),
