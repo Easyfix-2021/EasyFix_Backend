@@ -87,31 +87,42 @@ async function clickToCall({ from, to }) {
   const apiKey = process.env.KALEYRA_API_KEY;
   if (!apiKey) return { delivered: false, error: 'KALEYRA_API_KEY not configured' };
 
-  // ── DEV-ONLY LEG OVERRIDES ──
-  // Each leg can be independently substituted via env. Production leaves
-  // BOTH unset → operator's real mobile + customer's real mobile go to
-  // Kaleyra (the production path). The overrides exist because Kaleyra
-  // click2call is a two-leg bridge — verifying that both legs ring
-  // requires two phones the developer can answer, and a single shared
-  // TEST_MOBILE (the SMS/WhatsApp pattern) can't express that.
+  // ── DEV-ONLY LEG OVERRIDES (env vars) ──
+  // Each leg can be independently substituted via env. Three-tier waterfall:
+  //   1. KALEYRA_CALLING_CUSTOM_NUMBER=true → QA mode. The route handler
+  //      has ALREADY substituted from/to with the FE-supplied values, and
+  //      this service must NOT clobber those with env vars (which might be
+  //      left over from a previous dev run). We short-circuit the env
+  //      overrides for this case.
+  //   2. KALEYRA_CALL_FROM / KALEYRA_CALL_TO set → dev mode. Substitute.
+  //   3. Neither set → production. Pass through.
+  // The overrides exist because Kaleyra click2call is a two-leg bridge —
+  // verifying that both legs ring requires two phones the developer can
+  // answer, and a single shared TEST_MOBILE (the SMS/WhatsApp pattern)
+  // can't express that.
   let caller   = callerReal;
   let receiver = receiverReal;
   const overrides = [];
 
-  const envFrom = process.env.KALEYRA_CALL_FROM;
-  if (envFrom && envFrom.trim()) {
-    const v = normaliseIndianPhone(envFrom);
-    if (v) { caller = v; overrides.push(`from=${callerReal}→${caller} (KALEYRA_CALL_FROM)`); }
-    else   logger.warn(`KALEYRA_CALL_FROM='${envFrom}' is not a valid Indian phone — ignored, using real caller.`);
-  }
-  const envTo = process.env.KALEYRA_CALL_TO;
-  if (envTo && envTo.trim()) {
-    const v = normaliseIndianPhone(envTo);
-    if (v) { receiver = v; overrides.push(`to=${receiverReal}→${receiver} (KALEYRA_CALL_TO)`); }
-    else   logger.warn(`KALEYRA_CALL_TO='${envTo}' is not a valid Indian phone — ignored, using real receiver.`);
-  }
-  if (overrides.length) {
-    logger.test(`Kaleyra dev-override · ${overrides.join(' · ')}`);
+  const customNumberMode =
+    String(process.env.KALEYRA_CALLING_CUSTOM_NUMBER).toLowerCase() === 'true';
+
+  if (!customNumberMode) {
+    const envFrom = process.env.KALEYRA_CALL_FROM;
+    if (envFrom && envFrom.trim()) {
+      const v = normaliseIndianPhone(envFrom);
+      if (v) { caller = v; overrides.push(`from=${callerReal}→${caller} (KALEYRA_CALL_FROM)`); }
+      else   logger.warn(`KALEYRA_CALL_FROM='${envFrom}' is not a valid Indian phone — ignored, using real caller.`);
+    }
+    const envTo = process.env.KALEYRA_CALL_TO;
+    if (envTo && envTo.trim()) {
+      const v = normaliseIndianPhone(envTo);
+      if (v) { receiver = v; overrides.push(`to=${receiverReal}→${receiver} (KALEYRA_CALL_TO)`); }
+      else   logger.warn(`KALEYRA_CALL_TO='${envTo}' is not a valid Indian phone — ignored, using real receiver.`);
+    }
+    if (overrides.length) {
+      logger.test(`Kaleyra dev-override · ${overrides.join(' · ')}`);
+    }
   }
 
   // ── HARD GUARD: caller == receiver ──

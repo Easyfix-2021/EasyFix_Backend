@@ -37,19 +37,162 @@ async function requireClickToCallAction(req, res, next) {
   } catch (e) { return next(e); }
 }
 
+/*
+ * First-4-digits masking helper. Used both by /preview (which masks the
+ * resolved real numbers before returning them) and by error logs / audit
+ * trails. Bullet character matches the FE's existing maskMobile() so the
+ * visual treatment is consistent across the stack.
+ */
+function maskFirstFour(raw) {
+  if (raw == null) return null;
+  const d = String(raw).replace(/\D/g, '');
+  if (!d) return null;
+  if (d.length <= 4) return d;
+  return d.slice(0, 4) + '•'.repeat(d.length - 4);
+}
+
+/* Resolve which mode the environment is in. Centralised so the constants
+ * stay single-sourced across the route file. */
+function callingMode() {
+  if (String(process.env.KALEYRA_CALLING_CUSTOM_NUMBER).toLowerCase() === 'true') return 'qa';
+  const f = (process.env.KALEYRA_CALL_FROM || '').trim();
+  const t = (process.env.KALEYRA_CALL_TO   || '').trim();
+  if (f && t) return 'dev';
+  return 'prod';
+}
+
+// ─── GET /config ─────────────────────────────────────────────────────
+// Tells the FE which calling mode the environment is in so it can render
+// the right confirmation flow:
+//   - promptForNumbers=true  → QA mode; FE shows two text inputs and the
+//                              operator supplies both Call From and Call To.
+//   - promptForNumbers=false → operator's real mobile + customer mobile go
+//                              to Kaleyra (dev env vars or production).
+// In QA mode also surfaces `qaDefaults` (env var values, UNMASKED — they're
+// operator-managed config, not user PII) so the dialog can pre-fill.
+// Permission-gated on isClickToCall so unauthorised operators can't probe.
+router.get('/config', requireClickToCallAction, (req, res) => {
+  const mode = callingMode();
+  const promptForNumbers = mode === 'qa';
+
+  // qaDefaults is ONLY populated in QA mode (we don't want the dev-env
+  // override values leaking to a production FE; in dev/prod the FE
+  // already uses /preview to get masked previews instead).
+  let qaDefaults = null;
+  if (promptForNumbers) {
+    const envFrom = (process.env.KALEYRA_CALL_FROM || '').trim();
+    const envTo   = (process.env.KALEYRA_CALL_TO   || '').trim();
+    if (envFrom || envTo) qaDefaults = { from: envFrom || null, to: envTo || null };
+  }
+
+  modernOk(res, { mode, promptForNumbers, qaDefaults });
+});
+
+// ─── GET /preview ────────────────────────────────────────────────────
+// Returns the EXACT numbers that the BE WOULD dial right now if
+// click-to-call were invoked with the supplied identifier. Both legs are
+// masked to first-4-digits-then-bullets so the unmasked digits never
+// cross the wire (same masking-everywhere convention as the rest of the
+// CRM — see CallableMobile and ClickToCallTab on the FE).
+//
+// Returns mode alongside so the FE can label "Real numbers" vs "Dev
+// override" vs "QA mode default" in the confirm dialog if it wants to.
+//
+// Permission-gated like every other /admin/calls route.
+router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'), async (req, res, next) => {
+  try {
+    // Reuse the existing callListQuery validator since it already permits
+    // jobId / customerId / page / limit and silently strips unknowns; we
+    // only consume jobId/customerId here.
+    const { jobId, customerId } = req.query;
+    if (!jobId && !customerId) {
+      return modernError(res, 400, 'jobId or customerId required');
+    }
+
+    // Resolve receiver real-mobile via the same join the POST handler uses
+    // (kept in sync deliberately — if you change one query, change both).
+    let receiverReal = null;
+    if (jobId) {
+      const [[job]] = await pool.query(
+        `SELECT c.customer_mob_no
+           FROM tbl_job j
+      LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
+          WHERE j.job_id = ?
+          LIMIT 1`,
+        [jobId]
+      );
+      if (!job) return modernError(res, 404, `Job ${jobId} not found`);
+      receiverReal = job.customer_mob_no || null;
+    } else {
+      const [[cust]] = await pool.query(
+        `SELECT customer_mob_no FROM tbl_customer WHERE customer_id = ? LIMIT 1`,
+        [customerId]
+      );
+      if (!cust) return modernError(res, 404, `Customer ${customerId} not found`);
+      receiverReal = cust.customer_mob_no || null;
+    }
+
+    // Apply the same three-tier waterfall as the POST handler + service
+    // so the preview matches what would actually be dialled. QA mode falls
+    // through to the env defaults if they're populated (they'll be the
+    // dialog's pre-fill values); empty QA falls through to real numbers.
+    const mode = callingMode();
+    const envFrom = (process.env.KALEYRA_CALL_FROM || '').trim() || null;
+    const envTo   = (process.env.KALEYRA_CALL_TO   || '').trim() || null;
+    const callerEffective = (mode === 'dev' || (mode === 'qa' && envFrom))
+      ? envFrom
+      : (req.user.mobile_no || null);
+    const receiverEffective = (mode === 'dev' || (mode === 'qa' && envTo))
+      ? envTo
+      : receiverReal;
+
+    modernOk(res, {
+      mode,
+      dialFrom: maskFirstFour(callerEffective),
+      dialTo:   maskFirstFour(receiverEffective),
+    });
+  } catch (e) { next(e); }
+});
+
 // ─── POST /click-to-call ─────────────────────────────────────────────
 router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
-    const { jobId, customerId } = req.body;
+    const { jobId, customerId, callFrom, callTo } = req.body;
     const agent = req.user;
 
-    // Agent mobile guard — operator must have filled in their profile.
-    if (!agent.mobile_no || String(agent.mobile_no).replace(/\D/g, '').length < 10) {
+    // Three-tier number-resolution waterfall:
+    //   1. QA prompt mode → FE MUST supply both callFrom + callTo, BE uses them.
+    //   2. Flag OFF + FE sent override numbers → 400 (anti-spoofing).
+    //   3. Otherwise → resolve real numbers (req.user.mobile_no + customer lookup).
+    const isCustomNumberMode =
+      String(process.env.KALEYRA_CALLING_CUSTOM_NUMBER).toLowerCase() === 'true';
+
+    if (!isCustomNumberMode && (callFrom || callTo)) {
+      // Defence in depth: even though the FE shouldn't send these when the
+      // flag is off (it queries /config first), any user crafting their own
+      // POST could try. Reject explicitly so privilege escalation isn't
+      // silently accepted via stripUnknown.
+      return modernError(res, 400, 'Custom caller/receiver numbers are not allowed in this environment.');
+    }
+    if (isCustomNumberMode && (!callFrom || !callTo)) {
+      return modernError(res, 400, 'Both Call From and Call To are required in QA mode.');
+    }
+
+    // Agent mobile guard — only required when we're going to fall back to
+    // it. In QA-prompt mode the FE-supplied callFrom takes the operator's
+    // place, so an operator without a profile mobile can still place calls
+    // in QA. Production / dev-env-override modes still require it.
+    if (!isCustomNumberMode &&
+        (!agent.mobile_no || String(agent.mobile_no).replace(/\D/g, '').length < 10)) {
       return modernError(res, 400, 'Your profile does not have a valid mobile number. Update your profile before placing calls.');
     }
 
     // ── Resolve receiver mobile + name + (optional) job context ──
-    // FE never sends the mobile — we always look it up server-side.
+    // FE never sends the customer mobile — we always look it up server-side
+    // (even in QA mode, we still record the canonical customer ref in
+    // tbl_job_caller_info; the Call To the FE supplied is only used as the
+    // actual dial target, not as the persisted "this is who we called"
+    // value).
     let receiverMobile;
     let receiverName;
     let receiverCustomerId = null;
@@ -96,9 +239,16 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     }
 
     // ── Place the Kaleyra call ──
+    // In QA mode the operator typed both numbers; everywhere else we use
+    // the resolved real values. The service layer's env-var overrides
+    // (KALEYRA_CALL_FROM / KALEYRA_CALL_TO) also fire here — but only
+    // when KALEYRA_CALLING_CUSTOM_NUMBER is OFF (the service has its own
+    // short-circuit so the FE-supplied values aren't clobbered).
+    const dialFrom = isCustomNumberMode ? callFrom : agent.mobile_no;
+    const dialTo   = isCustomNumberMode ? callTo   : receiverMobile;
     const callResult = await kaleyra.clickToCall({
-      from: agent.mobile_no,
-      to:   receiverMobile,
+      from: dialFrom,
+      to:   dialTo,
     });
 
     if (!callResult.delivered) {

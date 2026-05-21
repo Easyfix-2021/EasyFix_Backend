@@ -21,6 +21,13 @@ const intId = Joi.number().integer().positive();
 const clickToCallBody = Joi.object({
   jobId: intId,
   customerId: intId,
+  // QA-MODE ONLY — when KALEYRA_CALLING_CUSTOM_NUMBER=true the FE prompts
+  // the operator for both legs and forwards them here. The route handler
+  // rejects these fields when the flag is OFF, so even though Joi accepts
+  // the shape, defence-in-depth prevents privilege escalation in dev/prod.
+  // Pattern matches the rest of the codebase: 10-12 digit Indian numbers.
+  callFrom: Joi.string().pattern(/^[0-9]{10,12}$/),
+  callTo:   Joi.string().pattern(/^[0-9]{10,12}$/),
 }).xor('jobId', 'customerId');
 
 /*
