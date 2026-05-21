@@ -11,6 +11,7 @@ const routes = require('./routes');
 const { notFound, errorHandler } = require('./middleware/error-handler');
 const { rateLimit } = require('./middleware/rate-limit');
 const httpLog = require('./middleware/http-log');
+const scheduler = require('./server/scheduler');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '5100', 10);
@@ -82,10 +83,17 @@ async function start() {
     if (String(process.env.NOTIFICATIONS_DISABLE).toLowerCase() === 'true') {
       logger.test(`Notifications DISABLED — no real SMS / email / WhatsApp / push will be sent.`);
     }
+    // Register cron jobs only AFTER the HTTP listener is up — guarantees
+    // a job can't fire before the app is healthy enough to serve dependent
+    // queries. CRON_DISABLED=true env flag short-circuits inside init().
+    scheduler.init();
   });
 
   const shutdown = async (signal) => {
     logger.shutdown(`Shutdown requested (${signal}) — closing connections gracefully…`);
+    // Stop cron BEFORE closing the HTTP server so an in-flight cron task
+    // doesn't keep the pool alive past closePool().
+    scheduler.stop();
     server.close(async () => {
       await closePool().catch(() => {});
       logger.shutdown('Server stopped. Goodbye.');

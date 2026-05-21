@@ -51,6 +51,7 @@ router.use('/advances',        require('./advances'));
 router.use('/clients',         require('./clients'));
 router.use('/customers',       require('./customers'));
 router.use('/call-info',       require('./call-info'));
+router.use('/calls',           require('./calls'));
 router.use('/menus',           require('./menus'));
 router.use('/products',        require('./products'));
 router.use('/users',           require('./users'));
