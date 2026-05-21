@@ -1,6 +1,22 @@
 const logger = require('../logger');
 
 /*
+ * ⚠️  STALE — no longer wired into any caller as of 2026-05-21.
+ *
+ * All WhatsApp delivery now flows through services/meta.whatsapp.service.js
+ * (direct Meta Cloud API). This Gallabox path is retained ONLY as a
+ * reference for the legacy template registry and as a fallback if the Meta
+ * cutover ever needs to be reversed. The dependents that used to call
+ * sendTemplate() here — orchestrator, otp-delivery, admin notifications
+ * test route — have been switched over.
+ *
+ * If you find yourself adding a require('./gallabox.whatsapp.service')
+ * somewhere, stop and use the Meta service instead unless you have an
+ * explicit need to send through the BSP (e.g. a template that Meta
+ * hasn't approved yet but Gallabox has).
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ *
  * WhatsApp delivery via Gallabox template API.
  * Legacy contract replicated from ACD_APIs/.../WhatsNotificationUtil.java:
  *   POST https://server.gallabox.com/devapi/messages/whatsapp

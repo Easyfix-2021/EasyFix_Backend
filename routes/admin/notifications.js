@@ -6,7 +6,7 @@ router.use(require('./notifications-inbox'));
 const validate = require('../../middleware/validate');
 const sms = require('../../services/sms.service');
 const email = require('../../services/email.service');
-const whatsapp = require('../../services/whatsapp.service');
+const whatsapp = require('../../services/meta.whatsapp.service');
 const fcm = require('../../services/fcm.service');
 const { modernOk, modernError } = require('../../utils/response');
 const { testBody } = require('../../validators/notification.validator');
@@ -19,7 +19,8 @@ const { testBody } = require('../../validators/notification.validator');
  * Bodies:
  *   { channel: "sms",      to: "9812345678", message: "…" }
  *   { channel: "email",    to: "x@y.com",   subject: "…", body: "…" }
- *   { channel: "whatsapp", to: "9812345678", templateName: "…", recipientName: "…", bodyValues: {…} }
+ *   { channel: "whatsapp", to: "9812345678", templateName: "…", recipientName: "…", variables: { "1": "…", "2": "…" } }
+ *     (legacy `bodyValues` is still accepted as an alias for `variables` — see validator)
  *   { channel: "fcm",      to: "<fcm-token>", title: "…", pushBody: "…", data: {…} }
  */
 router.post('/test', validate(testBody), async (req, res, next) => {
@@ -36,11 +37,18 @@ router.post('/test', validate(testBody), async (req, res, next) => {
         });
         break;
       case 'whatsapp':
+        // Accept either `variables` (Meta-native, preferred) or the legacy
+        // `bodyValues` key for backward compat with any external probe scripts
+        // that pre-date the Gallabox→Meta swap. The Meta service only reads
+        // numeric keys, so map-style keys (e.g. {customerName:"X"}) silently
+        // drop their non-numeric entries — caller's responsibility.
         result = await whatsapp.sendTemplate({
           to,
           recipientName: req.body.recipientName,
           templateName: req.body.templateName,
-          bodyValues: req.body.bodyValues,
+          variables: req.body.variables ?? req.body.bodyValues,
+          headerVariables: req.body.headerVariables,
+          languageCode: req.body.languageCode,
         });
         break;
       case 'fcm':

@@ -1,7 +1,7 @@
 const logger = require('../logger');
 const smsService = require('./sms.service');
 const emailService = require('./email.service');
-const whatsappService = require('./whatsapp.service');
+const whatsappService = require('./meta.whatsapp.service');
 const smsTemplate = require('./sms-template.service');
 
 /*
@@ -107,14 +107,16 @@ function buildOtpEmailHtml(otp) {
 async function tryWhatsApp({ mobile, name, otp }) {
   if (!mobile) return { delivered: false, skipped: 'no mobile' };
   try {
-    // Gallabox templates may use either named ({{otp}}) or positional ({{1}})
-    // placeholders — we can't introspect from the API, so pass both. Unused keys
-    // are ignored silently by the template renderer.
+    // Meta Cloud API uses positional placeholders ({{1}}, {{2}}, …) — there's
+    // no named-key option, so the OTP must land at position 1. The template
+    // referenced by WA_TEMPLATE needs to be approved under our own WABA with
+    // a single body variable. If you re-add named templates later, you'll
+    // need to also re-pass the named key — Meta does not support it.
     return await whatsappService.sendTemplate({
       to: mobile,
       recipientName: name || '',
       templateName: WA_TEMPLATE,
-      bodyValues: { otp: String(otp), '1': String(otp) },
+      variables: { 1: String(otp) },
     });
   } catch (e) { return { delivered: false, error: e.message }; }
 }

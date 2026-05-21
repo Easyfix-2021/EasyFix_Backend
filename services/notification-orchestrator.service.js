@@ -2,7 +2,7 @@ const logger = require('../logger');
 const inbox = require('./notification-inbox.service');
 const smsService = require('./sms.service');
 const emailService = require('./email.service');
-const whatsappService = require('./whatsapp.service');
+const whatsappService = require('./meta.whatsapp.service');
 const fcmService = require('./fcm.service');
 
 /*
