@@ -3,21 +3,31 @@ const router = require('express').Router();
 const requireAuth = require('../../middleware/auth');
 const { role } = require('../../middleware/role');
 const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+const maskMobile = require('../../middleware/mask-mobile');
 const { pool } = require('../../db');
 
 /*
  * Every /api/admin/* sub-resource inherits these gates:
- *   - requireAuth   → valid JWT, fresh tbl_user row on req.user
- *   - role(['admin']) → user_role must classify to 'admin' group
- *   - scope attach  → computes the hierarchy-unioned scope ONCE per
- *                     request and stashes on req.scope. Downstream
- *                     handlers + assertEntityInScope read this.
+ *   - requireAuth         → valid JWT, fresh tbl_user row on req.user
+ *   - role(['admin'])     → user_role must classify to 'admin' group
+ *   - scope attach        → computes the hierarchy-unioned scope ONCE per
+ *                           request and stashes on req.scope. Downstream
+ *                           handlers + assertEntityInScope read this.
+ *   - maskMobile          → wraps res.json so every mobile-bearing field
+ *                           (customer_mob_no, mobile_no, efr_no, caller,
+ *                           reciever, …) ships as "first 4 digits + bullets"
+ *                           to the operator's browser. Edit forms opt out
+ *                           with ?unmasked=true. NOT applied to
+ *                           /integration/v1/* or /webhook/* — those mount
+ *                           separately and intentionally keep the legacy
+ *                           contract.
  *
  * Fine-grained role restrictions (e.g. finance-only reports) layer on with
  * roleByName() at the sub-route level.
  */
 router.use(requireAuth);
 router.use(role(['admin']));
+router.use(maskMobile);
 router.use(async (req, _res, next) => {
   // Hierarchy-aware scope: own manage_* ∪ every direct/indirect report's
   // manage_*. Bypass roles (Admin/Finance) get `undefined` = no row filter.

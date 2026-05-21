@@ -102,15 +102,17 @@ router.get('/config', requireClickToCallAction, (req, res) => {
 router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'), async (req, res, next) => {
   try {
     // Reuse the existing callListQuery validator since it already permits
-    // jobId / customerId / page / limit and silently strips unknowns; we
-    // only consume jobId/customerId here.
-    const { jobId, customerId } = req.query;
-    if (!jobId && !customerId) {
-      return modernError(res, 400, 'jobId or customerId required');
+    // jobId / customerId / efrId / reportingContactId / page / limit and
+    // silently strips unknowns. /preview consumes whichever of the four
+    // identifiers the FE supplied — matching the click-to-call branches.
+    const { jobId, customerId, efrId, reportingContactId } = req.query;
+    if (!jobId && !customerId && !efrId && !reportingContactId) {
+      return modernError(res, 400, 'one of jobId/customerId/efrId/reportingContactId is required');
     }
 
-    // Resolve receiver real-mobile via the same join the POST handler uses
-    // (kept in sync deliberately — if you change one query, change both).
+    // Resolve receiver real-mobile via the same lookups the POST handler
+    // uses (kept in sync deliberately — if you change one set of queries,
+    // change both).
     let receiverReal = null;
     if (jobId) {
       const [[job]] = await pool.query(
@@ -123,13 +125,27 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
       );
       if (!job) return modernError(res, 404, `Job ${jobId} not found`);
       receiverReal = job.customer_mob_no || null;
-    } else {
+    } else if (customerId) {
       const [[cust]] = await pool.query(
         `SELECT customer_mob_no FROM tbl_customer WHERE customer_id = ? LIMIT 1`,
         [customerId]
       );
       if (!cust) return modernError(res, 404, `Customer ${customerId} not found`);
       receiverReal = cust.customer_mob_no || null;
+    } else if (efrId) {
+      const [[efr]] = await pool.query(
+        `SELECT efr_no FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`,
+        [efrId]
+      );
+      if (!efr) return modernError(res, 404, `Easyfixer ${efrId} not found`);
+      receiverReal = efr.efr_no || null;
+    } else {
+      const [[ct]] = await pool.query(
+        `SELECT contact_no FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
+        [reportingContactId]
+      );
+      if (!ct) return modernError(res, 404, `Contact ${reportingContactId} not found`);
+      receiverReal = ct.contact_no || null;
     }
 
     // Apply the same three-tier waterfall as the POST handler + service
@@ -157,7 +173,7 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
 // ─── POST /click-to-call ─────────────────────────────────────────────
 router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
-    const { jobId, customerId, callFrom, callTo } = req.body;
+    const { jobId, customerId, efrId, reportingContactId, callFrom, callTo } = req.body;
     const agent = req.user;
 
     // Three-tier number-resolution waterfall:
@@ -224,7 +240,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       jobIdToStore        = job.job_id;
       jobStatusSnapshot   = job.job_status;
       jobEfrId            = job.fk_easyfixter_id || null;
-    } else {
+    } else if (customerId) {
       // customerId path — customer-only call, no associated job row
       const [[cust]] = await pool.query(
         `SELECT customer_id, customer_name, customer_mob_no
@@ -236,6 +252,37 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       receiverMobile     = cust.customer_mob_no;
       receiverName       = cust.customer_name || null;
       receiverCustomerId = cust.customer_id;
+    } else if (efrId) {
+      // Technician dial. efr_no is the canonical mobile column on
+      // tbl_easyfixer (despite the field name — see backend CLAUDE.md
+      // "tbl_easyfixer glossary"). receiverCustomerId stays null since
+      // a tech is not a customer; the audit row's reciever_id will
+      // capture the efr_id-as-int instead via the persistence layer.
+      const [[efr]] = await pool.query(
+        `SELECT efr_id, efr_first_name, efr_last_name, efr_no
+           FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`,
+        [efrId]
+      );
+      if (!efr) return modernError(res, 404, `Easyfixer ${efrId} not found`);
+      if (!efr.efr_no) return modernError(res, 400, `Easyfixer ${efrId} has no mobile on file`);
+      receiverMobile     = efr.efr_no;
+      receiverName       = [efr.efr_first_name, efr.efr_last_name].filter(Boolean).join(' ').trim() || null;
+      receiverCustomerId = null;
+    } else {
+      // reportingContactId path — call a client SPOC directly. Resolves
+      // mobile from tbl_client_contacts (the canonical SPOC table). The
+      // legacy tbl_job.client_spoc text column duplicates this number but
+      // we prefer the FK source for accuracy.
+      const [[ct]] = await pool.query(
+        `SELECT id, contact_name, contact_no
+           FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
+        [reportingContactId]
+      );
+      if (!ct) return modernError(res, 404, `Contact ${reportingContactId} not found`);
+      if (!ct.contact_no) return modernError(res, 400, `Contact ${reportingContactId} has no mobile on file`);
+      receiverMobile     = ct.contact_no;
+      receiverName       = ct.contact_name || null;
+      receiverCustomerId = null;
     }
 
     // ── Place the Kaleyra call ──

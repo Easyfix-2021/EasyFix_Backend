@@ -19,8 +19,17 @@ const intId = Joi.number().integer().positive();
  * rather than a generic "value not allowed" — better DX for ops.
  */
 const clickToCallBody = Joi.object({
-  jobId: intId,
-  customerId: intId,
+  // Four supported receiver-identifier shapes — the BE looks up the
+  // actual mobile from the appropriate table and never trusts a
+  // FE-supplied mobile string:
+  //   jobId               → tbl_job.customer_mob_no (customer of a job)
+  //   customerId          → tbl_customer.customer_mob_no
+  //   efrId               → tbl_easyfixer.efr_no (technician)
+  //   reportingContactId  → tbl_client_contacts.contact_no (client SPOC)
+  jobId:              intId,
+  customerId:         intId,
+  efrId:              intId,
+  reportingContactId: intId,
   // QA-MODE ONLY — when KALEYRA_CALLING_CUSTOM_NUMBER=true the FE prompts
   // the operator for both legs and forwards them here. The route handler
   // rejects these fields when the flag is OFF, so even though Joi accepts
@@ -28,7 +37,7 @@ const clickToCallBody = Joi.object({
   // Pattern matches the rest of the codebase: 10-12 digit Indian numbers.
   callFrom: Joi.string().pattern(/^[0-9]{10,12}$/),
   callTo:   Joi.string().pattern(/^[0-9]{10,12}$/),
-}).xor('jobId', 'customerId');
+}).xor('jobId', 'customerId', 'efrId', 'reportingContactId');
 
 /*
  * Call-history list query (modal tab + future drill-downs).
@@ -39,6 +48,11 @@ const clickToCallBody = Joi.object({
 const callListQuery = Joi.object({
   jobId: intId.optional(),
   customerId: intId.optional(),
+  // /preview also accepts efrId / reportingContactId for tech + SPOC
+  // call resolution. The /list endpoint ignores them (history is
+  // anchored to job/customer); /preview branches on whichever is set.
+  efrId: intId.optional(),
+  reportingContactId: intId.optional(),
   dateFrom: Joi.string().max(40).optional(),
   dateTo:   Joi.string().max(40).optional(),
   page:     Joi.number().integer().min(1).default(1),
