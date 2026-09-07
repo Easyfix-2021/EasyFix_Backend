@@ -60,6 +60,15 @@ concurrency:
   group: deploy-${{ github.ref_name }}
   cancel-in-progress: true
 
+# The suite runs in UTC, matching the container. This is DECLARED rather than
+# inherited: a github-hosted runner happens to be UTC today, and the whole point
+# of pinning it is that the tests must not depend on where they run. Mirrors the
+# TZ=UTC prefix on the npm scripts, so a developer's local run and this one
+# answer the same question — a date bug that only shows in one zone shipped to
+# production once because they did not.
+env:
+  TZ: UTC
+
 jobs:
   precheck:
     name: Lint & syntax check
