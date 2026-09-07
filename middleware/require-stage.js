@@ -21,7 +21,15 @@
  *   'status'     → target = Number(req.body.status)  (explicit status change)
  *   'assign'     → target = 1 (SCHEDULED)            (direct assign schedules the job)
  *   'offer'      → target = 1 (SCHEDULED)            (offer intends to schedule)
+ *   'checkin'    → target = 2 (IN_PROGRESS)          (ops check-in; fixed target)
  *   'reschedule' → NO status change; require the job's CURRENT stage be visible.
+ *
+ * 'checkin' exists because the ops check-in route (POST /admin/jobs/:id/checkin)
+ * carries no `status` in its body — it only ever means 2. Reusing 'status' there
+ * would read `Number(undefined)` → NaN, which maps to no stage and so denies
+ * EVERY restricted caller, including the `pending-start` grant the feature is
+ * for (that stage declares 2 as a target). Same shape as 'assign'/'offer': a
+ * route whose target is fixed states it here rather than through the body.
  *
  * Bypass roles (Admin/Finance) and unrestricted users resolve to
  * req.allowedStages.mode === 'all' (set in routes/admin/index.js) → no-op.
@@ -31,9 +39,10 @@ const { modernError } = require('../utils/response');
 const { transitionAllowed, stageVisible } = require('../lib/job-stages');
 
 const SCHEDULED = 1; // tbl_job.job_status SCHEDULED — the effective target of assign/offer.
+const IN_PROGRESS = 2; // tbl_job.job_status IN_PROGRESS — the fixed target of the ops check-in.
 
 function requireStageForTransition(kind) {
-  if (!['status', 'assign', 'offer', 'reschedule'].includes(kind)) {
+  if (!['status', 'assign', 'offer', 'reschedule', 'checkin'].includes(kind)) {
     throw new Error(`requireStageForTransition(): unknown kind "${kind}"`);
   }
 
@@ -54,7 +63,9 @@ function requireStageForTransition(kind) {
       return next();
     }
 
-    const target = kind === 'status' ? Number(req.body?.status) : SCHEDULED;
+    const target = kind === 'status'  ? Number(req.body?.status)
+      : kind === 'checkin' ? IN_PROGRESS
+        : SCHEDULED;
     if (!transitionAllowed(allowed, source, target)) {
       return modernError(res, 403, 'You are not allowed to move this job to that stage.');
     }

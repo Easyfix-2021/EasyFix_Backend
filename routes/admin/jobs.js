@@ -2672,6 +2672,188 @@ router.post('/:id/resend-customer-pin',
   },
 );
 
+// ─── Ops check-in (on the assigned technician's behalf) ──────────────
+/*
+ * POST /jobs/:id/checkin
+ *
+ * WHY IT EXISTS
+ *   Check-in is the TAT anchor: `checkin_date_time` starts Segment 2 and
+ *   `fk_checkin_by` says whose visit it was. The only CRM path that reached
+ *   status 2 was PATCH /:id/status {status:2}, which moves the code and writes
+ *   NEITHER — so every job started from My Orders → Pending to Start looked, to
+ *   every downstream report, like a visit that never began. Ops needs the
+ *   escape hatch (dead phone, app not installed, technician mid-drive), and the
+ *   escape hatch has to leave the same trail the app leaves.
+ *
+ * WHOSE ID GOES IN fk_checkin_by
+ *   The JOB'S OWN technician — `tbl_job.fk_easyfixter_id` — never the operator.
+ *   Same resolution as POST /:id/resend-customer-pin above: satisfy the
+ *   technician-shaped contract by passing the job's real technician rather than
+ *   by adding a staff bypass to it. This matches the one other live writer,
+ *   routes/mobile/index.js POST /jobs/:id/checkin, which stamps req.tech.efr_id.
+ *
+ *   ⚠ THE COLUMN'S HISTORICAL CONTENTS ARE A DIFFERENT ID SPACE, measured
+ *   2026-09-08 on `easyfix`: of 307,293 populated rows joinable to their
+ *   technician, 223,012 hold `tbl_easyfixer.user_id` (the technician's
+ *   tbl_user id) and exactly ONE holds an efr_id. Every one of the 1,799
+ *   distinct values is a valid tbl_user.user_id. So legacy stored the
+ *   TECHNICIAN, but by their tbl_user id — not, as is sometimes assumed, an
+ *   operator. All 348,626 of those rows predate cutover (newest check-in
+ *   2026-04-29); this backend has written the column zero times so far.
+ *   Writing an efr_id here therefore agrees with the current code and
+ *   disagrees with the history, and any report joining fk_checkin_by to
+ *   tbl_user will mis-resolve the new rows. That is a decision for the mobile
+ *   route (which set the precedent) and this one TOGETHER — flagged, not
+ *   silently forked: what must never happen is the CRM and the app disagreeing
+ *   about which id a check-in records.
+ *
+ * SO HOW IS "OPS DID THIS" RECOVERABLE?
+ *   From the two rows this writes, not from a flag column (there is none, and
+ *   adding one to a shared legacy table is not on the table):
+ *     - tbl_job_logs 'status change' — actor is `req.user`, so job-log's
+ *       resolveActor puts the operator's user_id in `changed_by` with
+ *       comments 'Changed by New CRM'. A technician check-in lands
+ *       changed_by = 0 / 'Changed by App', so the two are never confusable.
+ *     - tbl_job_comment comment_on = 2 (check_in) carrying the REASON, with
+ *       commented_by = the operator. No LIVE writer produces a 2: the 108,118
+ *       existing rows are all legacy, newest 2026-04-28, none since cutover
+ *       (measured 2026-09-08). So a 2 dated after cutover is unambiguously an
+ *       ops check-in with a typed justification.
+ *
+ * WHY THE REASON IS REQUIRED
+ *   An ops check-in moves an SLA anchor for work the operator did not witness.
+ *   The one thing that makes that auditable rather than merely convenient is a
+ *   sentence saying why it wasn't the technician. Joi enforces it; there is no
+ *   default and no blank.
+ *
+ * NO COORDINATES, DELIBERATELY. The operator is not at the site, so
+ *   checkin_gps_location / checkin_address / checkin_pincode are simply not
+ *   passed (setStatus skips an absent extra rather than NULLing it, so a
+ *   technician's earlier reading survives). Nothing here touches the arrival
+ *   geofence either — that lives on the reached-location/selfie path
+ *   (mobile-job-lifecycle.saveSelfie), behind `if (device)`, and is not on the
+ *   check-in path at all.
+ *
+ * checkin_date_time is WRITE-ONCE in setStatus (WRITE_ONCE_EXTRAS → COALESCE),
+ *   so an ops check-in AFTER a technician's cannot move the anchor forward.
+ */
+const opsCheckinBody = require('joi').object({
+  reason: require('joi').string().trim().min(1).max(500).required(),
+});
+
+router.post('/:id/checkin',
+  validate(idParam, 'params'),
+  validate(opsCheckinBody),
+  scopedJob,
+  // Fixed target 2 — see the 'checkin' kind in middleware/require-stage.js.
+  requireStageForTransition('checkin'),
+  requireAction('isJobStatusChange'),
+  async (req, res, next) => {
+    try {
+      const jobId  = Number(req.params.id);
+      const efrId  = Number(req.scopedJob.fk_easyfixter_id || 0);
+      const source = Number(req.scopedJob.job_status);
+      logger.info('Ops check-in · jobId=' + jobId + ' by userId=' + (req.user?.user_id ?? '-'));
+
+      // No technician = nobody whose visit this could be, so there is no id to
+      // put in fk_checkin_by. Passing NULL would satisfy nothing and leave the
+      // anchor attributed to no one — refuse with the action to take instead.
+      if (!efrId) {
+        logger.warn('Ops check-in refused · jobId=' + jobId + ' · no technician assigned');
+        return modernError(
+          res,
+          409,
+          'No technician is assigned to this job yet — assign one, then check the job in',
+        );
+      }
+      // SCHEDULED only. A job already in progress has its anchor (and a second
+      // call could not move it anyway); anything else has not been scheduled.
+      if (source !== 1 /* SCHEDULED */) {
+        logger.warn('Ops check-in refused · jobId=' + jobId + ' · job_status=' + source);
+        return modernError(
+          res,
+          409,
+          'Only a scheduled job can be checked in — this job is in status ' + source,
+        );
+      }
+
+      /*
+       * fk_checkin_by IS A tbl_user.user_id — MEASURED, not inferred.
+       *
+       * Counted on the live schema 2026-09-08, joining each job to its own
+       * technician: of 348,619 populated rows, 223,012 equal
+       * tbl_easyfixer.user_id and 29 equal efr_id — and those 29 are noise,
+       * since the two id ranges overlap and membership is not identity. The
+       * legacy CRM agrees, rendering the actor through
+       * `LEFT JOIN tbl_user checkIn_by ON checkIn_by.user_id = J.fk_checkin_by`.
+       *
+       * So the value is the TECHNICIAN'S CRM user id, not their efr_id. Every
+       * populated row predates cutover (newest 2026-04-29) and this backend has
+       * written the column zero times, so nothing has forked yet — an efr_id
+       * here would open a second namespace in a column with 348k consistent
+       * rows, and resolve to a DIFFERENT PERSON wherever it is joined.
+       *
+       * NOTE: routes/mobile/index.js still writes req.tech.efr_id here. That is
+       * the same defect and it has also never fired; it needs the same fix, but
+       * it is the technician app's path and is not changed from here.
+       */
+      // Required here, not at module scope — the convention this file already
+      // follows (see the other handlers that touch the pool directly).
+      const { pool } = require('../../db');
+      const [[tech]] = await pool.query(
+        'SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [efrId],
+      );
+      const checkinById = Number(tech?.user_id || 0);
+      if (!checkinById) {
+        /*
+         * A technician with no tbl_user row cannot be represented in this
+         * column. Refuse rather than stamp 0, which would read as "no one" and
+         * silently detach the TAT anchor from whoever actually attended.
+         */
+        logger.warn('Ops check-in refused · jobId=' + jobId + ' · efr=' + efrId + ' has no tbl_user row');
+        return modernError(
+          res,
+          409,
+          'This technician has no CRM user record, so the check-in cannot be attributed — contact support',
+        );
+      }
+
+      const updated = await job.setStatus(
+        jobId,
+        { status: 2 /* IN_PROGRESS */, extras: { fk_checkin_by: checkinById, checkin_date_time: new Date() } },
+        req.user, // no efr_id → job-log records the OPERATOR, not the technician
+      );
+
+      /*
+       * FAIL OPEN, and after the transition — same rule as the cancel audit
+       * comment in setStatus() and the history row on /resend-customer-pin. The
+       * status has already committed; a comment failure must not turn that into
+       * a 500 that has ops press the button again on a job that is already
+       * checked in. The reason is then only in the warn line below, which is
+       * the cost of not double-checking-in a job.
+       */
+      try {
+        await jobComments.addComment(jobId, {
+          comments: req.body.reason,
+          comment_on: 2, // check_in
+          commented_by: req.user?.user_id ?? null,
+        });
+      } catch (ce) {
+        logger.warn('Ops check-in reason comment failed (non-fatal) · jobId=' + jobId
+          + ' · reason=' + req.body.reason + ' · ' + ce.message);
+      }
+
+      logger.info('Ops check-in done · jobId=' + jobId + ' · status->IN_PROGRESS · efrId=' + efrId);
+      // Same payload as PATCH /:id/status (the refreshed job) so the CRM reuses
+      // its existing refresh path rather than growing a second one.
+      return modernOk(res, updated, 'job checked in');
+    } catch (e) {
+      logger.warn('Ops check-in failed · jobId=' + req.params.id + ' · ' + e.message);
+      return next(e);
+    }
+  },
+);
+
 // ─── Job Feedback sub-resource (legacy tbl_customer_feedback) ─────────
 const jobFeedback = require('../../services/job-feedback.service');
 // VERIFIED against tbl_customer_feedback (see services/job-feedback.service.js).
