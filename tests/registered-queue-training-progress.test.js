@@ -75,20 +75,46 @@ test('training progress is the MINIMUM across the required set, not one video', 
   }
 });
 
-test('the required set is the global catalogue plus HELD mandatory courses', async () => {
+// The arms of the derived pair list, one string each.
+function requiredSetArms(sql) {
+  const m = sql.match(/FROM \(([\s\S]*?)\n\s*\) m\b/);
+  assert.ok(m, 'the required-set subquery is missing');
+  return m[1].split(/\bUNION\b/i);
+}
+
+test('the required set is what the APP LISTS, not only the mandatory subset', async () => {
   /*
-   * Mirrors lms.mandatoryVideoIdsSql(), which is the set the technician's own
-   * registration gate counts. The two must not diverge: the operator acting on
-   * "Pending Member Verification" and the app deciding whether the technician
-   * may earn are answering the same question.
+   * Mirrors lms.visibleVideoIdsSql(), which is the set GET
+   * /api/mobile/training-videos returns and the set the app's Next button
+   * gates on (every listed row at 100). The two must not diverge: the operator
+   * acting on "Pending Member Verification" and the app deciding whether the
+   * technician may work are answering the same question.
    *
-   * `easyfixer_courses` (HELD), not `courses.is_mandatory` alone: flagging a
-   * course mandatory must not retro-gate technicians it was never assigned to.
+   * Mirroring mandatoryVideoIdsSql() instead — a strict subset — is the defect
+   * this replaced: a technician holding a NON-mandatory course with an
+   * unwatched video is blocked by the app while this queue calls him complete,
+   * so ops early-activate someone who cannot then work.
+   *
+   * `easyfixer_courses` (HELD) in both course arms: flagging a course mandatory
+   * must not retro-gate technicians it was never assigned to.
    */
   for (const sql of [...await listSql(), ...await countsSql()]) {
     assert.match(sql, /JOIN training_videos tv ON tv\.is_global = 1/);
     assert.match(sql, /JOIN easyfixer_courses ec\s+ON ec\.course_id = c\.id/);
     assert.match(sql, /c\.is_mandatory = 1/);
+
+    const arms = requiredSetArms(sql);
+    assert.equal(arms.length, 3,
+      'three arms, one per arm of visibleVideoIdsSql(): global catalogue, '
+      + 'mandatory courses held, ANY course held');
+    const anyCourseArms = arms.filter(
+      (a) => /easyfixer_courses/.test(a) && !/is_mandatory/.test(a));
+    assert.equal(anyCourseArms.length, 1,
+      'the third arm — held courses with NO is_mandatory predicate — is what '
+      + 'makes this set equal the one the app lists; narrowing it back to '
+      + 'mandatory-only re-opens the early-activation gap');
+    assert.match(anyCourseArms[0], /lc2\.kind = 'video' AND lc2\.status = 1/,
+      'video-only and live content only, exactly as visibleVideoIdsSql filters');
   }
 });
 

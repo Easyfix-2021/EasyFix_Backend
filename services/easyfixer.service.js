@@ -1411,28 +1411,56 @@ function earlyActivationEligible(r) {
  *
  * WHAT IT MEANS NOW: the minimum completion across every video this
  * technician is REQUIRED to watch — 100 only when all of them are done, 0
- * while any is unstarted. That is the same question the app's registration
- * gate asks (services/mobile-registration.service.js fetchTrainingCompletedTime),
- * and asking it the same way is the point: the operator's queue and the
- * technician's earning gate must not disagree about whether training is done.
- * Gating on ONE video — any one — marks the whole section complete the moment
- * a single video finishes, which is the defect the mobile gate already fixed.
+ * while any is unstarted. Gating on ONE video — any one — marks the whole
+ * section complete the moment a single video finishes, which is the defect
+ * the mobile gate already fixed.
  *
- * The required set MIRRORS lms.mandatoryVideoIdsSql(): the global catalogue
- * plus the videos of mandatory courses the technician actually HOLDS. It is
- * restated here rather than called because that helper correlates on a `?`
+ * WHOSE question it is: the app's Training Videos screen, whose Next button
+ * needs every row it LISTED at 100. That is what actually stops a technician
+ * finishing registration, so it is what the operator's queue must report.
+ * Note that services/mobile-registration.service.js fetchTrainingCompletedTime
+ * — the EARNING gate — still counts the narrower MANDATORY set, so the two
+ * backend gates do not currently ask the same question. Converging them is a
+ * product call and not this join's to make; this one follows the app.
+ *
+ * The required set MIRRORS lms.visibleVideoIdsSql() — CHANGE ONE, CHANGE
+ * BOTH. That is the set the app actually puts in front of the technician
+ * (GET /api/mobile/training-videos: `WHERE tv.id IN (visibleVideoIdsSql())`)
+ * and the set its Next button gates on (EasyFixer_App
+ * src/app/(registration)/training-video.tsx: every listed row at 100). Three
+ * arms: the global catalogue, the videos of MANDATORY courses held, and the
+ * videos of ANY course held.
+ *
+ * Until 2026-09-07 it mirrored mandatoryVideoIdsSql() instead, which is a
+ * strict SUBSET — it has no third arm. A technician holding a
+ * NON-mandatory course with an unwatched video was therefore blocked by the
+ * app while this queue reported his training complete, and ops early-activated
+ * someone the app would not let work. The queue and the app must answer the
+ * same question; mandatory-only answers a narrower one.
+ *
+ * The third arm SUBSUMES the second under today's predicates (it drops only
+ * `c.is_mandatory` and `c.status`), and visibleVideoIdsSql carries the same
+ * redundancy. Both are kept so the two read arm-for-arm: a predicate added to
+ * either arm there has one obvious home here.
+ *
+ * Restated here rather than called because that helper correlates on a `?`
  * bind, and this is a set-based join over the whole queue — there is no
  * per-row efr_id to bind. Both flag columns arrive by migration and are
- * probed exactly as lms.service probes them; a missing column degrades the
+ * probed exactly as lms.service probes them; a missing column degrades that
  * arm to `1=0` (empty set → MIN over no rows → NULL → every consumer reads
- * "not complete", the safe direction).
+ * "not complete", the safe direction). The third arm names no probed column,
+ * so it never degrades.
  *
  * Pre-aggregated by easyfixer_id → one row per technician → no fan-out.
  * ponytail: the pair list crosses tbl_easyfixer with the global catalogue
  * (~32k rows on QA), materialised once per query, not per row. Measured on
  * the counts strip: 107-120ms before, 213-226ms with three global videos
  * present. Narrow the left arm to technicians who hold a watched row if that
- * ever matters (measured 146-148ms) — it changes nothing but the timing.
+ * ever matters (measured 146-148ms) — it changes nothing but the timing. The
+ * third arm's INCREMENTAL cost is unmeasurable on QA: `easyfixer_courses` is
+ * empty there, so the arm scans nothing. Whole-statement with the arm in
+ * place, QA 2026-09-07 over 7,504 technicians: counts 380-402ms, page
+ * 310-318ms (three runs).
  */
 async function registeredTrainingJoin() {
   const { courseMandatory, videoGlobal } = await lms.lmsFlagColumns();
@@ -1451,6 +1479,11 @@ async function registeredTrainingJoin() {
               JOIN easyfixer_courses ec ON ec.course_id = c.id
              WHERE lc.kind = 'video' AND lc.status = 1
                AND ${courseMandatory ? 'c.is_mandatory = 1' : '1=0'} AND c.status = 1
+             UNION
+            SELECT ec2.easyfixer_id, lc2.ref_id
+              FROM lms_content lc2
+              JOIN easyfixer_courses ec2 ON ec2.course_id = lc2.course_id
+             WHERE lc2.kind = 'video' AND lc2.status = 1
            ) m
       LEFT JOIN easyfixer_watched_video w
              ON w.easyfixer_id = m.easyfixer_id AND w.video_id = m.video_id
