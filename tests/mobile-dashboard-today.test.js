@@ -16,7 +16,7 @@ test.after(async () => {
  * bucketed on the APPOINTMENT date for all three active statuses, so starting
  * the job moved it into `upcoming` and out of the only screen that lists it.
  */
-const { dedupeById, isStarted, isTodaysWork } = dashboard._internals;
+const { dedupeById, isStarted, isTodaysWork, istDayOf } = dashboard._internals;
 
 /*
  * "Now" in IST, because that is what the service means by today.
@@ -132,4 +132,37 @@ test('the activeToday count counts started jobs on any date, exactly once', () =
   }
   assert.match(source, /WORK_DATE_SQL = `DATE\(CASE WHEN job_status IN \(\$\{STARTED_STATUSES\}\)/,
     'the work date must switch on the started statuses, not on a literal list');
+});
+
+
+/*
+ * THE DATE OF A STORED STAMP MUST NOT DEPEND ON THE SERVER'S TIMEZONE.
+ *
+ * These use FIXED strings and never read the clock, so they assert the same
+ * thing in every zone — which is the whole point. The tests above could only
+ * catch this bug while CI happened to run between 13:00 and 18:30 UTC, and they
+ * did: two of them failed a deploy at 13:11 UTC and had passed at 10:24 UTC.
+ *
+ * The bug: db.js sets dateStrings:true, so a DATETIME arrives as an IST
+ * wall-clock string. `new Date("2026-09-07 23:30:00")` reads it as the server's
+ * LOCAL zone and Intl then converted that instant to IST — under a UTC
+ * container, 23:30 IST became 05:00 the next day, and every job started after
+ * 18:30 IST dropped out of "Today's Jobs".
+ */
+test('a stored IST stamp keeps its own date, whatever zone the server runs in', () => {
+  assert.equal(istDayOf('2026-09-07 23:30:00'), '2026-09-07',
+    'late evening must not roll into tomorrow — this is the reported bug');
+  assert.equal(istDayOf('2026-09-07 00:15:00'), '2026-09-07',
+    'and early morning must not roll back into yesterday');
+  assert.equal(istDayOf('2026-09-07'), '2026-09-07', 'a bare DATE too');
+  assert.equal(istDayOf('2026-09-07T18:53:00'), '2026-09-07', 'ISO-ish separator');
+});
+
+test('istDayOf still CONVERTS a real Date, because an instant is a different question', () => {
+  // 2026-09-07T20:00:00Z is 2026-09-08 01:30 IST — a Date denotes an instant,
+  // so asking which IST day it lands on is correct here. Only an already-IST
+  // string must be read verbatim.
+  assert.equal(istDayOf(new Date('2026-09-07T20:00:00Z')), '2026-09-08');
+  assert.equal(istDayOf(null), null);
+  assert.equal(istDayOf('not a date'), null);
 });

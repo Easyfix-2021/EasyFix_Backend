@@ -447,10 +447,44 @@ async function fetchAttendance(efrId) {
 // IST YYYY-MM-DD string so it can be matched against istTodayString() /
 // istTomorrowString() regardless of how the driver hands back the DATE
 // value (Date object vs string).
+/*
+ * The IST calendar day of a DATETIME/DATE value that came out of the database.
+ *
+ * ⚠ DO NOT "SIMPLIFY" THIS BACK TO Intl.format(new Date(value)). That is what
+ * it used to be, and it was wrong twice over:
+ *
+ *   db.js sets `dateStrings: true`, so MySQL DATETIME arrives as the literal
+ *   string "YYYY-MM-DD HH:mm:ss" and that string is ALREADY IST — the column
+ *   stores IST wall-clock verbatim. `new Date("2026-09-07 18:53:00")` parses a
+ *   space-separated stamp as the SERVER'S LOCAL time, and Intl then converts
+ *   that instant into Asia/Kolkata. Two wrongs that cancel only when the server
+ *   happens to run in IST.
+ *
+ *   The container runs UTC. So an 18:53 IST check-in was read as 18:53 UTC and
+ *   re-rendered as 00:23 the NEXT day — and every job started after 18:30 IST
+ *   silently left "Today's Jobs". That is the exact regression the header of
+ *   tests/mobile-dashboard-today.test.js says this code exists to prevent; it
+ *   came back through the conversion rather than through the bucket rule.
+ *
+ * A real Date is a different case and is still converted: it denotes an
+ * instant, so asking which IST day it falls on is the right question. Only an
+ * already-IST STRING must be read verbatim.
+ */
+function istDayOf(value) {
+  if (value == null) return null;
+  if (typeof value === 'string') {
+    const m = /^(\d{4}-\d{2}-\d{2})/.exec(value.trim());
+    if (m) return m[1];              // already IST — take it, do not convert
+  }
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime())
+    ? null
+    : new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(d);
+}
+
 function attendanceRowDay(row) {
   if (!row || row.created_on == null) return null;
-  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' })
-    .format(new Date(row.created_on));
+  return istDayOf(row.created_on);
 }
 
 function attendanceStatus(row) {
@@ -515,9 +549,7 @@ function dedupeById(rows) {
 function isTodaysWork(j) {
   const workDate = workDateOf(j);
   if (workDate == null) return false;
-  const rowDay = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' })
-    .format(new Date(workDate));
-  return rowDay === istTodayString();
+  return istDayOf(workDate) === istTodayString();
 }
 
 // ─── Date-sliced counts ──────────────────────────────────────────────
@@ -727,4 +759,4 @@ function mapJobForMobile(j) {
  * asserted without a database. The count half lives in SQL and the list half in
  * JS; these are the JS half, and they are the half that silently drops a job.
  */
-module.exports = { getDashboard, fetchIdentity, _internals: { dedupeById, isStarted, isTodaysWork, workDateOf } };
+module.exports = { getDashboard, fetchIdentity, _internals: { istDayOf, dedupeById, isStarted, isTodaysWork, workDateOf } };
