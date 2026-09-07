@@ -20,6 +20,7 @@
  */
 
 const router = require('express').Router();
+const { rateLimit } = require('../../middleware/rate-limit');
 
 /*
  * Privacy policy — the ONE deliberate exception to the self-verify rule above.
@@ -119,10 +120,20 @@ router.use('/website-booking', require('./website-booking'));
  */
 router.use('/branding', require('./branding'));
 
-// Customer feedback page — public, jobId-scoped via the URL param.
-// See routes/public/feedback.js for the threat model + future
-// magic-link hardening notes.
-router.use('/feedback', require('./feedback'));
+/*
+ * Customer feedback page — public, jobId-scoped via the URL param, optionally
+ * token-scoped via ?t=. See routes/public/feedback.js for the threat model.
+ *
+ * THE RATE LIMIT IS THE POINT OF THIS MOUNT. The job id is a small sequential
+ * integer, so the only thing standing between this endpoint and a scripted walk
+ * of the whole book is a cap on how fast one address can ask. The route's own
+ * header used to assert this limit existed while the mount was bare — a
+ * security control that lived entirely in a comment.
+ *
+ * 60/min/IP: a customer rates one job once, so this is far above any honest
+ * use and far below a useful scrape.
+ */
+router.use('/feedback', rateLimit({ windowMs: 60_000, max: 60 }), require('./feedback'));
 // Customer/SPOC estimate-approval page — JWT-scoped via the URL token.
 // Token-only credential (same JWT_SECRET); see routes/public/estimate.js
 // for the threat model and idempotency guards.

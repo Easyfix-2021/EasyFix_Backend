@@ -7,26 +7,83 @@
  * a rating, and submits.
  *
  * Security posture:
- *   - NO admin / SPOC auth. Customers don't have accounts.
- *   - This is rate-limited per-IP at the router mount so a single
- *     attacker can't pound the endpoint.
- *   - The submit only INSERTs / UPDATEs the rating row tied to the
- *     specific jobId in the URL — no privilege escalation surface.
+ *   - NO admin / SPOC auth. Customers don't have accounts, so the link
+ *     itself has to carry the authority.
+ *   - A per-IP rate limit at the router mount. This comment previously
+ *     ASSERTED that limit while routes/public/index.js mounted the router
+ *     bare — the sentence was true of nobody. It is now real; see the
+ *     rateLimit() on the /feedback mount.
+ *   - `?t=` carries a signed, job-scoped feedback token whose jobId must
+ *     match the URL. FEEDBACK_TOKEN_REQUIRED=true makes it mandatory.
+ *   - The response carries no contact details — see the projection note.
  *
  * Endpoints:
  *   GET  /api/public/feedback/:jobId   — basic job + tech info for the page
  *   POST /api/public/feedback/:jobId   — submit the rating
  *
- * Future hardening (TODO when ops ask): mint a magic-link JWT at job-
- * complete time and require it on both endpoints, same pattern as
- * /api/public/job-completion. Until then, anyone with the jobId can
- * read + submit — acceptable for the typical SMS-link customer flow
- * where the jobId is the "secret".
+ * THE jobId IS NOT A SECRET, and treating it as one was the hole. It is a
+ * small sequential integer: counting from 1 walked the entire customer book
+ * out of this endpoint, unauthenticated and unthrottled, and the projection
+ * used to include customer_mob_no. Two changes close that:
+ *
+ *   1. The response no longer carries contact details at all. The page greets
+ *      the customer by FIRST NAME and renders the technician, the category and
+ *      the client's branding — so that is all it now receives. The mobile
+ *      number was never read by the page; it was pure exhaust, and it was the
+ *      single most damaging field to hand out.
+ *   2. `?t=` accepts a signed feedback token bound to this jobId.
+ *
+ * WHY THE TOKEN IS NOT YET MANDATORY BY DEFAULT. Nothing in this codebase
+ * builds the feedback URL — the link lives in an SMS/WhatsApp template outside
+ * it. Flipping the requirement on before those templates carry `?t=` would
+ * break the rating page for every customer, including everyone holding a link
+ * already sent. So the gate ships OFF, the enumeration value is removed
+ * immediately by (1), and FEEDBACK_TOKEN_REQUIRED=true is the one-flag cutover
+ * once the templates are updated. Mint links with signFeedbackToken().
  */
 
 const router = require('express').Router();
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+const { verifyFeedbackToken } = require('../../utils/jwt');
+
+/*
+ * Token gate for BOTH endpoints — read and submit. The submit matters as much
+ * as the read: without it, anyone can post a star rating against any job id,
+ * which is rating fraud against technicians' scores.
+ *
+ * A token that does not match the jobId in the URL is rejected, so one
+ * customer's link cannot be pointed at another customer's job.
+ */
+function feedbackGate(req, res, next) {
+  const raw = typeof req.query.t === 'string' ? req.query.t.trim() : '';
+  const required = String(process.env.FEEDBACK_TOKEN_REQUIRED || '').toLowerCase() === 'true';
+
+  if (!raw) {
+    if (required) return modernError(res, 401, 'this feedback link is no longer valid');
+    return next();          // legacy bare-id link; see the header note
+  }
+  try {
+    const { jobId } = verifyFeedbackToken(raw);
+    if (Number(jobId) !== Number(req.params.jobId)) {
+      return modernError(res, 401, 'this feedback link is no longer valid');
+    }
+    return next();
+  } catch (e) {
+    // A PRESENT-but-bad token is always rejected, even when the gate is off.
+    // Accepting it would make a forged token strictly better than no token.
+    return modernError(res, e.status || 401, e.message || 'invalid or expired link');
+  }
+}
+router.use('/:jobId', feedbackGate);
+
+// "Mr. Ravi Kumar" -> "Ravi". Mirrors the trimming the feedback page already
+// applied to the full name it used to receive.
+function firstName(name) {
+  if (!name) return null;
+  const bare = String(name).replace(/^\s*(?:mr|mrs|ms|dr)\.?\s+/i, '').trim();
+  return bare.split(/\s+/)[0] || null;
+}
 
 /*
  * GET /api/public/feedback/:jobId
@@ -51,10 +108,16 @@ router.get('/:jobId', async (req, res, next) => {
     // docs/claude-reference/SCHEMA.md). efr_image / efr_photo were
     // initially added but neither exists — kept the avatar as an
     // initials tile on the FE, no photo URL is sent down.
+    /*
+     * customer_mob_no is GONE and must not come back: the page never read it,
+     * and on an endpoint reachable by guessing an integer it was a phone book.
+     * customer_name is reduced to the first word below for the same reason —
+     * the page renders "Hi <first name>," and nothing else needs the rest.
+     */
     const [[row]] = await pool.query(
       `SELECT j.job_id, j.job_status, j.fk_customer_id, j.fk_easyfixter_id,
               j.fk_service_catg_id,
-              cu.customer_name, cu.customer_mob_no,
+              cu.customer_name,
               ef.efr_name AS easyfixer_name,
               sc.service_catg_name,
               cl.client_id, cl.client_name
@@ -84,7 +147,14 @@ router.get('/:jobId', async (req, res, next) => {
     modernOk(res, {
       job_id:           row.job_id,
       job_status:       row.job_status,
-      customer_name:    row.customer_name,
+      /*
+       * FIRST NAME ONLY. The page renders "Hi <first name>, please share your
+       * experience" and does the same trimming client-side today — so sending
+       * the full name gave the page nothing and gave an enumerator a surname.
+       * Honorifics are stripped here so the server and the page agree on what
+       * "first name" means rather than each having an opinion.
+       */
+      customer_name:    firstName(row.customer_name),
       easyfixer_id:     row.fk_easyfixter_id,
       easyfixer_name:   row.easyfixer_name,
       easyfixer_image:  null, // no photo column on this DB; FE falls back to initials

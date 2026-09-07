@@ -65,6 +65,41 @@ function signJobToken({ jobId }) {
  *
  * Returns `{ jobId }` (Number) on success.
  */
+/**
+ * Feedback links get their OWN token type, deliberately.
+ *
+ * A job-completion token authorises a customer to SUBMIT a completion form. A
+ * feedback token only authorises reading a job's rating page and leaving a
+ * star rating. Minting one type and accepting it for the other would mean a
+ * feedback link — the widest-distributed link we send, going to every customer
+ * after every visit — could be replayed against the completion endpoint.
+ *
+ * So the two verifiers each pin their own `type` and reject the other's. The
+ * cost is one extra pair of functions; the alternative is that the blast radius
+ * of a leaked feedback URL is a job write.
+ */
+function signFeedbackToken({ jobId }) {
+  const ttlHours = Number(process.env.FEEDBACK_LINK_TTL_HOURS || 720);   // 30d
+  return jwt.sign(
+    { sub: 'job:' + jobId, jobId: Number(jobId), type: 'job_feedback' },
+    requireSecret(),
+    { expiresIn: `${ttlHours}h` },
+  );
+}
+
+function verifyFeedbackToken(token) {
+  let claims;
+  try {
+    claims = jwt.verify(token, requireSecret());
+  } catch (_err) {
+    throw { status: 401, message: 'invalid or expired link' };
+  }
+  if (!claims || claims.type !== 'job_feedback') {
+    throw { status: 401, message: 'token type mismatch' };
+  }
+  return { jobId: Number(claims.jobId) };
+}
+
 function verifyJobToken(token) {
   let claims;
   try {
@@ -275,6 +310,8 @@ function verifyEstimateToken(token) {
 }
 
 module.exports = {
+  signFeedbackToken,
+  verifyFeedbackToken,
   signUserToken,
   verifyToken,
   signJobToken,
