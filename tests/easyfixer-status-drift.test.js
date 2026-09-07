@@ -165,3 +165,95 @@ test('positive control — the resolver actually moves something', () => {
     'INACTIVE',
   );
 });
+
+/*
+ * Read-time reconciliation (2026-09-07). The nightly heal makes the repair
+ * permanent and auditable; these make it take effect on the first request,
+ * which matters because the heal's property ships 'false' and its window is
+ * otherwise unbounded.
+ */
+
+const eligibility = require('../services/easyfixer-work-eligibility.service');
+const { lifecycleFromRow, reconciledWorkEligibleSql } = require('../services/easyfixer-lifecycle.service');
+
+test('a drifted row already reads as the status the heal will write', () => {
+  const drifted = { is_technician_verified: 1, efr_status: 1, lifecycle_status: 'INACTIVE' };
+  assert.equal(lifecycleFromRow(drifted).status, 'ACTIVE');
+  assert.equal(
+    lifecycleFromRow({ ...drifted, efr_manager_id: 4 }).status,
+    'UNDER_MASTER',
+    'the master mapping still decides which work-enabled state it lands in',
+  );
+  // Reverse drift resolves the other way, and stays fail-closed.
+  assert.equal(
+    lifecycleFromRow({ is_technician_verified: 1, efr_status: 0, lifecycle_status: 'ACTIVE' }).status,
+    'INACTIVE',
+  );
+  // Untouched rows must be unaffected — reconciliation is not a rewrite.
+  assert.equal(
+    lifecycleFromRow({ is_technician_verified: 1, efr_status: 1, lifecycle_status: 'ACTIVE' }).status,
+    'ACTIVE',
+  );
+  assert.equal(
+    lifecycleFromRow({ is_technician_verified: 1, efr_status: 1, lifecycle_status: 'BLACKLISTED' }).status,
+    'BLACKLISTED',
+  );
+});
+
+test('reconciling reads does NOT blind the drift monitor', () => {
+  /*
+   * The point of reconciling at read time is that the defect stops HURTING
+   * immediately. If it also stopped being VISIBLE, the fix would have removed
+   * its own evidence and nobody would learn the legacy CRM is still writing.
+   * statusDriftSql reads the raw columns for exactly this reason.
+   */
+  const sql = statusDriftSql('e');
+  assert.match(sql, /e\.efr_status/, 'the monitor must read the raw legacy column');
+  assert.match(sql, /e\.lifecycle_status/, 'and the raw lifecycle column');
+  assert.doesNotMatch(sql, /reconcil/i, 'never the reconciled view');
+});
+
+test('the row projection and the candidate SQL admit exactly the same technicians', () => {
+  /*
+   * The anti-mirror guard, and the one that matters most: a technician offered
+   * a job by id must be the same technician the candidate LIST would have
+   * surfaced. Two implementations of one rule is how this whole defect started
+   * — two status columns, two readers, no test that they agreed.
+   */
+  const sql = reconciledWorkEligibleSql('e');
+  const blockedInSql = LIFECYCLE_STATUSES.filter((s) => sql.includes(`'${s}'`));
+
+  for (const status of LIFECYCLE_STATUSES) {
+    const row = { efr_status: 1, is_technician_verified: 1, lifecycle_status: status };
+    const rowSaysYes = eligibility.fromRow(row).canOffer;
+    const sqlSaysYes = !blockedInSql.includes(status);
+    assert.equal(
+      rowSaysYes,
+      sqlSaysYes,
+      `${status}: row projection says ${rowSaysYes}, candidate SQL says ${sqlSaysYes}`,
+    );
+  }
+
+  assert.ok(blockedInSql.length > 0, 'positive control: something must still be blocked');
+  assert.ok(
+    blockedInSql.includes('BLACKLISTED'),
+    'a blacklist must survive a legacy reactivation on BOTH sides',
+  );
+});
+
+test('the legacy bit alone cannot admit an unverified technician', () => {
+  /*
+   * efr_status carries no agreed meaning before verification, so the gate keeps
+   * its own verification check rather than inheriting one from the lifecycle
+   * states — which is what stops "legacy wins" from reaching the onboarding
+   * funnel.
+   */
+  const sql = reconciledWorkEligibleSql('e');
+  assert.match(sql, /is_technician_verified = 1/);
+  for (const verified of [null, 0]) {
+    assert.equal(
+      eligibility.fromRow({ efr_status: 1, is_technician_verified: verified, lifecycle_status: 'NEW' }).canOffer,
+      false,
+    );
+  }
+});

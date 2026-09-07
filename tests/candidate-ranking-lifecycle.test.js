@@ -93,8 +93,19 @@ test('Top 10 uses the shared lifecycle predicate and excludes a restricted row',
     /FROM tbl_easyfixer e/.test(call.sql) && /scheduling_history sh/.test(call.sql)
   ));
   assert.ok(eligibility, 'the set-based L1 query must be issued');
-  assert.match(eligibility.sql, /e\.lifecycle_status IN \('ACTIVE', 'UNDER_MASTER'\)/);
-  assert.match(eligibility.sql, /e\.efr_status = 1 AND e\.is_technician_verified = 1/);
+  /*
+   * Asserted against the shared predicate itself, not a literal copy of the
+   * SQL it happens to produce today. The literal here pinned
+   * `lifecycle_status IN ('ACTIVE','UNDER_MASTER')` and broke on 2026-09-07
+   * when that clause was replaced by the reconciled form — a shape change,
+   * not a behaviour change: the restricted fixtures carry efr_status = 0 and
+   * are still excluded, as the assertions above confirm.
+   */
+  const shared = await require('../services/easyfixer-work-eligibility.service').sqlPredicate('e');
+  assert.ok(
+    eligibility.sql.includes(shared),
+    'the L1 query must embed the shared eligibility predicate verbatim, not a hand-rolled gate',
+  );
 });
 
 test('restricted current assignee is pinned only as non-offerable reassignment context', async () => {

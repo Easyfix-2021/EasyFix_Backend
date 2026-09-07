@@ -288,7 +288,28 @@ function deriveLegacyStatus(row = {}) {
 
 function lifecycleFromRow(row = {}) {
   const persisted = normalizeStatus(row.lifecycle_status);
-  const status = persisted || deriveLegacyStatus(row);
+  /*
+   * Reconciled at READ time, not only by the nightly heal.
+   *
+   * Drift is created by an outside write and repaired on a schedule, which
+   * leaves a window — up to a day, and unbounded while the heal's property is
+   * off — in which the stored status is known to be stale. Applying the same
+   * resolution here closes it: every reader sees the value the heal WILL
+   * write, so the chip, the technician app's capabilities and the assignment
+   * engine agree from the first request rather than from tomorrow morning.
+   *
+   * Reconciling display alone would have been worse than leaving it: the chip
+   * would read Active while the candidate query still skipped the row, so the
+   * one visible sign of the defect would be gone and the missing job offers
+   * would remain. reconciledWorkEligibleSql() is the matching half.
+   *
+   * The DRIFT MONITOR deliberately keeps reading the raw columns, so
+   * reconciling here hides nothing — statusDriftSql() still counts these rows
+   * until the heal makes the repair permanent and auditable.
+   */
+  const status = persisted
+    ? reconciledStatusFor(row, { status: persisted })
+    : deriveLegacyStatus(row);
   const verified = asBool(row.is_technician_verified);
   // Persisted lifecycle is authoritative only when its legacy work bit agrees.
   // During pre-migration derivation we preserve the established NULL=enabled
@@ -1566,6 +1587,39 @@ function reconciledStatusFor(row = {}, current = {}) {
 }
 
 /*
+ * The reconciliation above, as SQL — "may this row receive new work once the
+ * two status columns are reconciled?"
+ *
+ * DERIVED from reconciledStatusFor(), never mirrored. The blocked list is
+ * computed by asking the resolver itself what each status becomes when the
+ * legacy bit says active, so changing the heal's rule changes this predicate
+ * with it. A hand-written second copy is exactly how a checker ends up
+ * disagreeing with the thing it checks.
+ *
+ * What it works out to today: efr_status and is_technician_verified decide,
+ * and lifecycle_status only ever SUBTRACTS — BLACKLISTED. That is not a
+ * demotion of the lifecycle model, it is what the model already implies. Every
+ * transition writes efr_status alongside the status (legacyStatusForTransition:
+ * work-enabled -> 1, blocked -> 0), so for any row this backend wrote, the
+ * lifecycle half of the old AND was already implied by the legacy half and
+ * changed no answer. It only ever bit on DRIFTED rows — and there it gave the
+ * wrong answer, excluding a technician ops had reactivated.
+ *
+ * NULL lifecycle_status is eligible: a row from before the migration has no
+ * lifecycle to consult, and lifecycleFromRow derives ACTIVE for it.
+ */
+function reconciledWorkEligibleSql(alias = 'e') {
+  const blocked = LIFECYCLE_STATUSES.filter((status) => !WORK_ENABLED.has(
+    reconciledStatusFor({ is_technician_verified: 1, efr_status: 1 }, { status }),
+  ));
+  const legacyGate = `${alias}.efr_status = 1 AND ${alias}.is_technician_verified = 1`;
+  if (!blocked.length) return legacyGate;
+  const list = blocked.map((status) => `'${status}'`).join(', ');
+  return `${legacyGate}
+          AND (${alias}.lifecycle_status IS NULL OR ${alias}.lifecycle_status NOT IN (${list}))`;
+}
+
+/*
  * Adopt a legacy `efr_status` write that bypassed this state machine.
  *
  * The legacy Java CRM is still a sanctioned ops tool and it flips efr_status
@@ -1788,6 +1842,7 @@ module.exports = {
   LEGACY_ACTIVE_STATUSES,
   REAPPLY_FROM,
   statusDriftSql,
+  reconciledWorkEligibleSql,
   capabilitiesForStatus,
   hasLifecycleSchema,
   readProjection,

@@ -142,7 +142,10 @@ test('service enforces the same 50-recipient cap as the HTTP validator', async (
 test('mobile open-offer reads fail closed on lifecycle, job state, latest row and TTL', async () => {
   assert.equal(await jobService.techHasOpenOffer(100, 42), false);
   const membership = fake.calls.find((call) => /SELECT 1 AS ok/.test(call.sql));
-  assert.match(membership.sql, /lifecycle_status IN \('ACTIVE', 'UNDER_MASTER'\)/);
+  const shared = await require('../services/easyfixer-work-eligibility.service').sqlPredicate('e');
+  // The shared predicate, not a copy of its current text — see the note in
+  // candidate-ranking-lifecycle.test.js.
+  assert.ok(membership.sql.includes(shared), 'the membership read must use the shared eligibility predicate');
   assert.match(membership.sql, /MAX\(latest\.job_offer_id\)/);
   assert.match(membership.sql, /j\.job_status = 0/);
   assert.match(membership.sql, /j\.fk_easyfixter_id IS NULL/);
@@ -152,7 +155,7 @@ test('mobile open-offer reads fail closed on lifecycle, job state, latest row an
   assert.deepEqual(await jobService.listOfferedForTech(42), { items: [] });
   const list = fake.calls.find((call) => /FROM tbl_job_offer newer/.test(call.sql));
   assert.ok(list);
-  assert.match(list.sql, /lifecycle_status IN \('ACTIVE', 'UNDER_MASTER'\)/);
+  assert.ok(list.sql.includes(shared), 'and so must the capped list read');
   assert.match(list.sql, /j\.job_status = 0/);
   assert.match(list.sql, /newer\.job_offer_id > jo\.job_offer_id/);
   assert.doesNotMatch(list.sql, /GROUP BY job_id/, 'the capped read must not aggregate lifetime history');
