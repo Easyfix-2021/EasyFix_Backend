@@ -238,3 +238,7 @@ router.post('/:jobId', async (req, res, next) => {
 });
 
 module.exports = router;
+// Exported for tests: the gate is the whole security contract of this route,
+// and the pair of flag states it has to honour is worth asserting directly
+// rather than through a booted server.
+module.exports.feedbackGate = feedbackGate;

@@ -1,4 +1,6 @@
 const logger = require('../logger');
+const { getProperty } = require('./properties.service');
+const { mintFeedbackLink } = require('./feedback-link.service');
 const inbox = require('./notification-inbox.service');
 const smsService = require('./sms.service');
 const emailService = require('./email.service');
@@ -154,7 +156,27 @@ async function onJobEvent(eventName, jobCtx) {
         break;
       case 'TechVisitComplete':
         if (jobCtx.customer_mob_no) {
-          smsService.send({ to: jobCtx.customer_mob_no, message: `EasyFix: Your ${jobCtx.job_type} is complete. Please rate your experience.` });
+          /*
+           * The message asks the customer to rate their experience and, until
+           * this was added, gave them no way to do it — no URL at all. The link
+           * has to originate here because it carries a signed feedback token,
+           * and the legacy sender signs with a different secret.
+           *
+           * FLAG-GATED, and the reason is DLT, not caution. Indian SMS must
+           * match a template registered with the DLT registry; appending a URL
+           * to an already-registered body is a CONTENT CHANGE and undelivered
+           * messages are the failure mode — silent, and only visible as missing
+           * ratings. So ops registers the new template first, then sets
+           * job.feedback_link.enabled=true. While it is off the message is
+           * byte-identical to what ships today.
+           */
+          const feedbackOn = String(getProperty('job.feedback_link.enabled') || '').toLowerCase() === 'true';
+          let message = `EasyFix: Your ${jobCtx.job_type} is complete. Please rate your experience.`;
+          if (feedbackOn && jobCtx.job_id) {
+            const { url } = mintFeedbackLink(jobCtx.job_id);
+            message += ` ${url}`;
+          }
+          smsService.send({ to: jobCtx.customer_mob_no, message });
         }
         if (jobCtx.job_owner) {
           await inbox.create({ userId: jobCtx.job_owner, jobId: jobCtx.job_id,
