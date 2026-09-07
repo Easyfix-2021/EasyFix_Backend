@@ -966,6 +966,69 @@ Note: this task only runs automatically if the property "easyfixer.auto_reactiva
     logger.info('Easyfixer auto-reactivation cron registered (easyfixer.auto_reactivation.enabled=true, 01:00 IST).');
   }
 
+  // ─── Easyfixer status-drift heal — daily at 01:30 IST ───────────────
+  // (Added 2026-09-07) Repairs technicians whose efr_status and lifecycle_status
+  // contradict each other because the still-live legacy Java CRM wrote one of
+  // them alone. Its own job, NOT a second pass of the auto-reactivation cron
+  // above: that one is gated on easyfixer.auto_reactivation.enabled, which is
+  // 'false' today, so riding along would have shipped a repair that never ran.
+  // Runs after it at 01:30 so a scheduled lift is already settled before the
+  // reconciliation looks at the same rows.
+  const easyfixerStatusDriftCron = require('../services/easyfixer-status-drift-cron');
+  const easyfixerStatusDriftJob = registerJob({
+    id: 'easyfixer-status-drift-heal',
+    name: 'Technician Status-Drift Repair',
+    description:
+`What this task does: Every day at 1:30 AM IST it finds technicians whose two status fields disagree with each other, and makes them agree again.
+
+Why there are two status fields at all: a technician's status is stored twice. The OLD CRM reads and writes one of them; this new CRM reads and writes the other. Everything this backend does writes both together, so they normally match. The old CRM does not know the second field exists, so whenever somebody activates or deactivates a technician there, only one of the two changes.
+
+Why that matters, and why nobody would notice: for a technician to be offered work, BOTH fields have to say "active". So a technician reactivated in the old CRM looks completely Active on every screen anyone uses, and silently receives no job offers at all. Nothing errors. Nothing is logged. They simply stop getting work. This was reported on 7 September 2026 for Easyfixer 4980 — Active in the old CRM, Inactive in the new one.
+
+Here's how it works, step by step:
+  1. Every day at 1:30 AM IST, the task wakes up automatically.
+  2. It finds a bounded batch of verified technicians whose two status fields disagree.
+  3. For each, it applies what the OLD CRM last said — because this backend always writes both fields together, a disagreement can only mean the old CRM wrote afterwards, so its value is the more recent one.
+  4. It uses the same locked, audited transition the CRM uses, so every repair appears in the technician's status history with the reason "Reconciled with the legacy CRM status flag".
+  5. Blacklisted technicians are NEVER repaired this way. A blacklist is a deliberate safety decision, and a status flip in the old CRM must not undo one silently — those rows stay flagged for a person to look at.
+  6. It logs how many were found, repaired and failed (visible in the server logs and on this page), including when the answer is zero.
+
+Where to see the problem yourself: Manage EasyFixers shows a red "Status Drift" count above the filters whenever any technician is in this state. It is hidden when the count is zero. Clicking it lists exactly those technicians.
+
+This stops being necessary the day the old CRM is retired, or taught to write both fields.
+
+Note: this task only runs automatically if the property "easyfixer.status_drift_heal.enabled" is "true" in easyfix_properties (checked once at server start — a restart is required after changing it). If unset or "false", the schedule is OFF, but Trigger Now / Test still work for manual verification.`,
+    cron: '30 1 * * *',
+    runner: async () => {
+      const result = await easyfixerStatusDriftCron.runDailyHeal();
+      logger.info(
+        `Easyfixer status-drift heal cron · drifted=${result.drifted || 0} · healed=${result.healed || 0}`
+        + (result.skipped ? ` (skipped — ${result.reason || 'lifecycle schema pre-migration'})` : '')
+      );
+      return result;
+    },
+    tester: ({ sourceId }) => easyfixerStatusDriftCron.runTest({ sourceId }),
+    testSourceLabel: 'Easyfixer ID (efr_id)',
+    testSourceHelp:
+      'Required. Immediately reconciles THIS technician\'s lifecycle status with the legacy CRM flag, so a reported mismatch can be fixed and verified without waiting for tonight\'s run.',
+  });
+  const easyfixerStatusDriftEnabled =
+    String(getProperty('easyfixer.status_drift_heal.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    easyfixerStatusDriftJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!easyfixerStatusDriftEnabled) {
+    easyfixerStatusDriftJob.skipReason = "property 'easyfixer.status_drift_heal.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info("Easyfixer status-drift heal cron SKIPPED — set easyfixer.status_drift_heal.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    easyfixerStatusDriftJob.task = cron.schedule(
+      easyfixerStatusDriftJob.cron,
+      () => invokeJob(easyfixerStatusDriftJob, 'cron'),
+      { timezone: TZ },
+    );
+    easyfixerStatusDriftJob.registered = true;
+    logger.info('Easyfixer status-drift heal cron registered (easyfixer.status_drift_heal.enabled=true, 01:30 IST).');
+  }
+
   // ─── Plivo low-balance alert — every 3 hours ────────────────────────
   // Added 2026-08-27, after calling was dead on production with an empty Plivo
   // account and nothing anywhere reporting it: the API accepted every call, the
