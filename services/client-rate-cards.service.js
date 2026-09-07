@@ -221,15 +221,26 @@ async function bulkUpsert(clientId, rows) {
   return r.affectedRows;
 }
 
-async function deleteOne(rateCardId) {
-  logger.info('Delete client rate card · crc_id=' + rateCardId);
-  const [r] = await pool.query(
-    // Column-name landmine — PK is `crc_id` on tbl_client_rate_card.
-    'DELETE FROM tbl_client_rate_card WHERE crc_id = ?', [rateCardId],
-  );
-  logger.info('Client rate card deleted · crc_id=' + rateCardId + ' affected=' + r.affectedRows);
-  return r.affectedRows;
-}
+/*
+ * deleteOne() IS DELIBERATELY GONE. It ran
+ *
+ *     DELETE FROM tbl_client_rate_card WHERE crc_id = ?
+ *
+ * from a per-client route, and tbl_client_rate_card has NO client_id — it is a
+ * shared CATALOG (6,097 rows, five of them referenced by more than one client,
+ * the worst by 151). Deleting a row on one client's behalf therefore blanked
+ * the rate-card name for every other client pointing at it, silently, because
+ * listForClient LEFT JOINs the name.
+ *
+ * Nothing here may delete from that catalog through a per-client route. If a
+ * catalog-maintenance flow is ever needed it belongs on its own admin surface,
+ * with its own permission, and it must refuse to remove a row that any
+ * tbl_client_service still references.
+ *
+ * Removing a rate card FOR A CLIENT is a soft-delete of that client's own
+ * tbl_client_service row — clientServicesSvc.softDelete(), which the route now
+ * calls behind guardRowByClientId().
+ */
 
 /*
  * ─── Rate-Card Charge Calculation Formula ─────────────────────────
@@ -337,7 +348,6 @@ function round2(n) {
 module.exports = {
   listForClient,
   bulkUpsert,
-  deleteOne,
   hasCompositeUniqueKey,
   COST_COLS,
   calculateCharges,

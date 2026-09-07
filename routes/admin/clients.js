@@ -1592,15 +1592,43 @@ router.get('/:clientId/rate-cards/download', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * DELETE /rate-cards/:clientServiceId
+ *
+ * ⚠ THIS USED TO DELETE A SHARED CATALOG ROW, AND THAT WAS NOT A SCOPE BUG —
+ * it was cross-client data destruction reachable from a button.
+ *
+ * The grid this backs shows ONE ROW PER tbl_client_service ENTRY. The old
+ * handler took `row.rate_card_id` — the FK into tbl_client_rate_card — and ran
+ * `DELETE FROM tbl_client_rate_card WHERE crc_id = ?`. That table has NO
+ * client_id: it is a 6,097-row CATALOG shared across clients, and five of its
+ * rows are referenced by more than one client (the worst by 151). So an
+ * operator clicking "Remove rate card" on client A deleted a template that
+ * clients B..Z were using, and their rate-card NAME silently became NULL,
+ * because listForClient LEFT JOINs it.
+ *
+ * It did not even do what the operator asked. The client's own
+ * tbl_client_service row survived, so the row REAPPEARED on the next refetch
+ * with a blank name, under a "Rate card removed" toast.
+ *
+ * The correct action is the one the sibling route above already performs:
+ * resolve the owning client from the row, guard it, and SOFT-DELETE the
+ * client's own tbl_client_service row. Same two helpers, so there is one
+ * definition of "remove a client service" rather than two. tbl_client_rate_card
+ * is never written here — see the note on rateCardsSvc for why nothing may
+ * delete from a shared catalog through a per-client route.
+ */
 router.delete(
-  '/rate-cards/:id',
+  '/rate-cards/:clientServiceId',
   requireClientEdit,
   async (req, res, next) => {
     try {
-      logger.info('Delete client rate card · id=' + req.params.id);
-      const affected = await rateCardsSvc.deleteOne(req.params.id);
+      const id = req.params.clientServiceId;
+      logger.info('Remove client rate card · clientServiceId=' + id);
+      if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(id), 'rate card not found'))) return;
+      const affected = await clientServicesSvc.softDelete(id);
       if (!affected) return modernError(res, 404, 'rate card not found');
-      logger.info('Rate card deleted · id=' + req.params.id);
+      logger.info('Client rate card removed · clientServiceId=' + id);
       modernOk(res, { deleted: true });
     } catch (e) { next(e); }
   },
