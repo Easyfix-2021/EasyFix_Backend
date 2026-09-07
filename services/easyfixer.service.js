@@ -2,6 +2,10 @@ const { pool } = require('../db');
 const { cityScopeSql } = require('../lib/scope');
 const logger = require('../logger');
 const lifecycleService = require('./easyfixer-lifecycle.service');
+// Only lmsFlagColumns() — the same probed-column answer the LMS uses, so the
+// registered queue and the technician's training gate cannot disagree about
+// which flags exist. See registeredTrainingJoin().
+const lms = require('./lms.service');
 const {
   mapAadhaarUniqueViolation,
   normalizeAadhaar,
@@ -150,7 +154,7 @@ const DETAIL_COLUMNS = `
 // supplied, the easyfixer list is row-filtered by `e.efr_cityId` against
 // scope.cities (and `mode='none'` short-circuits to zero rows).
 async function list({
-  q, cityId, serviceCategory, isVerified, status, lifecycleStatus,
+  q, cityId, serviceCategory, isVerified, status, lifecycleStatus, statusDrift,
   scope,
   limit = 50, offset = 0, includeInactive = false,
   // Manage Easyfixers parity filters (2026-06-08)
@@ -249,6 +253,18 @@ async function list({
       clauses.push('e.lifecycle_status = ?');
       params.push(lifecycleStatus);
     }
+  }
+  /*
+   * Status-drift drill-down. The counts strip reports how many technicians
+   * carry contradictory status columns; this is the filter that lists exactly
+   * the rows it counted, so the number and the list can never disagree — both
+   * come from statusDriftSql(). Schema-guarded like the filter above: before
+   * the lifecycle migration the columns do not exist and there is nothing that
+   * could have drifted.
+   */
+  if (statusDrift) {
+    const { hasLifecycleSchema, statusDriftSql } = require('./easyfixer-lifecycle.service');
+    if (await hasLifecycleSchema()) clauses.push(`(${statusDriftSql('e')})`);
   }
   if (q) {
     clauses.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_email LIKE ?)');
@@ -1212,7 +1228,8 @@ async function statusCounts({ scope } = {}) {
       // No access — short-circuit to all-zero counts.
       return {
         active: 0, inactive: 0, idle: 0, not_eligible: 0,
-        not_suitable: 0, reg_in_progress: 0, training_pending: 0, total: 0,
+        not_suitable: 0, reg_in_progress: 0, training_pending: 0,
+        status_drift: 0, total: 0,
       };
     }
     if (ci.mode === 'allow' && ci.ids.length) {
@@ -1242,9 +1259,26 @@ async function statusCounts({ scope } = {}) {
     ? `SUM(CASE WHEN e.lifecycle_status = 'TRAINING_PENDING' THEN 1 ELSE 0 END)`
     : '0';
 
+  /*
+   * Status drift — the monitor for a defect no screen could otherwise show.
+   * `efr_status` and `lifecycle_status` are two independent status columns and
+   * two different CRMs read different ones: the legacy Java CRM reads
+   * efr_status, this one renders the lifecycle chip. transition() writes both
+   * together, so a disagreement is proof that something outside this backend
+   * wrote efr_status alone — and the technician is then invisible to job
+   * assignment while ops sees them as Active. See statusDriftSql().
+   *
+   * Same schema guard as Training Pending: referencing a column that does not
+   * exist yet would take the whole counts strip down, not just this number.
+   */
+  const statusDriftCountSql = lifecycleInstalled
+    ? `SUM(CASE WHEN ${lifecycleService.statusDriftSql('e')} THEN 1 ELSE 0 END)`
+    : '0';
+
   const [[row]] = await pool.query(`
     SELECT
       ${trainingPendingSql} AS training_pending,
+      ${statusDriftCountSql} AS status_drift,
       SUM(CASE WHEN e.is_technician_verified = 1 AND e.efr_status = 1
                THEN 1 ELSE 0 END) AS active,
       SUM(CASE WHEN e.is_technician_verified = 1 AND e.efr_status = 0
@@ -1283,6 +1317,13 @@ async function statusCounts({ scope } = {}) {
     // currently moves a technician INTO TRAINING_PENDING (the LMS wire only
     // moves them out), so the bucket is empty until an entrance exists.
     training_pending: Number(row.training_pending) || 0,
+    /*
+     * 0 means "no contradictory rows" OR "no lifecycle columns to contradict".
+     * Both are the same operational answer — nothing to reconcile — so the
+     * strip hides the entry entirely at 0 rather than parking a permanent
+     * zero next to six buckets that are genuinely worth reading at zero.
+     */
+    status_drift:    Number(row.status_drift)    || 0,
     total:           Number(row.total)           || 0,
   };
 }
@@ -1306,8 +1347,10 @@ async function statusCounts({ scope } = {}) {
  * Legacy quirks deliberately FIXED (documented for the migration):
  *   - parameterised SQL (legacy string-concatenated → injection-prone);
  *   - COUNT(*) for total (legacy materialised every row + counted in Java);
- *   - easyfixer_watched_video.video_id unified to 3 (legacy used 6 in the list
- *     query but 3 in count/export — a silent inconsistency);
+ *   - training progress derived from the CATALOGUE, not a hardcoded video id
+ *     (see registeredJoins() — legacy used 6 in the list query and 3 in
+ *     count/export, two DIFFERENT id spaces, and this port picked the wrong
+ *     one of the two);
  *   - PIN search unified to U.pin_code (legacy diverged list vs count);
  *   - State-User (zonal manager) name via a scalar subquery, not the legacy
  *     per-row DAO call (N+1).
@@ -1347,7 +1390,76 @@ function earlyActivationEligible(r) {
   );
 }
 
-const REGISTERED_JOINS = `
+/*
+ * TRAINING PROGRESS — DERIVED FROM THE CATALOGUE, NEVER A LITERAL VIDEO ID.
+ *
+ * `easyfixer_watched_video.video_id` references `training_videos.id`, always
+ * (see migrations/2026-09-07-canonicalise-watched-video-id-space.sql). The
+ * legacy MOBILE WIRE format spoke `training_videos.training_video_id` (1/2/3,
+ * FKs into the legacy `document` table) and a Java translator resolved it
+ * before persisting — two id spaces, one column.
+ *
+ * So the legacy CRM's two hardcoded constants were not "a silent
+ * inconsistency" between equals: the list query's 6 was a real
+ * training_videos.id ("Process of how Handymen team gets payment", the last
+ * registration video), and count/export's 3 was a WIRE id that matches
+ * nothing in storage. This port unified on 3 — the broken one. Measured on QA
+ * 2026-09-07 after the canonicalisation migration: `WHERE video_id = 3`
+ * matches 0 of 7,220 rows, so `watched_percentage` came back NULL for all
+ * 4,055 rows of this queue and the "Pending Member Verification" bucket and
+ * the early-activation highlight could never fire at all.
+ *
+ * WHAT IT MEANS NOW: the minimum completion across every video this
+ * technician is REQUIRED to watch — 100 only when all of them are done, 0
+ * while any is unstarted. That is the same question the app's registration
+ * gate asks (services/mobile-registration.service.js fetchTrainingCompletedTime),
+ * and asking it the same way is the point: the operator's queue and the
+ * technician's earning gate must not disagree about whether training is done.
+ * Gating on ONE video — any one — marks the whole section complete the moment
+ * a single video finishes, which is the defect the mobile gate already fixed.
+ *
+ * The required set MIRRORS lms.mandatoryVideoIdsSql(): the global catalogue
+ * plus the videos of mandatory courses the technician actually HOLDS. It is
+ * restated here rather than called because that helper correlates on a `?`
+ * bind, and this is a set-based join over the whole queue — there is no
+ * per-row efr_id to bind. Both flag columns arrive by migration and are
+ * probed exactly as lms.service probes them; a missing column degrades the
+ * arm to `1=0` (empty set → MIN over no rows → NULL → every consumer reads
+ * "not complete", the safe direction).
+ *
+ * Pre-aggregated by easyfixer_id → one row per technician → no fan-out.
+ * ponytail: the pair list crosses tbl_easyfixer with the global catalogue
+ * (~32k rows on QA), materialised once per query, not per row. Measured on
+ * the counts strip: 107-120ms before, 213-226ms with three global videos
+ * present. Narrow the left arm to technicians who hold a watched row if that
+ * ever matters (measured 146-148ms) — it changes nothing but the timing.
+ */
+async function registeredTrainingJoin() {
+  const { courseMandatory, videoGlobal } = await lms.lmsFlagColumns();
+  return `
+  LEFT JOIN (
+    SELECT m.easyfixer_id,
+           MIN(COALESCE(w.watched_percentage, 0)) AS watched_percentage
+      FROM (
+            SELECT e2.efr_id AS easyfixer_id, tv.id AS video_id
+              FROM tbl_easyfixer e2
+              JOIN training_videos tv ON ${videoGlobal ? 'tv.is_global = 1' : '1=0'}
+             UNION
+            SELECT ec.easyfixer_id, lc.ref_id
+              FROM lms_content lc
+              JOIN courses c            ON c.id = lc.course_id
+              JOIN easyfixer_courses ec ON ec.course_id = c.id
+             WHERE lc.kind = 'video' AND lc.status = 1
+               AND ${courseMandatory ? 'c.is_mandatory = 1' : '1=0'} AND c.status = 1
+           ) m
+      LEFT JOIN easyfixer_watched_video w
+             ON w.easyfixer_id = m.easyfixer_id AND w.video_id = m.video_id
+     GROUP BY m.easyfixer_id
+  ) wvd ON wvd.easyfixer_id = e.efr_id`;
+}
+
+async function registeredJoins() {
+  return `
   FROM tbl_easyfixer e
   LEFT JOIN tbl_user U ON U.user_id = e.user_id
   /* One bank row per easyfixer. tbl_easyfixer_bank_details can hold >1 row per
@@ -1363,11 +1475,11 @@ const REGISTERED_JOINS = `
       FROM tbl_easyfixer_bank_details
      GROUP BY efr_id
   ) tb ON tb.efr_id = e.efr_id
-  /* video_id=3 is unique per easyfixer (easyfixer_id+video_id key) → no fan-out. */
-  LEFT JOIN easyfixer_watched_video wvd ON wvd.easyfixer_id = e.efr_id AND wvd.video_id = 3
+  ${await registeredTrainingJoin()}
   /* One cached performance row per technician (PK lookup; no fan-out). */
   LEFT JOIN tbl_efr_grade_snapshot egs ON egs.efr_id = e.efr_id
 `;
+}
 
 const REGISTERED_SORTS = Object.freeze({
   efr_id:          'e.efr_id',
@@ -1529,6 +1641,10 @@ async function listRegistered(f = {}, scope) {
   const lifecycleInstalled = await lifecycleService.hasLifecycleSchema();
   const lifecycleProjection = await lifecycleService.readProjection('e');
   const { where, params } = buildRegisteredWhere(f, scope, lifecycleInstalled);
+  // Resolved ONCE and reused by the page query and its COUNT: two awaits could
+  // straddle the LMS schema probe's TTL and build the two from different
+  // answers, so a row could be on the page but not in the total.
+  const joins = await registeredJoins();
   const sortCol = REGISTERED_SORTS[f.sortBy] || 'U.insert_date';
   const sortDir = String(f.sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   // Page-size ceiling: 500 for the interactive list (matches the Joi cap).
@@ -1579,14 +1695,14 @@ async function listRegistered(f = {}, scope) {
       tb.efr_bank_acc_num                    AS efr_bank_acc_num,
       ${lifecycleProjection},
       ${lifecycleInstalled ? reappliedProvenanceExists('e') : '0'} AS lifecycle_reapplication_count
-    ${REGISTERED_JOINS}
+    ${joins}
     ${where}
     ORDER BY ${sortCol} ${sortDir}, e.efr_id DESC
     LIMIT ? OFFSET ?
   `, [...params, limit, offset]);
 
   const [[{ total }]] = await pool.query(
-    `SELECT COUNT(*) AS total ${REGISTERED_JOINS} ${where}`,
+    `SELECT COUNT(*) AS total ${joins} ${where}`,
     params
   );
 
@@ -1662,7 +1778,7 @@ async function registeredStatusCounts(scope) {
       SUM(CASE WHEN wvd.watched_percentage = 100 AND e.efr_profile_perc = 100 AND e.efr_profile_img IS NOT NULL AND e.is_identity_details_verified_by_crm IS NULL AND tb.beneficiary_id IS NULL AND tb.easyfix_bank_name_id IS NULL THEN 1 ELSE 0 END) AS pending_member_verification,
       ${reapplicationCountSql} AS reapplications,
       COUNT(*) AS total
-    ${REGISTERED_JOINS}
+    ${await registeredJoins()}
     ${where}
   `, params);
   logger.info('Registered status counts ready · total=' + (Number(row.total) || 0));

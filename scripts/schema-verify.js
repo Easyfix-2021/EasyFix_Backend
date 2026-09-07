@@ -41,12 +41,60 @@ const EXPECTED = {
     'original_appointment_date_time', 'original_appointment_time',
     'job_client_owner', 'helper_req', 'remarks',
     'efr_special_notes', 'branch_details', 'last_update_time',
+    /*
+     * Added 2026-09-07 by verifyExpectedIsComplete(): every one of these is
+     * named by the code's own SQL and was missing from this list, so the loop
+     * below never looked at it. Each was confirmed against the live
+     * INFORMATION_SCHEMA before being added — the whole point of this map is
+     * that a name here which does NOT exist turns the boot gate red for the
+     * wrong reason.
+     *
+     * Magic link (routes/admin/job-magic-link.js,
+     * services/job-magic-link.service.js, services/job-magic-link-cron.js).
+     * The exact set named in verifyExpectedIsComplete's own worked example.
+     */
+    'magic_link_sent_at', 'magic_link_send_count', 'magic_link_last_action',
+    'customer_submitted_at', 'customer_submitted_payload',
+    /*
+     * Client-dashboard job list + the Unreachable / Enquiry outcome pair
+     * (routes/client/index.js, services/enquiry-notification.service.js).
+     * `call_later` is probe-gated on the WRITE side (job.service.js
+     * hasCallLaterColumn, job-comment.service.js hasJobColumn) and named by an
+     * unguarded SELECT on the READ side (quicksight-admin-dashboard.service.js
+     * line 560, routes/client/index.js) — so it is NOT optional: losing it
+     * still 500s the admin dashboard report. Listed strictly, exactly as
+     * training_videos.is_global and courses.is_mandatory are.
+     */
+    'ticket_created_date_time', 'enquiry_date_time', 'call_later',
+    'sub_job_id', 'ready_for_billing', 'enquiry_reason_id',
+    // The Jobs export's audit columns (services/job-export.service.js). Every
+    // one is a literal in that SELECT, so a rename empties a column of the
+    // operator-facing XLSX with no error anywhere.
+    'remarks_date_time', 'enum_reason_id',
+    'fk_scheduled_by', 'fk_checkout_by', 'first_scheduled_by',
+    // Technician app job lifecycle — check-in OTP, questionnaire binding,
+    // cash collection and the revisit triple (services/mobile-job-lifecycle
+    // .service.js, services/mobile-phe.service.js). These gate check-out, so a
+    // gap is a technician who cannot close a job.
+    'otp', 'fk_questionaire_id', 'problem_reason_id',
+    'is_collected_cash_by_app', 'material_charge', 'collect_cash_reason_id',
+    'revisit_reason_id', 'revisit_date', 'revisit_time_slot',
+    'app_checkout_date_time', 'visit_number',
+    // QuickSight report columns (services/quicksight/*.service.js) + the
+    // webhook reschedule reason (services/webhook.service.js). Same story as
+    // the Supply Gap incident recorded on tbl_user below: a report reads these
+    // by name and 500s on every environment the moment one moves.
+    'original_scheduling_date_time', 'billing_checkout_date_time',
+    'custom_property', 'reschedule_reason_id',
   ],
   tbl_job_services: [
     'job_service_id', 'job_id', 'service_id', 'service_type_id', 'service_category_id',
     'quantity', 'total_charge', 'material_charge', 'easyfix_charge',
     'easyfixer_charge', 'client_charge', 'job_charge_type',
     'service_charge_description', 'job_service_status',
+    // The two-stage charge approval (services/job-charges.service.js) and the
+    // Material report's line total (quicksight-material-report.service.js).
+    'approval_by_client', 'is_approved_by_pm', 'total_cost',
   ],
   tbl_job_comment: [
     'comment_id', 'job_id', 'comments', 'comment_on', 'created_on',
@@ -160,12 +208,26 @@ const EXPECTED = {
     'reporting_manager',
     'city', 'pin_code', 'is_personal_detail_filled',
     'insert_date', 'update_date', 'updated_by',
+    // Added 2026-09-07. Same family as city / pin_code above and the same
+    // hazard: `personal_details_filled` and `is_personal_detail_filled` are two
+    // DIFFERENT live columns (singular vs plural, one prefixed `is_`), read
+    // side by side in services/candidate-ranking.service.js's pre-lifecycle
+    // derivation. A rename of either is silent until the funnel reads wrong.
+    'user_code', 'personal_details_filled', 'state', 'district', 'is_released',
   ],
-  tbl_vertical: ['vertical_id', 'vertical_name', 'status'],
+  // vertical_desc + the four audit columns are written by the Manage Verticals
+  // CRUD (routes/admin/verticals.js); only the three-column read was listed.
+  tbl_vertical: [
+    'vertical_id', 'vertical_name', 'status',
+    'vertical_desc', 'inserted_on', 'inserted_by', 'updated_on', 'updated_by',
+  ],
   confirmation_token: [
     'id', 'token', 'login_id', 'is_verified', 'client_id', 'easyfixer_id', 'is_token_expired',
   ],
-  pincode_firefox_city_mapping: ['id', 'pincode', 'firefox_city_id'],
+  // city_name is denormalised onto the mapping row and selected directly by
+  // services/auto-assign.service.js, rather than joined from
+  // firefox_city_mapping — so it is a real dependency, not a duplicate.
+  pincode_firefox_city_mapping: ['id', 'pincode', 'firefox_city_id', 'city_name'],
   firefox_city_mapping: ['id', 'city_name', 'city_id', 'no_of_slot'],
   // training_video_id is the FK into `document` that resolves a video's
   // playable URL; services/lms.service.js both reads it and writes it
@@ -201,9 +263,12 @@ const EXPECTED = {
   // badge_earned_at: 2026-09-01-course-completion-rewards. The EARNED stamp —
   // a badge/certificate entitlement, recorded so a later course edit cannot
   // revoke one. Strict, like its two siblings on `courses`.
+  // completion_date / due_date: the assignment's own dates, read by
+  // routes/admin/lms-action.js and services/lms.service.js. Older than
+  // badge_earned_at and simply never listed. Strict, like its siblings.
   easyfixer_courses: [
     'id', 'easyfixer_id', 'course_id', 'score', 'created_at', 'updated_at',
-    'badge_earned_at',
+    'badge_earned_at', 'completion_date', 'due_date',
   ],
   /*
    * Course CONTENT (2026-08-26-lms-content-types-and-assessments.sql). These
@@ -246,6 +311,54 @@ const EXPECTED = {
     // `personal_detail_filled_verified_by_crm` -- the name the report used --
     // exists in no table at all; this is the real one.
     'is_personal_details_verified_by_crm', 'is_identity_details_verified_by_crm',
+    /*
+     * Added 2026-09-07. This table held 42 of the 91 columns the code named and
+     * this list did not — by far the largest blind spot, because everything
+     * above was added one incident at a time and nobody ever swept it. All 42
+     * confirmed present in the live INFORMATION_SCHEMA before listing.
+     *
+     * Identity + contact, read on nearly every technician-facing surface
+     * (routes/admin/calls.js, routes/admin/validate.js, routes/mobile/rewards
+     * .js, services/easyfixer-profile-update-link.service.js).
+     */
+    'efr_first_name', 'efr_last_name', 'efr_email', 'efr_alt_no',
+    'efr_address', 'efr_address_res', 'efr_pin_no',
+    'efr_marital_status', 'efr_children', 'about_yourself', 'about_yourself2',
+    'efr_profile_img', 'efr_profile_perc',
+    'user_id', 'experience_id', 'updated_by',
+    'insert_date', 'update_date',
+    // Assignment + ranking inputs (services/auto-assign.service.js,
+    // services/candidate-ranking.service.js). A gap here does not 500 loudly —
+    // it silently changes who gets offered the job.
+    'efr_zone_city_id', 'efr_service_category', 'efr_service_type',
+    'efr_manager_id', 'skill_rating', 'tool_rating',
+    'inactive_comment', 'inactive_reason', 'send_back_to_tx_reason_crm',
+    'last_inactive_date_time', 'profile_activation_date_time',
+    'scheduled_reactivation_date',
+    /*
+     * The v5.1 technician lifecycle (services/easyfixer-lifecycle.service.js +
+     * its two crons). These are the closest thing in this batch to a genuinely
+     * OPTIONAL column — easyfixer-lifecycle.service.js probes the schema
+     * (hasLifecycleSchema) and readProjection() substitutes NULL literals when
+     * it is absent. They are still listed STRICTLY, for the reason already
+     * recorded for training_videos.is_global: the probe stops a 500, it does
+     * not make the column optional. And the tolerance is not even complete —
+     * services/withdrawal.service.js line 47, services/lms-action.service.js
+     * line 253, services/easyfixer-work-eligibility.service.js line 26 and
+     * services/easyfixer-reactivation-cron.js line 49 all name lifecycle_status
+     * in unguarded SQL, so losing it 500s withdrawals and the LMS action list
+     * whatever the probe says.
+     */
+    'lifecycle_status', 'lifecycle_changed_at', 'lifecycle_reason_code',
+    'lifecycle_reason', 'lifecycle_version', 'lifecycle_source',
+    // Profile-save OTP gate (services/easyfixer-profile-otp.service.js) and the
+    // profile-update magic link's send audit
+    // (services/easyfixer-profile-update-link.service.js).
+    'profile_update_otp', 'profile_update_otp_valid_up_to',
+    'profile_update_sent_at', 'profile_update_send_count',
+    // Insurance flags shown on the technician's own profile screen
+    // (services/mobile-profile-extra.service.js). BIT(1) — see SCHEMA.md.
+    'health_insurance', 'accidental_insurance',
   ],
   tbl_idempotency_key: [
     'actor_type', 'actor_id', 'idempotency_key', 'method', 'path',
@@ -266,6 +379,10 @@ const EXPECTED = {
   tbl_easyfixer_rating_by_customer: [
     'table_id', 'easyfixer_id', 'job_id', 'customer_rating', 'comment',
     'review_comment', 'is_escalated', 'insert_date_time',
+    // The escalation's WHO and WHEN — is_escalated was listed, the pair that
+    // records it was not (routes/admin/jobs.js writes them,
+    // services/job-export.service.js reads escalated_time).
+    'escalated_by', 'escalated_time',
   ],
 };
 
