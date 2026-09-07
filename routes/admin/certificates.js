@@ -35,10 +35,17 @@ const logger = require('../../logger');
  * still served, without an id line — exactly what this endpoint produced
  * before, which is the right degradation for a document somebody is waiting on.
  *
- * One record per certificate, not per download: unlike the LMS path there is no
- * natural key here, so every call to this endpoint IS a new issuance. That is
- * the correct reading — an operator pressing the button twice has deliberately
- * issued two documents, and each gets its own number.
+ * ONE RECORD PER FORM, NOT PER DOWNLOAD. That reading was wrong when this
+ * shipped, and a report proved it within the day: an operator filled the form
+ * once, clicked PDF and then PNG, and got EF-GEN-2026-0001 and -0002 — two
+ * numbers for one award, with no way for a later lookup to say which is real.
+ * Pressing a second FORMAT button is not issuing a second document.
+ *
+ * `issueKey` fixes it: the CRM mints a UUID when the form loads and again
+ * whenever a field changes, and sends it with every download, so three formats
+ * of one form share a row while an edit or a reload starts a new issuance.
+ * Optional, so a caller that sends none keeps the old one-row-per-request
+ * behaviour rather than colliding with every other keyless call.
  *
  * ─── THE GATE ──────────────────────────────────────────────────────────────
  *
@@ -65,6 +72,12 @@ const renderBody = Joi.object({
   heading: Joi.string().trim().max(80).optional(),
   eyebrow: Joi.string().trim().max(120).optional(),
   dateText: Joi.string().trim().allow('').max(60).optional(),
+  /*
+   * The idempotency key. Identifies the ACT of issuing, not the text — hashing
+   * the printed fields would silently merge two different people who share a
+   * name, a course and a date, which a batch induction produces routinely.
+   */
+  issueKey: Joi.string().trim().max(64).optional(),
   /*
    * NO certificateId. The number is server-issued now, so a caller that still
    * sends one has it dropped by validate()'s stripUnknown rather than printed —
@@ -120,7 +133,14 @@ router.post('/render', requireAction('isCertificateIssue'), validate(renderBody)
             + ' · ' + e.message);
           return null;
         });
-      const values = { ...b, certificateId: rec?.certificate_no };
+      /*
+       * issueKey is dropped here, not passed through. The renderer ignores keys
+       * it does not know, so this is hygiene rather than a fix — but a bookkeeping
+       * value has no business in a payload that describes a document, and the
+       * moment anything iterates these keys it would start to matter.
+       */
+      const { issueKey: _issueKey, ...printable } = b;
+      const values = { ...printable, certificateId: rec?.certificate_no };
 
       /*
        * `undefined` is what makes the renderer default to today in IST, so an

@@ -65,7 +65,10 @@ const table = (() => {
      * of NULLs in a UNIQUE index, which is the whole reason manual rows (no
      * enrolment) can coexist while LMS rows are held to one per enrolment. */
     for (const [col, key] of [['enrolment_id', 'uq_certificate_enrolment'],
-      ['certificate_no', 'uq_certificate_no']]) {
+      ['certificate_no', 'uq_certificate_no'],
+      /* uq_certificate_issue_key, added 2026-09-08 — same NULL rule: a caller
+       * that sends no key gets one row per request, as before. */
+      ['issue_key', 'uq_certificate_issue_key']]) {
       if (row[col] == null) continue;
       if (!rows.some((r) => String(r[col]) === String(row[col]))) continue;
       if (/ON DUPLICATE KEY UPDATE/i.test(sql)) return { affectedRows: 0, insertId: 0 };
@@ -97,6 +100,10 @@ const fake = installFakePool([
     .filter((r) => Number(r.enrolment_id) === Number(p[0]))],
   [/FROM tbl_certificate WHERE certificate_no/i, (sql, p) => table.rows
     .filter((r) => r.certificate_no === p[0])],
+  /* Added with uq_certificate_issue_key: issueManual reads by key before it
+   * writes, and again if ON DUPLICATE matched past that read. */
+  [/FROM tbl_certificate WHERE issue_key/i, (sql, p) => table.rows
+    .filter((r) => r.issue_key != null && r.issue_key === p[0])],
   [/FROM tbl_certificate WHERE id = \?/i, (sql, p) => table.rows
     .filter((r) => Number(r.id) === Number(p[0]))],
 ]);
@@ -286,6 +293,47 @@ test('both LMS downloads record BEFORE rendering, and fail open', () => {
 
 /* ── the table this rests on ──────────────────────────────────────────────── */
 
+test('one form is one issuance, however many formats are downloaded', async () => {
+  /*
+   * Reported 2026-09-08: an operator filled the form once and clicked PDF then
+   * PNG. Two rows, EF-GEN-2026-0001 and -0002 — two numbers for one award,
+   * with nothing to tell a later lookup which is real. Pressing a second FORMAT
+   * button is not issuing a second document.
+   */
+  table.reset();
+  const form = { recipientName: 'Harshit', title: 'Introduction to Easyfix', issueKey: 'form-abc' };
+
+  const pdf = await svc.issueManual(form, 2);
+  const png = await svc.issueManual(form, 2);
+  const jpg = await svc.issueManual(form, 2);
+
+  assert.equal(png.certificate_no, pdf.certificate_no, 'a second FORMAT must reuse the number');
+  assert.equal(jpg.certificate_no, pdf.certificate_no);
+  assert.equal(table.rows.length, 1, 'three downloads of one form are one row');
+});
+
+test('an edited field is a NEW issuance, and a keyless caller is unaffected', async () => {
+  table.reset();
+  const form = { recipientName: 'Harshit', title: 'Introduction to Easyfix', issueKey: 'form-abc' };
+  const first = await svc.issueManual(form, 2);
+
+  /* The page mints a fresh key whenever a value changes, which IS a new award. */
+  const edited = await svc.issueManual({ ...form, title: 'Advanced', issueKey: 'form-xyz' }, 2);
+  assert.notEqual(edited.certificate_no, first.certificate_no);
+  assert.equal(table.rows.length, 2);
+
+  /*
+   * And a caller that sends NO key keeps the old one-row-per-request rule —
+   * issue_key is NULL, and MySQL permits any number of NULLs in a unique index.
+   * Without this, an older CRM build would collide with every other keyless
+   * call and silently reuse a stranger's certificate number.
+   */
+  const a = await svc.issueManual({ recipientName: 'A', title: 'T' }, 2);
+  const b = await svc.issueManual({ recipientName: 'A', title: 'T' }, 2);
+  assert.notEqual(a.certificate_no, b.certificate_no);
+  assert.equal(table.rows.length, 4);
+});
+
 test('the migration declares the indexes the service relies on', () => {
   /* Comments stripped first — the header EXPLAINS the omissions by naming
    * them, so a raw scan reads the rationale as a violation. */
@@ -294,6 +342,15 @@ test('the migration declares the indexes the service relies on', () => {
   assert.match(sql, /UNIQUE KEY uq_certificate_enrolment \(enrolment_id\)/,
     'this index IS the one-record-per-certificate rule');
   assert.match(sql, /UNIQUE KEY uq_certificate_no \(certificate_no\)/);
+  /*
+   * The third index lives in a LATER migration, because the table was already
+   * in QA and Production by the time one download per FORMAT was found to be
+   * issuing one certificate per click.
+   */
+  const alter = readMigration('2026-09-08-certificate-issue-key.sql');
+  assert.match(alter, /ADD COLUMN issue_key VARCHAR\(64\) NULL/,
+    'nullable, so a keyless caller does not collide with every other keyless caller');
+  assert.match(alter, /ADD UNIQUE KEY uq_certificate_issue_key \(issue_key\)/);
   assert.match(sql, /enrolment_id\s+INT NULL/,
     'NULLABLE, or two manual certificates collide on the enrolment index');
   assert.match(sql, /issued_on\s+DATETIME NOT NULL/);

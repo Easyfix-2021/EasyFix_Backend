@@ -102,6 +102,22 @@ async function issueForEnrolment(row) {
  * enrolment_id stays NULL, and MySQL permits many NULLs in a UNIQUE index, so
  * manual rows never collide with each other on uq_certificate_enrolment.
  *
+ * IDEMPOTENT ON issue_key (2026-09-08). Reported: one filled form, a click on
+ * PDF and then on PNG, two rows and two numbers for one award. The LMS path
+ * never had this because enrolment_id keys it; manual issuance had no key at
+ * all, since the recipient may exist in no table here.
+ *
+ * The key identifies the ACT of issuing, not the text — the CRM mints a UUID
+ * when the form loads and again whenever a field changes. Hashing the printed
+ * fields instead would collide two different people who share a name, a course
+ * and a date, which is an ordinary occurrence on a batch induction and silent
+ * when it happens.
+ *
+ * A caller that sends no key keeps the old behaviour of one row per request:
+ * issue_key is NULL and MySQL allows many NULLs in a unique index, so keyless
+ * rows never collide with each other. That is what keeps an older CRM build
+ * working against a newer backend.
+ *
  * dateText is resolved to what the renderer WOULD print when the caller omits
  * it: `undefined` means "today in IST" to utils/pdf-certificate, and storing
  * NULL instead would make a re-issue print a different date from the holder's
@@ -109,17 +125,43 @@ async function issueForEnrolment(row) {
  */
 async function issueManual(values, actor) {
   const v = values || {};
+  const key = typeof v.issueKey === 'string' && v.issueKey.trim() !== ''
+    ? v.issueKey.trim().slice(0, 64)
+    : null;
+
+  /*
+   * Return the existing issuance before writing anything. The unique index is
+   * still the guarantee — this read only avoids burning an AUTO_INCREMENT id
+   * on the common case, where an operator clicks PDF then PNG a second apart.
+   */
+  if (key) {
+    const [[found]] = await pool.query(
+      `SELECT ${COLUMNS} FROM tbl_certificate WHERE issue_key = ?`, [key]);
+    if (found) return found;
+  }
+
   const [ins] = await pool.query(
     `INSERT INTO tbl_certificate
        (certificate_no, source, recipient_name, title, heading, eyebrow, date_text,
-        signatory_name, signatory_title, issued_by, issued_on)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        signatory_name, signatory_title, issued_by, issued_on, issue_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE id = id`,
     [null, 'manual', String(v.recipientName), String(v.title),
       v.heading ?? null, v.eyebrow ?? null,
       v.dateText === undefined ? formatDate(todayIst()) : v.dateText,
       v.signatoryName ?? null, v.signatoryTitle ?? null,
-      actor == null ? null : Number(actor), new Date()],
+      actor == null ? null : Number(actor), new Date(), key],
   );
+
+  /*
+   * insertId is 0 when ON DUPLICATE KEY UPDATE matched — two downloads a
+   * millisecond apart, past the read above. The row exists; read it by key.
+   */
+  if (!ins.insertId && key) {
+    const [[raced]] = await pool.query(
+      `SELECT ${COLUMNS} FROM tbl_certificate WHERE issue_key = ?`, [key]);
+    if (raced) return raced;
+  }
   /*
    * The YEAR is IST, matching issued_on — which the pool's +05:30 session
    * stores verbatim. The server clock is UTC in every container, so reading the
