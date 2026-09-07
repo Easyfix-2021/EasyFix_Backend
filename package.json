@@ -47,6 +47,7 @@
     "dotenv": "^16.4.7",
     "exceljs": "^4.4.0",
     "express": "^4.21.2",
+    "fontkit": "^2.0.4",
     "joi": "^17.13.3",
     "joi-to-swagger": "^6.2.0",
     "js-yaml": "^4.1.1",

@@ -19,9 +19,12 @@
 const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
 const { PassThrough } = require('stream');
+const fontkit = require('fontkit');
+const sharp = require('sharp');
 const { installFakePool } = require('./helpers/fake-pool');
 const { readMigration } = require('./helpers/migration-file');
 
@@ -33,9 +36,41 @@ after(() => fake.restore());
 const {
   renderCertificatePdf, renderCertificateImage, planCertificate, certificateSvg,
   formatDate, OUTPUT_FORMATS, ARTWORK_PNG, ARTWORK_SVG, ARTWORK_LAYOUT, ARTWORK_DIR,
-  DEFAULT_LAYOUT, PX_W, PX_H,
+  DEFAULT_LAYOUT, FONT_DIR, FACES, STYLE, PX_W, PX_H,
 } = require('../utils/pdf-certificate');
 const logger = require('../logger');
+
+/* ── reading the outlined overlay back ────────────────────────────────────── */
+
+/* The `d` the SVG drew for one planned run, or '' if it drew none. */
+function runPath(plan, name) {
+  const m = new RegExp(`<path data-run="${name}"[^>]*\\sd="([^"]*)"`).exec(certificateSvg(plan));
+  return m ? m[1] : '';
+}
+
+/*
+ * The outline that run SHOULD be, rebuilt straight from the bundled .ttf.
+ *
+ * It walks the same advances the renderer does, on purpose: what it proves is
+ * not that the loop is correct — the rendered page proves that — but that the
+ * ink in the overlay comes from a font file in THIS repository, at the size,
+ * baseline and x the plan decided. A different face, a different size or a
+ * regression to name-referenced <text> all break it.
+ */
+function outlineOf(run, text) {
+  const f = fontkit.openSync(path.join(FONT_DIR, FACES[run.font]));
+  const s = run.size / f.unitsPerEm;
+  const laid = f.layout(text);
+  const parts = [];
+  let pen = run.x;
+  for (let i = 0; i < laid.glyphs.length; i++) {
+    const p = laid.positions[i];
+    parts.push(laid.glyphs[i].path
+      .transform(s, 0, 0, -s, pen + p.xOffset * s, run.baseline - p.yOffset * s).toSVG());
+    pen += p.xAdvance * s + run.tracking;
+  }
+  return parts.join('');
+}
 
 /* ── reading a pdfkit page back ───────────────────────────────────────────── */
 
@@ -50,8 +85,11 @@ function renderToBuffer(payload) {
   });
 }
 
-/* Every FlateDecode stream in the file, inflated. The page content is one of them. */
-function inflatedStreams(buf) {
+/*
+ * Every FlateDecode stream in the file, inflated, tagged with the object number
+ * it belongs to. The page content is one of them; so is every ToUnicode CMap.
+ */
+function pdfStreams(buf) {
   const out = [];
   let i = 0;
   while ((i = buf.indexOf('stream', i)) !== -1) {
@@ -75,33 +113,139 @@ function inflatedStreams(buf) {
      */
     const dict = buf.subarray(Math.max(0, i - 512), i).toString('latin1');
     if (/\/Subtype\s*\/Image/.test(dict)) { i = end + 'endstream'.length; continue; }
-    try { out.push(zlib.inflateSync(buf.subarray(start, end)).toString('latin1')); } catch { /* font */ }
+    const objs = dict.match(/(\d+)\s+0\s+obj/g) || [];
+    const obj = objs.length ? Number(objs[objs.length - 1].match(/\d+/)[0]) : -1;
+    try {
+      out.push({ obj, text: zlib.inflateSync(buf.subarray(start, end)).toString('latin1') });
+    } catch { /* a raw, uncompressed font program */ }
     i = end + 'endstream'.length;
   }
   return out;
 }
 
+const contentStreams = (buf) => pdfStreams(buf).filter((s) => /\bTJ\b|\bTj\b/.test(s.text));
+
+/* One ToUnicode CMap: 2-byte code -> the characters it stands for. */
+function parseCMap(src) {
+  const m = new Map();
+  /*
+   * A destination is UTF-16BE, and may be MORE THAN ONE unit — pdfkit writes
+   * the fi ligature's glyph as `<0066 0069>`, spaces and all. Reading only
+   * `[0-9A-Fa-f]+` skips that entry, which silently shifts every destination
+   * after it by one and turns the rest of the line into plausible gibberish
+   * ("Certificate ID: EF-TR" decoded as "Certica:te ID- EF4TR"). Strip the
+   * whitespace instead of excluding it.
+   */
+  const chars = (raw) => {
+    const h = raw.replace(/\s+/g, '');
+    let s = '';
+    for (let i = 0; i + 4 <= h.length; i += 4) s += String.fromCharCode(parseInt(h.slice(i, i + 4), 16));
+    return s;
+  };
+  for (const b of src.matchAll(/beginbfchar([\s\S]*?)endbfchar/g)) {
+    for (const p of b[1].matchAll(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f\s]+?)>/g)) {
+      m.set(parseInt(p[1], 16), chars(p[2]));
+    }
+  }
+  /*
+   * BOTH bfrange forms. pdfkit writes the ARRAY one —
+   *   <0000> <000d> [<0000> <0043> <0045> …]
+   * — one destination per code, because a glyph subset's indices are assigned
+   * in order of first use and map to no contiguous run of characters. A parser
+   * that handles only the `<lo> <hi> <dst>` form silently produces an EMPTY map
+   * and every decode then comes back as replacement characters, which reads
+   * exactly like "the renderer drew nothing".
+   */
+  for (const b of src.matchAll(/beginbfrange([\s\S]*?)endbfrange/g)) {
+    const range = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:\[([\s\S]*?)\]|<([0-9A-Fa-f]+)>)/g;
+    for (const p of b[1].matchAll(range)) {
+      const [lo, hi] = [parseInt(p[1], 16), parseInt(p[2], 16)];
+      if (p[3] !== undefined) {
+        const list = [...p[3].matchAll(/<([0-9A-Fa-f\s]*?)>/g)].map((x) => chars(x[1]));
+        for (let c = lo; c <= hi && c - lo < list.length; c++) m.set(c, list[c - lo]);
+      } else {
+        const dst = parseInt(p[4], 16);
+        for (let c = lo; c <= hi; c++) m.set(c, String.fromCharCode(dst + (c - lo)));
+      }
+    }
+  }
+  return m;
+}
+
 /*
- * pdfkit writes Helvetica text as hex inside a TJ array with kerning numbers
- * between the chunks — `[<45617379> 30 <466978> 0] TJ`. Concatenating the hex
- * chunks in order rebuilds the string; the kerning is layout, not content.
+ * Resource name (/F3) -> that font's CMap, resolved through the page's own
+ * /Font dictionary and each font object's /ToUnicode reference.
+ *
+ * Resolved rather than assumed from stream order: every glyph subset numbers
+ * its glyphs from 1, so decoding one font's codes with another's map produces
+ * plausible-looking characters rather than an error, and an assertion built on
+ * a guessed correspondence would fail — or worse, pass — for reasons nothing
+ * reports.
+ */
+function fontMaps(buf) {
+  const raw = buf.toString('latin1');
+  const streams = new Map(pdfStreams(buf).map((s) => [s.obj, s.text]));
+  const maps = new Map();
+  const res = /\/Font\s*<<([\s\S]*?)>>/.exec(raw);
+  if (!res) return maps;
+  for (const m of res[1].matchAll(/\/(F\d+)\s+(\d+)\s+0\s+R/g)) {
+    const font = new RegExp(`(?:^|[^\\d])${m[2]}\\s+0\\s+obj([\\s\\S]{0,800}?)endobj`).exec(raw);
+    const tu = font && /\/ToUnicode\s+(\d+)\s+0\s+R/.exec(font[1]);
+    const src = tu && streams.get(Number(tu[1]));
+    if (src) maps.set(m[1], parseCMap(src));
+  }
+  return maps;
+}
+
+/*
+ * The strings the page actually shows.
+ *
+ * An EMBEDDED subset is written with /Encoding /Identity-H, so the hex inside a
+ * TJ array is glyph INDICES in that font's subset, not character codes — the
+ * naive latin1 read this used to do returns binary noise now that the faces are
+ * bundled rather than standard-14. Each BT block names its font with `/Fn … Tf`
+ * and that font's ToUnicode CMap is what turns its indices back into text.
  */
 function pdfText(buf) {
-  const content = inflatedStreams(buf).join('\n');
+  const maps = fontMaps(buf);
   let text = '';
-  for (const m of content.matchAll(/\[((?:\s*(?:<[0-9A-Fa-f]*>|-?[\d.]+))+)\s*\]\s*TJ/g)) {
-    for (const hex of m[1].matchAll(/<([0-9A-Fa-f]*)>/g)) {
-      text += Buffer.from(hex[1], 'hex').toString('latin1');
+  for (const stream of contentStreams(buf)) {
+    for (const block of stream.text.split(/\bBT\b/).slice(1)) {
+      const named = /\/(F\d+)\s+[\d.]+\s+Tf/.exec(block);
+      const map = named && maps.get(named[1]);
+      for (const m of block.matchAll(/\[((?:\s*(?:<[0-9A-Fa-f]*>|-?[\d.]+))+)\s*\]\s*TJ/g)) {
+        for (const hex of m[1].matchAll(/<([0-9A-Fa-f]*)>/g)) {
+          const h = hex[1];
+          if (!map) { text += Buffer.from(h, 'hex').toString('latin1'); continue; }
+          for (let i = 0; i + 4 <= h.length; i += 4) {
+            text += map.get(parseInt(h.slice(i, i + 4), 16)) ?? '�';
+          }
+        }
+        text += '\n';
+      }
+      for (const m of block.matchAll(/\(((?:[^()\\]|\\.)*)\)\s*Tj/g)) text += `${m[1]}\n`;
     }
-    text += '\n';
   }
-  for (const m of content.matchAll(/\(((?:[^()\\]|\\.)*)\)\s*Tj/g)) text += `${m[1]}\n`;
   return text;
 }
 
 /* One BT…ET per text() call, so this counts LINES actually drawn. */
 function textBlocks(buf) {
-  return (inflatedStreams(buf).join('\n').match(/(^|\n)BT(\n|$)/g) || []).length;
+  return contentStreams(buf).reduce(
+    (n, s) => n + (s.text.match(/(^|\n)BT(\n|$)/g) || []).length, 0,
+  );
+}
+
+/* Where each BT block set its text matrix — the x the PDF actually drew at. */
+function pdfRunOrigins(buf) {
+  const out = [];
+  for (const stream of contentStreams(buf)) {
+    for (const block of stream.text.split(/\bBT\b/).slice(1)) {
+      const tm = /1 0 0 1 ([-\d.]+) ([-\d.]+) Tm/.exec(block);
+      if (tm) out.push({ x: Number(tm[1]), y: Number(tm[2]) });
+    }
+  }
+  return out;
 }
 
 const FULL = {
@@ -121,8 +265,8 @@ test('POSITIVE CONTROL: every run the payload asked for is actually on the page'
    * this is the test that says so. A %PDF- header check would not.
    */
   const text = pdfText(await renderToBuffer(FULL));
-  for (const s of ['Ramesh Kumar', 'Induction & Safety', '30 August 2026',
-    'EF-TR-2026-0042', 'J. Ranjan', 'Training Head', 'PRESENTED TO', 'DATE']) {
+  for (const s of ['RAMESH KUMAR', 'Induction & Safety', '30 August 2026',
+    'EF-TR-2026-0042', 'J. Ranjan', 'TRAINING HEAD', 'PRESENTED TO', 'DATE']) {
     assert.ok(text.includes(s), `the page must print ${JSON.stringify(s)}`);
   }
 });
@@ -183,7 +327,8 @@ test('an omitted dateText defaults to TODAY IN IST, not to the server clock', as
 test('no certificateId and no signatory means those lines are ABSENT', async () => {
   const text = pdfText(await renderToBuffer({ recipientName: 'A B', title: 'Reading Only' }));
   assert.ok(!text.includes('EF-TR'), 'no id was supplied, so no id line');
-  assert.ok(!text.includes('Training Head'), 'no signatory was supplied');
+  assert.ok(!/Certificate ID/i.test(text), 'and no caption for it either');
+  assert.ok(!/TRAINING HEAD/i.test(text), 'no signatory was supplied');
   assert.ok(!text.includes('J. Ranjan'));
 });
 
@@ -195,7 +340,7 @@ test('a signatoryTitle without a name is not printed on its own', async () => {
   const text = pdfText(await renderToBuffer({
     recipientName: 'A B', title: 'T', signatoryTitle: 'Training Head',
   }));
-  assert.ok(!text.includes('Training Head'));
+  assert.ok(!/TRAINING HEAD/i.test(text));
 });
 
 test('an explicitly empty dateText drops the DATE label with it', async () => {
@@ -217,7 +362,7 @@ test('a very long name SHRINKS instead of wrapping into the line below it', asyn
   const big = await renderToBuffer({ ...FULL, recipientName: long });
   assert.equal(textBlocks(big), textBlocks(short),
     'a wrapped name would add a second line and push the page layout down');
-  assert.ok(pdfText(big).includes(long), 'and it must still be legible in full');
+  assert.ok(pdfText(big).includes(long.toUpperCase()), 'and it must still be legible in full');
 });
 
 test('a long TITLE shrinks the same way', async () => {
@@ -277,7 +422,7 @@ test('missing artwork WARNS and still produces a complete certificate', async ()
   try { buf = await renderToBuffer(FULL); } finally { logger.warn = original; }
 
   const text = pdfText(buf);
-  assert.ok(text.includes('Ramesh Kumar') && text.includes('EF-TR-2026-0042'),
+  assert.ok(text.includes('RAMESH KUMAR') && text.includes('EF-TR-2026-0042'),
     'the certificate must be complete in either state');
 
   if (present) {
@@ -512,7 +657,6 @@ for (const format of ['pdf', 'png', 'jpg']) {
 }
 
 test('png and jpg come back at the artwork native size, jpg opaque', async () => {
-  const sharp = require('sharp');
   for (const format of ['png', 'jpg']) {
     const meta = await sharp(await renderCertificateImage({ ...FULL, format })).metadata();
     assert.equal(meta.width, PX_W);
@@ -523,18 +667,22 @@ test('png and jpg come back at the artwork native size, jpg opaque', async () =>
    * A transparent ground encodes to BLACK in JPEG, not white — measured — so
    * this proves `flatten` ran.
    *
-   * It samples the CENTRE, not the top-left corner. The corner test held only
-   * while the certificate drew its own inset border on a white page; the
-   * vendored Brand Kit artwork puts a solid red band (#C42430) hard against
-   * every edge, so the corner is legitimately 196,36,48 and the old assertion
-   * failed on correct output. The centre is the white field in both, and
-   * asserting NOT-BLACK as well as light keeps the check pointed at the defect
-   * it exists for rather than at a particular design.
+   * It samples a point the PLAN left empty, not a fixed one. The top-left
+   * corner held only while the certificate drew its own inset border on a white
+   * page; the vendored Brand Kit artwork puts a solid red band (#C42430) hard
+   * against every edge, so the corner is legitimately 196,36,48. The exact
+   * centre then failed too, once the recipient name grew: 0.5 of the height is
+   * inside its band, and the sample landed on a glyph. Asking the plan where
+   * the runs are NOT is the version that survives the next type change.
    */
   const jpg = await sharp(await renderCertificateImage({ ...FULL, format: 'jpg' }))
     .raw().toBuffer({ resolveWithObject: true });
   assert.equal(jpg.info.channels, 3, 'JPEG carries no alpha');
-  const mid = ((jpg.info.height >> 1) * jpg.info.width + (jpg.info.width >> 1)) * 3;
+  const bands = planCertificate(FULL, PX_W, PX_H, [ARTWORK_SVG, ARTWORK_PNG]).runs
+    .map((run) => [run.rect.y, run.rect.y + run.rect.h]);
+  let sampleY = jpg.info.height >> 1;
+  while (bands.some(([y0, y1]) => sampleY >= y0 - 8 && sampleY <= y1 + 8)) sampleY += 8;
+  const mid = (sampleY * jpg.info.width + (jpg.info.width >> 1)) * 3;
   const [r, g, b] = [jpg.data[mid], jpg.data[mid + 1], jpg.data[mid + 2]];
   assert.ok(r > 200 && g > 200 && b > 200,
     `the centre is ${r},${g},${b} — a flattened ground should be light, and black means alpha was dropped unflattened`);
@@ -612,6 +760,13 @@ test('the plan is scale-invariant, which is why one rule can serve both outputs'
       `${a.name}.${what}: ${got} is not ${want} (tolerance ${tol})`);
     near(b.size, a.size * kx, STEP, 'size');
     near(b.tracking, a.tracking * kx, STEP, 'tracking');
+    /*
+     * x and width are the CENTRING both renderers are handed. They follow the
+     * size, so their tolerance is the size tolerance carried through the run's
+     * own width — a whole half-step of point size across a 2900px box.
+     */
+    near(b.width, a.width * kx, STEP * (b.text.length + 1), 'width');
+    near(b.x, a.x * kx, STEP * (b.text.length + 1), 'x');
     near(b.rect.x, a.rect.x * kx, 0.01, 'rect.x');
     near(b.rect.w, a.rect.w * kx, 0.01, 'rect.w');
     near(b.rect.y, a.rect.y * ky, 0.01, 'rect.y');
@@ -619,6 +774,31 @@ test('the plan is scale-invariant, which is why one rule can serve both outputs'
     /* top/baseline mix a ky-scaled rectangle with a kx-scaled line height. */
     near(b.top, a.top * ky, 0.6, 'top');
     near(b.baseline, a.baseline * ky, 0.6, 'baseline');
+  }
+});
+
+test('the PDF draws every run at the PLAN\'s x and baseline, not at one of its own', async () => {
+  /*
+   * The cross-output assertion that has no visual evidence until it is already
+   * wrong, and the reason centring moved into the plan. pdfkit's align:'center'
+   * re-measured the run and re-derived an x; the SVG derived its own from
+   * text-anchor plus a hand-tuned half-tracking correction. Two derivations of
+   * one number, drifting quietly.
+   *
+   * Read out of the page's own text matrices: `1 0 0 1 x y Tm` is where the
+   * renderer actually put the run, and the SVG outlines are generated from the
+   * same two plan fields (asserted glyph-for-glyph further down). So this pins
+   * the two outputs to each other through the plan, not to each other's code.
+   */
+  const plan = planCertificate(FULL, 841.89, 595.28, [ARTWORK_PNG]);
+  const drawn = pdfRunOrigins(await renderToBuffer(FULL));
+  assert.equal(drawn.length, plan.runs.length, 'one text matrix per planned run');
+  for (let i = 0; i < plan.runs.length; i++) {
+    const r = plan.runs[i];
+    assert.ok(Math.abs(drawn[i].x - r.x) < 0.01,
+      `${r.name}: the plan said x=${r.x}, the page drew at ${drawn[i].x}`);
+    assert.ok(Math.abs((595.28 - drawn[i].y) - r.baseline) < 0.01,
+      `${r.name}: the plan said baseline=${r.baseline}, the page drew at ${595.28 - drawn[i].y}`);
   }
 });
 
@@ -633,7 +813,7 @@ test('a name that FITS is never given an ellipsis it did not need', () => {
   const long = 'Venkataramanan Balasubramaniam Chandrasekharan Krishnamoorthy Iyer';
   const plan = planCertificate({ ...FULL, recipientName: long }, PX_W, PX_H, [ARTWORK_PNG]);
   const run = plan.runs.find((r) => r.name === 'recipientName');
-  assert.equal(run.text, long, 'it shrank to fit, so nothing may be cut off it');
+  assert.equal(run.text, long.toUpperCase(), 'it shrank to fit, so nothing may be cut off it');
   assert.ok(run.rect.x + run.rect.w <= PX_W, 'and it stays inside the canvas');
 });
 
@@ -643,11 +823,18 @@ test('what MIN_PT still cannot hold is truncated, in BOTH outputs identically', 
   const run = plan.runs.find((r) => r.name === 'recipientName');
   assert.ok(run.text.length < wall.length, 'an unbreakable 400-character run must be cut');
   assert.ok(run.text.endsWith('…'), 'and the cut must be visible');
-  assert.ok(certificateSvg(plan).includes(run.text.slice(0, 40)),
-    'the SVG prints the plan\'s string, never its own truncation');
+  /*
+   * The SVG carries no characters any more, so what is compared is the
+   * GEOMETRY: the outline the SVG drew must be the outline of the plan's
+   * truncated string, not of the wall the caller passed. Rebuilt here from the
+   * bundled face rather than from the module's own outliner, so a truncation
+   * done twice in two ways would show up as a different path.
+   */
+  assert.equal(runPath(plan, 'recipientName'), outlineOf(run, run.text));
+  assert.notEqual(runPath(plan, 'recipientName'), outlineOf(run, wall));
 
   const pdfText_ = pdfText(await renderToBuffer({ ...FULL, recipientName: wall }));
-  assert.ok(pdfText_.includes(run.text.slice(0, 40)), 'and so does the PDF');
+  assert.ok(pdfText_.includes(run.text.slice(0, 40)), 'and the PDF prints the same string');
 });
 
 /* ── the SVG the raster is composed from ──────────────────────────────────── */
@@ -658,13 +845,13 @@ test('POSITIVE CONTROL: the SVG carries every run, not just a frame', () => {
    * reduced to an empty canvas the raster still encodes, still has the right
    * dimensions and still passes every metadata check above — this is the test
    * that notices.
+   *
+   * Runs are counted by <path data-run>, because outlined text has no string
+   * to search for. That is the point of the whole font change, and it is why
+   * the presence assertions below are geometric.
    */
   const plan = planCertificate(FULL, PX_W, PX_H, [ARTWORK_PNG]);
   const svg = certificateSvg(plan);
-  for (const s of ['Ramesh Kumar', 'Induction &amp; Safety', '30 August 2026',
-    'EF-TR-2026-0042', 'J. Ranjan', 'Training Head', 'PRESENTED TO', 'DATE']) {
-    assert.ok(svg.includes(s), `the overlay must carry ${JSON.stringify(s)}`);
-  }
   assert.ok(svg.includes(`width="${PX_W}" height="${PX_H}"`),
     'sharp composites at the SVG\'s intrinsic size, so it must declare the canvas');
   /*
@@ -672,27 +859,219 @@ test('POSITIVE CONTROL: the SVG carries every run, not just a frame', () => {
    * wordmark run that the artwork supplies itself, so a hardcoded number here
    * would flip the day the frame lands and prove nothing either way.
    */
-  assert.equal((svg.match(/<text /g) || []).length, plan.runs.length,
-    'one <text> per planned run — a dropped run is a missing line');
+  assert.equal((svg.match(/<path /g) || []).length, plan.runs.length,
+    'one <path> per planned run — a dropped run is a missing line');
   assert.ok(plan.runs.length >= 10, `only ${plan.runs.length} runs were planned`);
+  for (const r of plan.runs) {
+    const d = runPath(plan, r.name);
+    assert.ok(d && d.length > 20, `${r.name} was planned but drew nothing`);
+    assert.ok(!/NaN|Infinity|undefined/.test(d), `${r.name} emitted non-finite path data`);
+  }
 });
 
-test('the SVG escapes markup rather than emitting it', () => {
+test('NEGATIVE CONTROL: a run removed from the plan disappears from the SVG', () => {
+  /*
+   * The other half of the control above. "Every planned run is drawn" is also
+   * true of a renderer that draws a fixed set of paths regardless of the plan,
+   * so this proves the SVG is actually produced FROM the plan.
+   */
+  const plan = planCertificate(FULL, PX_W, PX_H, [ARTWORK_PNG]);
+  const full = certificateSvg(plan);
+  const without = certificateSvg({ ...plan, runs: plan.runs.filter((r) => r.name !== 'heading') });
+  assert.ok(/data-run="heading"/.test(full));
+  assert.ok(!/data-run="heading"/.test(without));
+  assert.equal((without.match(/<path /g) || []).length, plan.runs.length - 1);
+});
+
+test('an operator-typed name cannot become markup, because it never becomes TEXT', () => {
+  /*
+   * Stronger than the escaping this used to assert: the characters are turned
+   * into outlines before they reach the document, so there is no string in the
+   * SVG to escape, mis-escape or re-interpret.
+   */
   const svg = certificateSvg(planCertificate(
     { ...FULL, recipientName: 'A & B', title: '<script>x</script>' }, PX_W, PX_H, [ARTWORK_PNG],
   ));
-  assert.ok(svg.includes('A &amp; B'));
-  assert.ok(!svg.includes('<script>'), 'an operator-typed name must not become an element');
-  assert.ok(svg.includes('&lt;script&gt;'));
+  assert.ok(!svg.includes('<script'), 'an operator-typed name must not become an element');
+  assert.ok(!svg.includes('&lt;script'), 'nor an escaped one — it is not text at all');
+  assert.ok(!svg.includes('A & B') && !svg.includes('A &amp; B'));
+  assert.ok(/data-run="title"/.test(svg), 'and it is still drawn');
 });
 
 test('omitted runs are absent from the SVG too, not drawn empty', () => {
   const svg = certificateSvg(planCertificate(
     { recipientName: 'A B', title: 'Reading Only', dateText: '' }, PX_W, PX_H, [ARTWORK_PNG],
   ));
-  assert.ok(!svg.includes('EF-TR'), 'no id was supplied');
-  assert.ok(!svg.includes('Training Head'));
-  assert.ok(!/>DATE</.test(svg), 'an empty date drops its caption in both outputs');
+  assert.ok(!/data-run="certificateIdLine"/.test(svg), 'no id was supplied');
+  assert.ok(!/data-run="signatoryName"/.test(svg));
+  assert.ok(!/data-run="dateLabel"/.test(svg), 'an empty date drops its caption in both outputs');
+});
+
+/* ── the fonts: bundled, embedded, outlined ───────────────────────────────── */
+
+test('the SVG contains NO <text> and names NO font — the Alpine defect, structurally', () => {
+  /*
+   * THE regression this guards. The overlay used to say
+   *   font-family="Helvetica, 'Liberation Sans', 'Nimbus Sans', Arial, sans-serif"
+   * and the container is node:20-alpine, which ships no fonts at all: librsvg
+   * resolved none of the names and every downloaded PNG and JPG came out with
+   * .notdef boxes where the text should be, while the frame artwork was
+   * perfect. It rendered correctly on a developer's Mac only because macOS
+   * substitutes a fallback of its own.
+   *
+   * Asserted on the DOCUMENT rather than on a render, deliberately: a render
+   * can only ever sample the machine it ran on, and the machines that matter
+   * are the ones this suite never runs on. A document with no text node and no
+   * font name has nothing for any rasteriser anywhere to resolve.
+   */
+  for (const values of [FULL, { recipientName: 'A B', title: 'T', dateText: '' }]) {
+    const svg = certificateSvg(planCertificate(values, PX_W, PX_H, [ARTWORK_SVG, ARTWORK_PNG]));
+    assert.doesNotMatch(svg, /<text[\s>]/, 'no <text> element may survive in the overlay');
+    assert.doesNotMatch(svg, /font-family/, 'and no font may be referenced by name');
+    assert.doesNotMatch(svg, /font-size|font-weight|letter-spacing|text-anchor/,
+      'those attributes only mean anything on a <text>, so their presence is the smell');
+  }
+  /*
+   * And the stack itself is gone from the CODE, not merely unused. Comments are
+   * stripped first — the header explains the defect by quoting the old stack,
+   * and a naive scan reads its own rationale as the violation.
+   */
+  const src = fs.readFileSync(path.join(ROOT, 'utils/pdf-certificate.js'), 'utf8');
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.doesNotMatch(code, /Liberation Sans|Nimbus Sans|sans-serif|font-family/,
+    'a font-name string left in the code is one edit away from being emitted again');
+});
+
+test('every face STYLE names is a real file bundled in this repo', () => {
+  /*
+   * The runtime dependency is a .ttf in this repo and nothing else — not the
+   * Brand Kit, not the base image, not the developer's font book.
+   */
+  assert.equal(path.basename(FONT_DIR), 'fonts');
+  assert.equal(path.basename(path.dirname(FONT_DIR)), 'assets');
+  for (const [key, file] of Object.entries(FACES)) {
+    const p = path.join(FONT_DIR, file);
+    assert.ok(fs.existsSync(p), `${key} -> ${file} is not bundled`);
+    assert.match(file, /\.ttf$/);
+    /* Static instance: a variable font embeds as its DEFAULT weight, silently. */
+    const f = fontkit.openSync(p);
+    assert.equal(f.variationAxes && Object.keys(f.variationAxes).length, 0,
+      `${file} is a variable font — it would embed at the wrong weight with nothing to flag it`);
+  }
+  for (const [name, style] of Object.entries(STYLE)) {
+    assert.ok(FACES[style.font], `${name} names face ${JSON.stringify(style.font)}, which does not exist`);
+  }
+  assert.ok(fs.existsSync(path.join(FONT_DIR, 'README.md')),
+    'provenance and licence must be recorded beside the binaries');
+});
+
+test('the PDF EMBEDS those faces — no standard-14 alias, no host lookup', async () => {
+  const buf = await renderToBuffer(FULL);
+  const raw = buf.toString('latin1');
+  /*
+   * FontFile2 is the embedded TrueType program. A standard-14 font is written
+   * as a /Type1 /BaseFont with no FontFile at all — the reader then supplies
+   * the glyphs, which is exactly the host dependency this change removes.
+   */
+  const embedded = (raw.match(/\/FontFile2/g) || []).length;
+  assert.ok(embedded >= 3, `only ${embedded} embedded font programs in the PDF`);
+  assert.doesNotMatch(raw, /\/BaseFont\s*\/Helvetica/, 'Helvetica is not embedded, it is assumed');
+  assert.doesNotMatch(raw, /\/BaseFont\s*\/Times|\/BaseFont\s*\/Courier/);
+  for (const ps of ['PlayfairDisplay-Bold', 'IBMPlexSans-Bold', 'GreatVibes-Regular']) {
+    assert.ok(raw.includes(ps), `${ps} must appear as an embedded face in the PDF`);
+  }
+});
+
+test('the plan MEASURES with the same embedded faces both outputs DRAW with', () => {
+  /*
+   * The requirement the shared-fitting rule rests on. pdfkit lays an embedded
+   * run out with fontkit; the SVG outlines are generated from the same
+   * fontkit layout of the same file. So this compares the width planCertificate
+   * fitted against with the advance the bundled face actually produces — if the
+   * measurer ever fell back to a standard-14 alias, the two would diverge and
+   * the SVG would draw something the PDF never measured.
+   */
+  const plan = planCertificate(FULL, PX_W, PX_H, [ARTWORK_PNG]);
+  for (const r of plan.runs) {
+    const f = fontkit.openSync(path.join(FONT_DIR, FACES[r.font]));
+    const advance = (f.layout(r.text).advanceWidth / f.unitsPerEm) * r.size
+      + r.tracking * (r.text.length - 1);
+    assert.ok(Math.abs(advance - r.width) < 0.05,
+      `${r.name}: the plan measured ${r.width} but ${FACES[r.font]} advances ${advance}`);
+    /* And the centring the plan handed both renderers follows from that width. */
+    assert.ok(Math.abs(r.x - (r.rect.x + (r.rect.w - r.width) / 2)) < 0.01, `${r.name} x`);
+  }
+});
+
+test('the SVG outlines are the BUNDLED glyphs, at the plan\'s size and position', () => {
+  /*
+   * Rebuilt from the .ttf independently of the module. It is the assertion that
+   * ties the ink in the raster to a file in this repository: swap the face,
+   * change the size, move the run, or go back to <text>, and the path data no
+   * longer matches.
+   */
+  const plan = planCertificate(FULL, PX_W, PX_H, [ARTWORK_PNG]);
+  for (const r of plan.runs) {
+    assert.equal(runPath(plan, r.name), outlineOf(r, r.text), `${r.name} outline`);
+  }
+});
+
+test('EMPTY-FONTCONFIG: the raster still draws its text with no fonts resolvable', async () => {
+  /*
+   * The closest local stand-in for Alpine — and READ THE CAVEAT BEFORE
+   * TRUSTING A PASS.
+   *
+   * On Linux, sharp's libvips resolves SVG <text> through fontconfig, so
+   * pointing FONTCONFIG_FILE/FONTCONFIG_PATH at a directory with no fonts is a
+   * faithful reproduction of the container and this test genuinely fails on the
+   * old name-referenced overlay. On darwin it is INERT: sharp's prebuilt
+   * libvips links CoreText, not fontconfig (verified — an SVG naming a font
+   * that does not exist rasterises to the same pixel count as one naming
+   * Helvetica), which is precisely why the defect was invisible to every
+   * developer who rendered one of these on a Mac.
+   *
+   * So this test is real coverage on CI and a formality locally. The assertion
+   * that holds everywhere is the structural one above: no <text>, no font name,
+   * nothing to resolve.
+   */
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cert-nofonts-'));
+  fs.mkdirSync(path.join(dir, 'cache'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'fonts.conf'),
+    `<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd"><fontconfig><cachedir>${dir}/cache</cachedir></fontconfig>`);
+  const saved = { file: process.env.FONTCONFIG_FILE, dir: process.env.FONTCONFIG_PATH };
+  process.env.FONTCONFIG_FILE = path.join(dir, 'fonts.conf');
+  process.env.FONTCONFIG_PATH = dir;
+
+  let png;
+  try {
+    png = await renderCertificateImage({ ...FULL, format: 'png' });
+  } finally {
+    if (saved.file === undefined) delete process.env.FONTCONFIG_FILE;
+    else process.env.FONTCONFIG_FILE = saved.file;
+    if (saved.dir === undefined) delete process.env.FONTCONFIG_PATH;
+    else process.env.FONTCONFIG_PATH = saved.dir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  /*
+   * Ink counted inside the rectangles the plan actually placed runs in — the
+   * frame leaves them empty, so every dark pixel there is drawn text. Counting
+   * whole-image ink would pass on the artwork alone, which is the exact defect.
+   */
+  const plan = planCertificate(FULL, PX_W, PX_H, [ARTWORK_SVG, ARTWORK_PNG]);
+  const { data, info } = await sharp(png).raw().toBuffer({ resolveWithObject: true });
+  for (const name of ['heading', 'recipientName', 'certificateIdLine']) {
+    const r = plan.runs.find((x) => x.name === name).rect;
+    let ink = 0;
+    for (let y = Math.round(r.y); y < Math.round(r.y + r.h); y++) {
+      for (let x = Math.round(r.x); x < Math.round(r.x + r.w); x++) {
+        const i = (y * info.width + x) * info.channels;
+        if (data[i] < 200 || data[i + 1] < 200 || data[i + 2] < 200) ink++;
+      }
+    }
+    assert.ok(ink > 500,
+      `${name} drew only ${ink} ink pixels with no fonts resolvable — that is the .notdef defect`);
+  }
 });
 
 test('the image path prefers the VECTOR frame and falls back to the same raster the PDF uses', () => {

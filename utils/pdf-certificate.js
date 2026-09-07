@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const PDFDocument = require('pdfkit');
+const fontkit = require('fontkit');
 const sharp = require('sharp');
 const logger = require('../logger');
 const { todayIst } = require('./ist-calendar');
@@ -66,6 +67,28 @@ const { todayIst } = require('./ist-calendar');
  * the last backstop. So a 60-character name degrades predictably instead of
  * colliding with the line under it, and the layout is identical for everyone.
  *
+ * ─── THE TYPE IS BUNDLED, AND THE SVG CARRIES NO TEXT ──────────────────────
+ * Every face is a .ttf under assets/fonts/, embedded into the PDF with
+ * registerFont and converted to <path> outlines for the SVG. Neither output
+ * names a font, so neither can be resolved differently by the machine it runs
+ * on.
+ *
+ * That is not a refinement, it is the fix for a production defect: the SVG used
+ * to name "Helvetica, Liberation Sans, Nimbus Sans, Arial, sans-serif" and the
+ * container is node:20-alpine, which ships no fonts at all. librsvg resolved
+ * none of them, so every downloaded PNG and JPG had .notdef boxes where the
+ * text should be while the frame artwork was perfect. It looked correct on a
+ * developer's Mac only because macOS substitutes a fallback; there is nothing
+ * in the image to substitute from. A name-referenced font makes the output a
+ * property of the host, and there is no font package you can add to the image
+ * that makes that untrue for the NEXT base image.
+ *
+ * fontkit rather than a second text-shaping library, because fontkit is the one
+ * pdfkit already lays text out with: doc.widthOfString on an embedded face IS
+ * font.layout(...).advanceWidth scaled, to the float. So the outlines drawn in
+ * the SVG advance by the exact numbers planCertificate measured with, and the
+ * shared fitting rule is shared in fact and not merely in intent.
+ *
  * ─── NOTHING IS PERSISTED ──────────────────────────────────────────────────
  * No certificate table, no stored file, no issued_on, no revoke. The document
  * is a pure projection of facts that already exist, so rendering it twice
@@ -87,17 +110,61 @@ const PT_H = 595.28;
 const PX_W = 3508;
 const PX_H = 2480;
 
+/*
+ * ─── THE FACES ─────────────────────────────────────────────────────────────
+ *
+ * Four .ttf files under assets/fonts/, all SIL OFL and licensed to embed —
+ * provenance and licence texts in that directory's README. Bundled rather than
+ * read out of EasyFix-Brand-Kit, so a container image needs nothing but this
+ * repo to render a certificate correctly.
+ *
+ * The keys are what STYLE names and what gets registered on a pdfkit document,
+ * so the PDF and the SVG cannot pick different files for one run.
+ */
+const FONT_DIR = path.join(__dirname, '..', 'assets', 'fonts');
+const FACES = Object.freeze({
+  sans: 'IBMPlexSans-Regular.ttf',
+  sansBold: 'IBMPlexSans-Bold.ttf',
+  serifBold: 'PlayfairDisplay-Bold.ttf',
+  script: 'GreatVibes-Regular.ttf',
+});
+const facePath = (key) => path.join(FONT_DIR, FACES[key]);
+
+/*
+ * Register every face on a document, whichever document it is — the measuring
+ * one and the rendering one must resolve a face key to the same bytes or the
+ * plan measures something the page does not draw. pdfkit only EMBEDS a
+ * registered font once font() actually selects it, so registering all four
+ * costs nothing on a certificate that uses three.
+ */
+function registerFaces(doc) {
+  for (const key of Object.keys(FACES)) doc.registerFont(key, facePath(key));
+  return doc;
+}
+
+/* fontkit instances for the SVG outlines. Same files, opened once per process. */
+const faceCache = new Map();
+function face(key) {
+  if (!faceCache.has(key)) faceCache.set(key, fontkit.openSync(facePath(key)));
+  return faceCache.get(key);
+}
+
 const NAVY = '#12305B';
 const GOLD = '#B8912F';
-const INK = '#1A1A1A';
+const INK = '#111111';
 const MUTED = '#5A5A5A';
+/* The brand red the frame's own bands are printed in. */
+const BRAND_RED = '#C42430';
+/* One step darker, so the title reads as subordinate to the heading. */
+const DEEP_RED = '#8E1B24';
 
 const MIN_PT = 6;
 
 const DEFAULT_HEADING = 'CERTIFICATE OF COMPLETION';
 const DEFAULT_EYEBROW = 'FOR SUCCESSFULLY COMPLETING THE TRAINING';
-const PRESENTED_TO = 'PRESENTED TO';
+const PRESENTED_TO = 'THIS CERTIFICATE IS PROUDLY PRESENTED TO';
 const DATE_LABEL = 'DATE';
+const SITE = 'www.easyfix.in';
 
 /*
  * Fallback rectangles, normalised 0..1 exactly like the shipped layout file, so
@@ -123,18 +190,26 @@ const DEFAULT_LAYOUT = Object.freeze({
   certificateIdLine:  { x: 0.30, y: 0.885, w: 0.40, h: 0.028 },
 });
 
-/* Per-region typography. Sizes are a CEILING — fitting shrinks, never grows. */
+/*
+ * Per-region typography. Sizes are a CEILING in POINTS — fitting shrinks, never
+ * grows, and a rectangle shorter than the ceiling caps it first.
+ *
+ * The heading is the design: large, brand red, serif, and tracked wide enough
+ * to span most of its rectangle (measured, at the vendored layout: 651pt of a
+ * 697pt box). It used to be 15pt grey sans, which is why the output read as a
+ * form rather than as a certificate.
+ */
 const STYLE = Object.freeze({
-  heading:            { font: 'Helvetica',      size: 15, color: MUTED, tracking: 3 },
-  eyebrowPresentedTo: { font: 'Helvetica',      size: 11, color: MUTED, tracking: 2 },
-  recipientName:      { font: 'Helvetica-Bold', size: 38, color: INK },
-  eyebrowFor:         { font: 'Helvetica',      size: 11, color: MUTED, tracking: 1 },
-  title:              { font: 'Helvetica-Bold', size: 22, color: NAVY },
-  dateValue:          { font: 'Helvetica',      size: 12, color: INK },
-  dateLabel:          { font: 'Helvetica',      size: 8,  color: MUTED, tracking: 2 },
-  signatoryName:      { font: 'Helvetica-Bold', size: 12, color: INK },
-  signatoryTitle:     { font: 'Helvetica',      size: 8,  color: MUTED, tracking: 2 },
-  certificateIdLine:  { font: 'Helvetica',      size: 8,  color: MUTED, tracking: 1 },
+  heading:            { font: 'serifBold', size: 30, color: BRAND_RED, tracking: 8 },
+  eyebrowPresentedTo: { font: 'sans',      size: 9,  color: MUTED, tracking: 3 },
+  recipientName:      { font: 'sansBold',  size: 31, color: INK, upper: true },
+  eyebrowFor:         { font: 'sans',      size: 9,  color: MUTED, tracking: 3 },
+  title:              { font: 'sansBold',  size: 25, color: DEEP_RED },
+  dateValue:          { font: 'sans',      size: 12, color: INK },
+  dateLabel:          { font: 'sans',      size: 8,  color: MUTED, tracking: 2 },
+  signatoryName:      { font: 'script',    size: 20, color: INK },
+  signatoryTitle:     { font: 'sans',      size: 8,  color: MUTED, tracking: 2, upper: true },
+  certificateIdLine:  { font: 'sans',      size: 8,  color: MUTED, tracking: 0.5 },
 });
 
 /*
@@ -144,7 +219,7 @@ const STYLE = Object.freeze({
  * this run exists only when there is no pipeline output to override it.
  */
 const FALLBACK_MARK_RECT = Object.freeze({ x: 0.05, y: 0.085, w: 0.90, h: 0.055 });
-const FALLBACK_MARK_STYLE = Object.freeze({ font: 'Helvetica-Bold', size: 26, color: NAVY });
+const FALLBACK_MARK_STYLE = Object.freeze({ font: 'sansBold', size: 26, color: NAVY });
 
 /*
  * One rectangle, tolerantly. The layout file is authored by a design pipeline
@@ -227,16 +302,18 @@ function loadArtwork(framePath) {
 /*
  * THE measuring device, for both outputs.
  *
- * pdfkit's AFM metrics decide every shrink step, and the image path uses the
- * same numbers rather than asking a rasteriser — otherwise the two would fit
- * text differently on any host whose font stack resolves Helvetica elsewhere.
- * A throwaway document per render would be pure allocation: nothing is ever
- * drawn on this one, planCertificate is synchronous, and Node is single
- * threaded, so no two plans can interleave on its font state.
+ * The embedded faces' own metrics decide every shrink step, and the image path
+ * draws outlines from the SAME fontkit layout pdfkit measured with — so the two
+ * cannot fit text differently, on any host, for any reason. A throwaway
+ * document per render would be pure allocation: nothing is ever drawn on this
+ * one, planCertificate is synchronous, and Node is single threaded, so no two
+ * plans can interleave on its font state.
  */
 let measurer = null;
 function measured(font, size) {
-  if (!measurer) measurer = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 0 });
+  if (!measurer) {
+    measurer = registerFaces(new PDFDocument({ size: 'A4', layout: 'landscape', margin: 0 }));
+  }
   measurer.font(font).fontSize(size);
   return measurer;
 }
@@ -255,12 +332,19 @@ function measured(font, size) {
  * Every length scales with the canvas, so this returns the same decision at
  * 841.89pt and at 3508px.
  */
-function fitRun(name, text, rect, style, scale) {
+function fitRun(name, raw, rect, style, scale) {
   const minPt = MIN_PT * scale;
   const step = 0.5 * scale;
   const tracking = (style.tracking || 0) * scale;
   const opts = { characterSpacing: tracking };
   const widthAt = (s, str) => measured(style.font, s).widthOfString(str, opts);
+
+  /*
+   * Case is typography, so it belongs to STYLE and is applied BEFORE the
+   * fitter measures — uppercasing a name after fitting it would measure a
+   * string nobody draws, and caps are ~12% wider.
+   */
+  const text = style.upper ? raw.toUpperCase() : raw;
 
   let size = Math.min(style.size * scale, rect.h / 1.25);
   while (size > minPt && widthAt(size, text) > rect.w) size = Math.max(minPt, size - step);
@@ -283,6 +367,16 @@ function fitRun(name, text, rect, style, scale) {
   const lineHeight = doc.currentLineHeight();
   const ascender = (doc._font && doc._font.ascender) || 718;
   const top = rect.y + Math.max(0, (rect.h - lineHeight) / 2);
+  /*
+   * Centring is a PLACEMENT decision, so it is made here once and both
+   * renderers are handed the answer. It used to be made twice — pdfkit's
+   * align:'center' on one side, text-anchor="middle" on the other — and the
+   * two disagreed, because SVG counts a trailing tracking unit that pdfkit's
+   * width does not; the old code carried a hand-measured half-tracking fudge
+   * to paper over it. One x, computed from the width the fitter already
+   * measured, removes the disagreement instead of correcting for it.
+   */
+  const width = widthAt(size, out);
   return {
     name,
     text: out,
@@ -292,6 +386,8 @@ function fitRun(name, text, rect, style, scale) {
     font: style.font,
     color: style.color,
     top,
+    width,
+    x: rect.x + Math.max(0, (rect.w - width) / 2),
     baseline: top + (ascender / 1000) * size,
   };
 }
@@ -334,7 +430,13 @@ function planCertificate(values, W, H, frames) {
     ['dateLabel', date ? DATE_LABEL : ''],
     ['signatoryName', values.signatoryName],
     ['signatoryTitle', values.signatoryName ? values.signatoryTitle : ''],
-    ['certificateIdLine', values.certificateId],
+    /*
+     * One footer line, composed here rather than by each caller: the id and the
+     * site are a single centred caption in the reference, and a caller that
+     * built the string itself would be free to build a different one.
+     */
+    ['certificateIdLine', isBlank(values.certificateId)
+      ? '' : `Certificate ID: ${String(values.certificateId).trim()} · ${SITE}`],
   ];
 
   const runs = [];
@@ -393,7 +495,7 @@ function planCertificate(values, W, H, frames) {
  */
 function renderCertificatePdf({ stream, ...values }) {
   /* Landscape: a certificate is read as a wall document, not a report page. */
-  const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 0 });
+  const doc = registerFaces(new PDFDocument({ size: 'A4', layout: 'landscape', margin: 0 }));
   doc.pipe(stream);
 
   const W = doc.page.width;
@@ -409,44 +511,75 @@ function renderCertificatePdf({ stream, ...values }) {
     else doc.moveTo(s.x1, s.y1).lineTo(s.x2, s.y2).stroke();
   }
 
+  /*
+   * Drawn at the plan's own x, not with align:'center'. pdfkit would otherwise
+   * re-centre from a width it measures itself, which is a second placement
+   * decision — and the SVG has no way to ask pdfkit what it decided.
+   * `lineBreak: false` because fitRun has already guaranteed the run fits, and
+   * its explicit truncation is the backstop that pdfkit's `ellipsis` cannot be
+   * (SVG has no equivalent, so a rule only one output can obey is not shared).
+   */
   for (const r of plan.runs) {
     doc.font(r.font).fillColor(r.color).fontSize(r.size)
-      .text(r.text, r.rect.x, r.top, {
-        width: r.rect.w,
-        height: r.rect.h,
-        align: 'center',
-        lineBreak: false,
-        ellipsis: true,
-        characterSpacing: r.tracking,
-      });
+      .text(r.text, r.x, r.top, { lineBreak: false, characterSpacing: r.tracking });
   }
 
   doc.end();
 }
 
-const XML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
-const xml = (s) => String(s).replace(/[&<>"']/g, (c) => XML_ESCAPES[c]);
+/*
+ * One run as OUTLINE PATH DATA — the whole point of this file's font handling.
+ *
+ * fontkit.layout() is the same call pdfkit makes to lay the run out in the PDF,
+ * so the glyphs, their order, their kerning and their advances are not merely
+ * similar to the PDF's: they are the same numbers. The pen walks those
+ * advances plus the plan's tracking (between glyphs, which is exactly what
+ * widthOfString counted), starting at the plan's x.
+ *
+ * The transform flips y — font units run upward from a baseline at 0, SVG's
+ * run downward from the top — and scales by size/unitsPerEm. transform()
+ * returns a new Path, so the font's cached glyph outlines are never mutated.
+ */
+function outlineRun(r) {
+  const f = face(r.font);
+  const s = r.size / f.unitsPerEm;
+  const laid = f.layout(r.text);
+  const parts = [];
+  let pen = r.x;
+  for (let i = 0; i < laid.glyphs.length; i++) {
+    const p = laid.positions[i];
+    const d = laid.glyphs[i].path
+      .transform(s, 0, 0, -s, pen + p.xOffset * s, r.baseline - p.yOffset * s)
+      .toSVG();
+    /*
+     * Not decoration. A non-finite pen position makes a path emitter write the
+     * literal string "NaN" into the data, and an invalid path is DROPPED by the
+     * rasteriser with no error — which is the same silent blank the font stack
+     * used to produce. Fail loudly and name the run instead.
+     */
+    if (/NaN|Infinity/.test(d)) {
+      throw new Error(`non-finite outline for ${r.name} glyph ${i} of ${JSON.stringify(r.text)}`);
+    }
+    if (d) parts.push(d);
+    pen += p.xAdvance * s + r.tracking;
+  }
+  return parts.join('');
+}
 
 /*
  * The plan as SVG. Text only when there is a frame — the frame is composited
  * underneath by sharp, because nesting one SVG document inside another is a
  * feature rasterisers disagree about and a stretched <image> is not.
  *
- * The one correction this file makes for the rasteriser: SVG `letter-spacing`
- * adds its space AFTER every glyph including the last, while pdfkit's
- * characterSpacing only goes between them. Centre a tracked run and the SVG
- * therefore sits half a tracking unit to the right of the PDF's. Measured, not
- * assumed — at 300dpi the CERTIFICATE OF COMPLETION band landed 7px right of
- * the PDF's, exactly its 12.5px tracking halved, and the untracked runs did
- * not move. Subtracting it here puts every band back within a pixel.
- *
- * Helvetica first, then the two metric-compatible clones a Linux container
- * actually has. Arial and sans-serif are the last resorts: this is the one
- * place the two outputs can diverge, because the PDF embeds Helvetica's own
- * metrics and the raster gets whatever fontconfig resolves.
+ * NO <text> AND NO font-family, deliberately and permanently. Naming a font
+ * hands the rendering to whatever fontconfig happens to resolve, which on the
+ * node:20-alpine image this deploys to is nothing at all: the shipped
+ * certificates had a row of .notdef boxes for every line. Outlines are
+ * geometry, so the raster is now identical on Alpine, on a Mac, and on a
+ * machine with no fonts installed whatsoever — which is what the empty
+ * fontconfig test in tests/certificate-render.test.js proves rather than
+ * assumes.
  */
-const SVG_FONT_STACK = "Helvetica, 'Liberation Sans', 'Nimbus Sans', Arial, sans-serif";
-
 function certificateSvg(plan) {
   const parts = [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${plan.width}" height="${plan.height}" `
@@ -460,12 +593,7 @@ function certificateSvg(plan) {
         + `stroke="${s.stroke}" stroke-width="${s.lineWidth}"/>`);
   }
   for (const r of plan.runs) {
-    const cx = r.rect.x + r.rect.w / 2 - r.tracking / 2;
-    parts.push(`<text x="${cx}" y="${r.baseline}" fill="${r.color}" `
-      + `font-family="${SVG_FONT_STACK}" font-size="${r.size}" `
-      + `font-weight="${/Bold/.test(r.font) ? 'bold' : 'normal'}" `
-      + `letter-spacing="${r.tracking}" text-anchor="middle" `
-      + `xml:space="preserve">${xml(r.text)}</text>`);
+    parts.push(`<path data-run="${r.name}" fill="${r.color}" d="${outlineRun(r)}"/>`);
   }
   parts.push('</svg>');
   return parts.join('\n');
@@ -551,6 +679,9 @@ module.exports = {
   ARTWORK_SVG,
   ARTWORK_LAYOUT,
   DEFAULT_LAYOUT,
+  FONT_DIR,
+  FACES,
+  STYLE,
   PX_W,
   PX_H,
 };
