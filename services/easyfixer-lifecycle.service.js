@@ -360,6 +360,45 @@ function legacyStatusForTransition(target, currentValue) {
   return asBool(currentValue) ? 1 : 0;
 }
 
+/*
+ * The states legacyStatusForTransition() writes `efr_status = 1` for. Exported
+ * so the drift check below tests the invariant against the SAME set the writer
+ * enforces, rather than a second copy that can itself drift.
+ */
+const LEGACY_ACTIVE_STATUSES = Object.freeze([...WORK_ENABLED]);
+
+/*
+ * Status-drift predicate — the invariant `transition()` maintains, written as
+ * SQL so it can be counted and listed.
+ *
+ * transition() is the ONLY writer of lifecycle_status in this backend and it
+ * sets lifecycle_status and efr_status in one UPDATE (legacyStatusForTransition:
+ * work-enabled -> 1, blocked -> 0). So a verified technician whose two columns
+ * disagree cannot have been written from here. The remaining author is the
+ * still-live legacy Java CRM, which flips efr_status alone and knows nothing
+ * about the lifecycle column — and because our own writes always leave the pair
+ * agreeing, that legacy write is necessarily the LATER one.
+ *
+ * This is not a cosmetic disagreement. Work eligibility ANDs the two halves
+ * (easyfixer-work-eligibility.sqlPredicate), so a technician reactivated in the
+ * legacy CRM passes the legacy half, fails the lifecycle half, and receives no
+ * job offers at all — silently, while every screen ops uses reads Active.
+ *
+ * Checked in BOTH directions. efr_status = 0 under a work-enabled lifecycle is
+ * equally unwritable from here, and lifecycleFromRow already fails that row's
+ * capabilities closed, so it is the same class of defect wearing the other
+ * face. Unverified rows are excluded: efr_status carries no agreed meaning
+ * before verification, and every pre-verification lifecycle state is blocked
+ * anyway, so including them would report the whole onboarding funnel as drift.
+ */
+function statusDriftSql(alias = 'e') {
+  const enabled = LEGACY_ACTIVE_STATUSES.map((status) => `'${status}'`).join(', ');
+  return `${alias}.is_technician_verified = 1
+          AND ${alias}.lifecycle_status IS NOT NULL
+          AND ((${alias}.efr_status = 1 AND ${alias}.lifecycle_status NOT IN (${enabled}))
+            OR (${alias}.efr_status = 0 AND ${alias}.lifecycle_status IN (${enabled})))`;
+}
+
 function requiresReapplicationVerificationReset(currentStatus, target) {
   return currentStatus === 'REAPPLIED'
     && REAPPLICATION_REENTRY_STATES.has(target);
@@ -1504,6 +1543,72 @@ async function finalizeTrainingCompletion(efrId) {
   return { schemaInstalled: true, ...result };
 }
 
+/*
+ * Which lifecycle status a drifted row should adopt. Extracted from the
+ * transition closure so the whole truth table is testable without a database:
+ * the decision is the entire safety argument for the heal, and an inline
+ * closure can only be exercised through a transaction.
+ *
+ * Returning `current.status` means "nothing to adopt" — reconcileLegacyStatus
+ * turns that into a no-op rather than a same-state write.
+ */
+function reconciledStatusFor(row = {}, current = {}) {
+  // Unverified rows carry no agreed meaning in efr_status, and every
+  // pre-verification state is work-blocked anyway — nothing to adopt.
+  if (!asBool(row.is_technician_verified)) return current.status;
+  if (current.status === 'BLACKLISTED') return current.status;
+  if (Number(row.efr_status) === 1) {
+    return WORK_ENABLED.has(current.status)
+      ? current.status
+      : operationalStatusForManager(row);
+  }
+  return WORK_ENABLED.has(current.status) ? 'INACTIVE' : current.status;
+}
+
+/*
+ * Adopt a legacy `efr_status` write that bypassed this state machine.
+ *
+ * The legacy Java CRM is still a sanctioned ops tool and it flips efr_status
+ * directly, knowing nothing about lifecycle_status. transition() always writes
+ * the pair together, so a disagreement proves an outside write landed AFTER our
+ * last one — see statusDriftSql(). Until then the technician is stranded:
+ * work eligibility ANDs the two halves, so ops sees Active and the assignment
+ * engine sees nothing.
+ *
+ * WHY THIS IS ALLOWED TO SKIP THE RE-APPLICATION GATE. assertTransition()
+ * refuses CRM/LEGACY moves out of INACTIVE/DORMANT into work, because a
+ * technician returning after going inactive is supposed to re-apply through the
+ * app. That rule governs the product's own flows. It cannot govern a write that
+ * has ALREADY happened in another tool: refusing to reconcile does not enforce
+ * the rule, it only keeps the two systems disagreeing while ops proceeds anyway.
+ * Enforcing it properly means taking the bit away from the legacy CRM, which is
+ * not in this repo. So this runs as SYSTEM — the established source for "the
+ * server concluded this from evidence it already holds".
+ *
+ * BLACKLISTED is the one state never lifted this way. Everything else here is
+ * an operational judgement an admin may reverse in either CRM; a blacklist is a
+ * deliberate safety decision, and a legacy status flip must not undo one
+ * silently. Those rows stay in the drift count for a human.
+ */
+async function reconcileLegacyStatus(efrId, actor = null) {
+  if (!(await hasLifecycleSchema())) {
+    return { schemaInstalled: false, changed: false, lifecycle: null };
+  }
+  return {
+    schemaInstalled: true,
+    ...(await transition(efrId, {
+      reasonCode: 'LEGACY_STATUS_DRIFT',
+      reason: 'Reconciled with the legacy CRM status flag',
+      source: 'SYSTEM',
+      metadata: { job: 'easyfixer-status-drift-heal' },
+      _resolveStatus: (row, current) => reconciledStatusFor(row, current),
+      // Resolving to the current status is the "nothing drifted" answer, and
+      // this turns it into a genuine no-op rather than a same-state write.
+      _protectLifecycle: (current, target) => current.status === target,
+    }, actor)),
+  };
+}
+
 async function activateFromVerification(efrId, body, actor = null) {
   return transition(efrId, {
     reasonCode: 'FINAL_ACTIVATION_APPROVED',
@@ -1680,7 +1785,9 @@ async function getHistory(efrId, { limit = 50, offset = 0 } = {}) {
 
 module.exports = {
   LIFECYCLE_STATUSES,
+  LEGACY_ACTIVE_STATUSES,
   REAPPLY_FROM,
+  statusDriftSql,
   capabilitiesForStatus,
   hasLifecycleSchema,
   readProjection,
@@ -1697,6 +1804,7 @@ module.exports = {
   finalizeMobileRegistrationGate1,
   finalizeTrainingCompletion,
   activateFromVerification,
+  reconcileLegacyStatus,
   syncFromVerificationFlags,
   syncFromVerificationFlagsAtomic,
   getHistory,
@@ -1709,6 +1817,7 @@ module.exports = {
     REAPPLIED_CRM_TARGETS,
     assertReapplicationSummaryAllowed,
     resetSchemaProbeForTests,
+    reconciledStatusFor,
     legacyStatusForTransition,
     requiresReapplicationVerificationReset,
     gate1FinalizationDecision,

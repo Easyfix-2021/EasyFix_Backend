@@ -38,6 +38,14 @@ const listQuery = Joi.object({
   // Filter the roster by the v5.1 lifecycle status (e.g. PAUSED, BLACKLISTED).
   // Distinct from the legacy numeric `status` buckets above.
   lifecycleStatus: Joi.string().valid(...LIFECYCLE_STATUSES).optional(),
+  /*
+   * Status-drift drill-down (boolean). Lists the technicians whose efr_status
+   * and lifecycle_status contradict each other — the rows the counts strip's
+   * "Status Drift" entry reports. Not a lifecycle status and not one of the
+   * six legacy buckets: it is a filter on the DISAGREEMENT between the two,
+   * which neither of the other dimensions can express.
+   */
+  statusDrift: Joi.boolean().optional(),
   includeInactive: Joi.boolean().default(false),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
