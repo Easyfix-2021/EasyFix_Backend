@@ -84,13 +84,41 @@ router.post(
   },
 );
 
-// ─── Reached-location selfie ─────────────────────────────────────────
-// POST /jobs/:id/selfie { selfieImageId } → store tx_selfie_id ref.
+// ─── Reached location ────────────────────────────────────────────────
+// POST /jobs/:id/selfie           { selfieImageId, … } → store tx_selfie_id ref
+// POST /jobs/:id/reached-location { selfieImageId, … } → same handler
+//
+// TWO PATHS, ONE HANDLER (not a duplicated route — Express takes the array).
+// `/selfie` is the path the shipped app calls (ApiJobService.reachedLocation)
+// and the one the legacy Flutter contract named (`jobs/upload-selfie`); it can
+// never be renamed away. `/reached-location` is the name the 2026-09-07
+// merged-screen contract uses. Aliasing costs one array literal; standing up a
+// second handler would fork the ownership guard and the geofence gate.
+//
+// GEOFENCE (2026-09-07) — every new field is OPTIONAL and the body without them
+// behaves exactly as before. Note that `latitude`/`longitude` were ALREADY
+// being sent by the shipped app and silently discarded: validate() runs Joi
+// with stripUnknown:true, so an unlisted field is dropped, not rejected.
+// Listing them here starts recording data that was previously thrown away — it
+// cannot break a caller, because no caller was ever 400'd for sending them.
 router.post(
-  '/:id/selfie',
+  ['/:id/selfie', '/:id/reached-location'],
   validate(idParam, 'params'),
   validate(Joi.object({
     selfieImageId: Joi.number().integer().positive().required(),
+    // Bare device fix — the shape the shipped app already sends.
+    latitude:  Joi.number().min(-90).max(90).optional().allow(null),
+    longitude: Joi.number().min(-180).max(180).optional().allow(null),
+    // Contract block. distanceMeters/withinFence are ACCEPTED but advisory:
+    // the server recomputes both from the coordinates and its own verdict is
+    // what the enforcement gate reads (see recordArrivalGeofence).
+    geofence: Joi.object({
+      latitude:       Joi.number().min(-90).max(90).required(),
+      longitude:      Joi.number().min(-180).max(180).required(),
+      distanceMeters: Joi.number().min(0).optional().allow(null),
+      withinFence:    Joi.boolean().optional().allow(null),
+      overrideReason: Joi.string().trim().max(500).optional().allow('', null),
+    }).optional().allow(null),
   })),
   async (req, res, next) => {
     try {
@@ -98,7 +126,12 @@ router.post(
       const out = await lifecycle.saveSelfie(
         Number(req.params.id),
         req.tech.efr_id,
-        { selfieImageId: req.body.selfieImageId },
+        {
+          selfieImageId: req.body.selfieImageId,
+          latitude:      req.body.latitude,
+          longitude:     req.body.longitude,
+          geofence:      req.body.geofence,
+        },
       );
       logger.info('Selfie saved · jobId=' + req.params.id);
       modernOk(res, out);

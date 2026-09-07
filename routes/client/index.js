@@ -928,11 +928,17 @@ function clientJobFilters(req, hier) {
  * "wrong client" and "wrong subtree" need different fixes.
  *
  * Returns null once it has answered the request — callers `if (!job) return;`.
+ *
+ * `jobId` defaults to the route's own `:id`, which is what every caller here
+ * wants. It is passed explicitly by the permission-request handlers below,
+ * whose route param is the REQUEST id and whose job id comes off the loaded
+ * row — so a route that is not addressed by job id still gets this resolver
+ * rather than a second hand-rolled copy of the same two checks.
  */
-async function loadJobInScope(req, res, what) {
-  const job = await jobService.getById(Number(req.params.id));
+async function loadJobInScope(req, res, what, jobId = req.params.id) {
+  const job = await jobService.getById(Number(jobId));
   if (!job || job.fk_client_id !== req.spoc.client_id) {
-    logger.warn(what + ' target not found / not owned · id=' + req.params.id);
+    logger.warn(what + ' target not found / not owned · id=' + jobId);
     modernError(res, 404, 'job not found');
     return null;
   }
@@ -1154,6 +1160,123 @@ router.get('/jobs/images/:imageId/file', async (req, res, next) => {
     await jobImageService.serveResolvedImage(res, row.image);
   } catch (e) { next(e); }
 });
+
+/* ─── SITE-ACCESS PERMISSION REQUESTS — the CLIENT half ────────────────────
+ *
+ * A technician stuck at a mall gate / society office raises a request against
+ * the job (POST /api/mobile/jobs/:jobId/permission-requests); the client
+ * uploads the pass here, or declines with a reason. Everything about what a
+ * request IS lives in services/job-permission-request.service.js — the same
+ * service the technician routes call, so the two sides cannot drift. These
+ * handlers own AUTHORISATION and nothing else.
+ *
+ * WHY THIS HALF IS INLINE while the technician half is its own file
+ * (routes/mobile/permission-requests.js): the scope resolver these handlers
+ * must reuse — loadJobInScope, tenancy AND reporting hierarchy in one answer —
+ * is a local function in this file. A sub-router would have to require('./index')
+ * to reach it, which is a require cycle (index → sub-router → index) whose
+ * partial export is `{}` at mount time. Copying the resolver instead is exactly
+ * the "second scoping rule" that let read scope and write scope drift apart in
+ * the first place. So the handlers come to the guard.
+ *
+ * NO NEW ACCESS SURFACE. requireGrant() gates six named surfaces; answering a
+ * permission request is an action on a job the SPOC can already open, like
+ * /escalate and /client-request directly below, which are likewise ungated
+ * beyond loadJobInScope. See the service header.
+ */
+const permissionRequests = require('../../services/job-permission-request.service');
+const permissionDocUpload = multerClientImg({
+  storage: multerClientImg.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
+
+// GET the requests on one job. Same item shape as the technician's list.
+router.get('/jobs/:id/permission-requests', async (req, res, next) => {
+  try {
+    const job = await loadJobInScope(req, res, 'List permission requests');
+    if (!job) return;
+    const items = await permissionRequests.listForJob(job.job_id);
+    logger.info('Permission requests listed (client) · job=' + job.job_id + ' · n=' + items.length);
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+/*
+ * Load a permission request AND prove the caller may act on it. The row is
+ * addressed by its OWN id, so the tenancy + hierarchy answer is fetched through
+ * the job it belongs to — loadJobInScope is handed that job id explicitly,
+ * which keeps this on the ONE scope resolver instead of a second hand-rolled
+ * copy of the same two checks.
+ *
+ * 404 for "no such request" and for "not your client's job" alike: a
+ * distinguishable answer would confirm which request ids exist.
+ */
+async function loadRequestInScope(req, res, what) {
+  const requestId = Number(req.params.id);
+  const [[row]] = await pool.query(
+    'SELECT id, job_id, status FROM tbl_job_permission_request WHERE id = ? LIMIT 1',
+    [requestId]);
+  if (!row) {
+    logger.warn(what + ' · permission request not found · id=' + requestId);
+    modernError(res, 404, 'permission request not found');
+    return null;
+  }
+  const job = await loadJobInScope(req, res, what, row.job_id);
+  if (!job) return null;                       // loadJobInScope already answered
+  if (row.status !== permissionRequests.STATUS.REQUESTED) {
+    logger.warn(what + ' · permission request already ' + row.status + ' · id=' + requestId);
+    modernError(res, 409, 'this request has already been ' + row.status);
+    return null;
+  }
+  return { row, job };
+}
+
+// FULFIL — multipart, file field "file". The document is stored as an ordinary
+// tbl_job_image row (image_category 'permission') through the shared
+// job-image.service, and read back as a PRESIGNED url.
+router.post('/permission-requests/:id/fulfil', permissionDocUpload.single('file'), async (req, res, next) => {
+  try {
+    const scoped = await loadRequestInScope(req, res, 'Fulfil permission request');
+    if (!scoped) return;
+    if (!req.file || !req.file.buffer) return modernError(res, 400, 'missing "file" upload');
+
+    const updated = await permissionRequests.fulfil({
+      id: scoped.row.id, jobId: scoped.job.job_id, file: req.file, spocId: req.spoc.id,
+    });
+    if (!updated) return modernError(res, 409, 'this request is no longer open');
+
+    // Fire-and-forget: a push failure must never fail a document the client has
+    // already successfully uploaded.
+    permissionRequests.notifyTechOfAnswer(updated)
+      .catch((e) => logger.warn('Permission request tech notify threw · ' + e.message));
+
+    modernOk(res, await permissionRequests.toItem(updated), 'document uploaded');
+  } catch (e) {
+    if (e?.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+    if (e?.status === 400) return modernError(res, 400, e.message);
+    next(e);
+  }
+});
+
+// DECLINE — the client cannot provide it, and says why.
+router.post('/permission-requests/:id/decline',
+  validate(Joi.object({ reason: Joi.string().trim().min(3).max(500).required() })),
+  async (req, res, next) => {
+    try {
+      const scoped = await loadRequestInScope(req, res, 'Decline permission request');
+      if (!scoped) return;
+
+      const updated = await permissionRequests.decline({
+        id: scoped.row.id, reason: req.body.reason, spocId: req.spoc.id,
+      });
+      if (!updated) return modernError(res, 409, 'this request is no longer open');
+
+      permissionRequests.notifyTechOfAnswer(updated)
+        .catch((e) => logger.warn('Permission request tech notify threw · ' + e.message));
+
+      modernOk(res, await permissionRequests.toItem(updated), 'request declined');
+    } catch (e) { next(e); }
+  });
 
 /**
  * Escalate an order — writes to tbl_job_escalation_info, the same table the

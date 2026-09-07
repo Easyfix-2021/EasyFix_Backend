@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const { getProperty } = require('./properties.service');
 
 /*
  * Job location track — the real-time GPS trail a technician's app posts while a
@@ -20,14 +21,80 @@ const logger = require('../logger');
  * the pings are frequent enough that receipt time ≈ fix time for a live map,
  * and not trusting a client timestamp avoids tampering + the IST-parse trap.
  */
-async function addPing(jobId, efrId, { latitude, longitude, accuracy }) {
+async function addPing(jobId, efrId, { latitude, longitude, accuracy, geofence } = {}) {
   logger.info('Add GPS ping · job_id=' + jobId + ' · efr_id=' + efrId + ' · accuracy=' + (accuracy == null ? 'null' : accuracy));
+  /*
+   * `geofence` is OPTIONAL and additive (2026-09-07).
+   *
+   * A routine ping omits it and runs the SAME six-column INSERT it always ran —
+   * byte-identical SQL, so it cannot start failing on a host where
+   * migrations/2026-09-07-reached-location-geofence.sql has not been applied.
+   * That mattered: the tech app's background tracker treats a failed ping as a
+   * reason to stop, so widening this one statement unconditionally would have
+   * killed live-location tracking estate-wide the moment the code deployed
+   * ahead of the migration.
+   *
+   * The arrival row from the reached-location path passes the block, and
+   * `within_fence IS NOT NULL` is the free discriminator that tells an arrival
+   * apart from the trail without a seventh column.
+   */
+  const g = geofence || null;
+  if (g && await hasGeofenceColumns()) {
+    await pool.query(
+      `INSERT INTO tbl_job_location_track
+         (job_id, efr_id, latitude, longitude, accuracy, captured_at,
+          distance_meters, within_fence, override_reason)
+       VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?)`,
+      [
+        jobId, efrId, latitude, longitude, accuracy == null ? null : accuracy,
+        g.distanceMeters == null ? null : Number(g.distanceMeters),
+        // Tri-state on purpose: NULL = not evaluated (no site coordinates),
+        // which is NOT the same as 0 = evaluated and outside. Collapsing the
+        // two would put every coordinate-less site into the abuse report.
+        g.withinFence == null ? null : (g.withinFence ? 1 : 0),
+        g.overrideReason ? String(g.overrideReason).slice(0, 500) : null,
+      ],
+    );
+    return { ok: true };
+  }
+  if (g) {
+    // Migration not applied on this host. Still record WHERE the technician
+    // was — losing the position too would be a second failure — and make the
+    // dropped evaluation loud rather than silent.
+    logger.warn('Geofence columns absent · job_id=' + jobId
+      + ' — arrival position recorded, evaluation dropped (apply 2026-09-07-reached-location-geofence.sql)');
+  }
   await pool.query(
     `INSERT INTO tbl_job_location_track (job_id, efr_id, latitude, longitude, accuracy, captured_at)
      VALUES (?, ?, ?, ?, ?, NOW())`,
     [jobId, efrId, latitude, longitude, accuracy == null ? null : accuracy],
   );
   return { ok: true };
+}
+
+/*
+ * Do the 2026-09-07 geofence columns exist on this deploy? Same probe pattern
+ * as job.service / mobile-job-lifecycle.service: INFORMATION_SCHEMA, memoised
+ * on SUCCESS ONLY. A probe that errors is NOT cached — caching a transient
+ * failure as `false` would permanently downgrade every arrival on the process
+ * to the position-only path (the bug the tx_selfie_id probe already learned).
+ */
+let _hasGeofenceCols = null;
+async function hasGeofenceColumns() {
+  if (_hasGeofenceCols !== null) return _hasGeofenceCols;
+  try {
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'tbl_job_location_track'
+          AND COLUMN_NAME IN ('distance_meters', 'within_fence', 'override_reason')`,
+    );
+    _hasGeofenceCols = Number(rows && rows[0] && rows[0].n) === 3;
+    return _hasGeofenceCols;
+  } catch (e) {
+    logger.warn('Geofence column probe failed · ' + e.message + ' — treating as absent for this call only');
+    return false;
+  }
 }
 
 /* Latest known location for a job (CRM "locate now"). Null when no ping yet. */
@@ -150,6 +217,101 @@ async function getLatestByEfr(efrId) {
   };
 }
 
+// ─── Geofence (2026-09-07) ───────────────────────────────────────────
+/*
+ * The site's own coordinates live in tbl_address.gps_location — the GPS
+ * varchar holding "lat,lng". It is NOT `address` (the booked address TEXT ops
+ * types) and NOT the map-search field; those are different column roles on the
+ * same polymorphic row, and only this one is machine-usable. parseLegacyLatLng
+ * above is already the estate's defensive reader for that exact format, so the
+ * geofence reuses it rather than minting a second parser that would drift.
+ */
+
+const DEFAULT_RADIUS_M = 150;
+
+/*
+ * Fence radius, ops-tunable via easyfix_properties `geofence.radius.meters`.
+ * A missing / unparseable / non-positive value falls back to the default
+ * rather than to zero — a 0 m fence would put every technician on earth
+ * outside it, which under hard mode is a full field-work outage.
+ */
+function fenceRadiusMeters() {
+  const n = Number(getProperty('geofence.radius.meters'));
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_RADIUS_M;
+}
+
+/*
+ * Is hard enforcement on? DEFAULT OFF, and deliberately NOT the estate's usual
+ * fail-closed property gate — see the long note in
+ * migrations/2026-09-07-reached-location-geofence.sql. Short version: the
+ * closed position here denies WORK rather than access, and the properties
+ * cache primes EMPTY whenever the table is briefly unreadable, so fail-closed
+ * would strand the whole field workforce on a transient DB blip. Only the
+ * literal string 'true' turns it on.
+ */
+function enforcementEnabled() {
+  return String(getProperty('geofence.enforcement.enabled') ?? 'false').toLowerCase() === 'true';
+}
+
+/*
+ * buildGeofence(gpsLocation) → { latitude, longitude, radiusMeters } | null
+ *
+ * NULL when the site has no usable coordinates. The app's contract is to skip
+ * validation entirely on null — a job must never be blocked because ops never
+ * captured a pin. "0,0" and other junk parse to null via parseLegacyLatLng.
+ */
+function buildGeofence(gpsLocation) {
+  const site = parseLegacyLatLng(gpsLocation);
+  if (!site) return null;
+  // (0,0) is in the Gulf of Guinea and is what a half-filled legacy row
+  // degrades to. It is never a real Indian service address.
+  if (site.latitude === 0 && site.longitude === 0) return null;
+  return { latitude: site.latitude, longitude: site.longitude, radiusMeters: fenceRadiusMeters() };
+}
+
+/*
+ * Great-circle distance in metres (haversine). Chosen over the cheaper
+ * equirectangular approximation because it is correct at every distance for
+ * the same three lines — the approximation's error grows with separation, and
+ * "how far outside the fence was he" is exactly the number ops will act on.
+ */
+const EARTH_RADIUS_M = 6371008.8;
+function distanceMeters(a, b) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.latitude - a.latitude);
+  const dLng = toRad(b.longitude - a.longitude);
+  const lat1 = toRad(a.latitude);
+  const lat2 = toRad(b.latitude);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+/*
+ * evaluateGeofence(gpsLocation, device) → null | { distanceMeters, withinFence, radiusMeters }
+ *
+ * null means NOT EVALUATED — no site coordinates, or no device fix. Callers
+ * must treat that as "skip", never as "outside": the whole product rule is
+ * that missing data never blocks a job start.
+ *
+ * The distance and the inside/outside verdict are computed HERE, from the raw
+ * device coordinates, and the client's own `distanceMeters` / `withinFence`
+ * claims are never trusted for the enforcement decision. Hard mode gates on
+ * this boolean, and a gate that reads a client-supplied boolean is not a gate.
+ */
+function evaluateGeofence(gpsLocation, device) {
+  const fence = buildGeofence(gpsLocation);
+  if (!fence) return null;
+  if (!device || !Number.isFinite(Number(device.latitude)) || !Number.isFinite(Number(device.longitude))) return null;
+  const d = distanceMeters(fence, {
+    latitude: Number(device.latitude), longitude: Number(device.longitude),
+  });
+  return {
+    distanceMeters: Math.round(d * 100) / 100,
+    withinFence: d <= fence.radiusMeters,
+    radiusMeters: fence.radiusMeters,
+  };
+}
+
 /* Recent breadcrumb trail for a job (CRM map), newest-first, capped at 1000. */
 async function getTrack(jobId, { limit } = {}) {
   const cap = Math.min(Math.max(Number(limit) || 200, 1), 1000);
@@ -166,4 +328,10 @@ async function getTrack(jobId, { limit } = {}) {
   return rows;
 }
 
-module.exports = { addPing, getLatest, getLatestByEfr, getTrack };
+module.exports = {
+  addPing, getLatest, getLatestByEfr, getTrack,
+  // Geofence (2026-09-07) — pure helpers, no DB. buildGeofence feeds the job
+  // detail projection; evaluateGeofence is the reached-location decision.
+  buildGeofence, evaluateGeofence, enforcementEnabled, fenceRadiusMeters,
+  parseLegacyLatLng, distanceMeters,
+};

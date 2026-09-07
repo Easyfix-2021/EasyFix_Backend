@@ -335,6 +335,13 @@ router.use('/profile', require('./profile-identity'));
 router.use('/jobs', require('./jobs-lifecycle'));
 router.use('/jobs', require('./jobs-estimate'));
 
+// Site-access permission requests (mall gate pass / society NOC / building
+// access letter) raised against a job the technician is ASSIGNED to; the client
+// answers them from the Client Dashboard. Two-segment paths, so nothing here
+// collides with the `GET /jobs/:id` param route below. Same mount reason as the
+// two routers above: literal segments must win over `:id`.
+router.use('/jobs', require('./permission-requests'));
+
 router.get('/me', (req, res) => modernOk(res, { tech: req.tech }));
 
 // Technician-initiated re-application. The protected-router idempotency layer

@@ -37,6 +37,9 @@ const {
 // eta_status code, actor scheme) lives in that module; every call below is
 // FAIL-SOFT and post-COMMIT by its contract, so none of them can fail a mutation.
 const jobLog = require('./job-log.service');
+// Geofence derivation for the detail projection. job-location.service requires
+// only db/logger/properties, so this adds no require cycle.
+const jobLocation = require('./job-location.service');
 
 /*
  * THE OFFER MODEL feature flag. ON by default — only the literal string
@@ -2548,6 +2551,26 @@ async function getByIdCore(jobId) {
   // prepopulate the client custom-property values on reopen. Pure string parse —
   // no extra query — so getByIdCore stays lean for the scope/status hot paths.
   job.custom_properties = parseCustomPropertyString(job.custom_property);
+  /*
+   * geofence (2026-09-07) — { latitude, longitude, radiusMeters } | null.
+   *
+   * The technician app validates the arrival fix against this before it lets a
+   * job start. Derived, never stored: the site coordinates are ad.gps_location
+   * (already selected above) and the radius is an ops property, so there is no
+   * new column and nothing to keep in sync.
+   *
+   * NULL when the site has no usable pin — roughly a fifth of legacy addresses
+   * carry blank or junk gps_location — and the app's contract on null is to
+   * SKIP validation entirely. A job must never be unstartable because ops never
+   * captured a coordinate.
+   *
+   * Lives here in getByIdCore rather than in the mobile route so the one
+   * derivation feeds every detail consumer. Pure function, no DB round trip
+   * (the property read is the synchronous cache), so the scope-assert and
+   * candidate-ranking callers of this hot path are unaffected. The CRM detail
+   * payload gains the key too and ignores it — additive.
+   */
+  job.geofence = jobLocation.buildGeofence(job.gps_location);
   return job;
 }
 

@@ -232,6 +232,117 @@ async function sendCheckinSms(jobId, efrId) {
   return { sent: true };
 }
 
+// ─── Reached-location geofence ───────────────────────────────────────
+/*
+ * The device fix the technician actually reported. Two shapes reach us and
+ * both are optional:
+ *   - `geofence: { latitude, longitude, … }` — the 2026-09-07 contract;
+ *   - top-level `latitude` / `longitude` — what the app has been sending to
+ *     this endpoint all along (Joi's stripUnknown was silently dropping them).
+ * The block wins when present. Returns null when there is no usable fix, and
+ * null means SKIP — never "outside".
+ */
+function resolveDeviceFix({ latitude, longitude, geofence }) {
+  const lat = geofence && geofence.latitude != null ? geofence.latitude : latitude;
+  const lng = geofence && geofence.longitude != null ? geofence.longitude : longitude;
+  if (lat == null || lng == null) return null;
+  const latitudeNum = Number(lat);
+  const longitudeNum = Number(lng);
+  if (!Number.isFinite(latitudeNum) || !Number.isFinite(longitudeNum)) return null;
+  // (0,0) is the Gulf of Guinea — what a device with no fix degrades to, and
+  // never a real arrival. Treat it as "no fix" rather than as 8,000 km outside.
+  if (latitudeNum === 0 && longitudeNum === 0) return null;
+  return { latitude: latitudeNum, longitude: longitudeNum };
+}
+
+/*
+ * Evaluate the arrival fix against the site, enforce if ops has asked for it,
+ * and record the result.
+ *
+ * SOFT BY DEFAULT: the server records and never rejects. Hard mode
+ * (easyfix_properties `geofence.enforcement.enabled` = 'true') rejects with 400
+ * ONLY when the server itself computed "outside" AND no override reason was
+ * given. Every other combination proceeds, including:
+ *   - the site has no coordinates            → nothing to compare against
+ *   - the device sent no fix                 → nothing to compare with
+ *   - outside the fence WITH a reason        → the audited override
+ * i.e. missing data never blocks a job start, which is the product rule.
+ *
+ * The verdict is the SERVER's, computed from the raw device coordinates. The
+ * client's own distanceMeters / withinFence claims are recorded nowhere and
+ * decide nothing — a gate that reads a boolean supplied by the thing being
+ * gated is not a gate. A divergence between the two is logged, because that is
+ * the signal that an app build is computing the fence differently from us.
+ */
+async function recordArrivalGeofence(jobId, efrId, device, claimed) {
+  const [[row]] = await pool.query(
+    `SELECT ad.gps_location
+       FROM tbl_job j
+       LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+      WHERE j.job_id = ? LIMIT 1`,
+    [jobId],
+  );
+  const verdict = jobLocation.evaluateGeofence(row && row.gps_location, device);
+  const overrideReason = claimed && claimed.overrideReason
+    ? String(claimed.overrideReason).trim() : '';
+
+  if (!verdict) {
+    logger.info('Arrival geofence not evaluated · jobId=' + jobId
+      + ' · ' + (row && row.gps_location ? 'device fix unusable' : 'site has no coordinates')
+      + ' — recording position only, not blocking');
+  } else {
+    logger.info('Arrival geofence · jobId=' + jobId
+      + ' · distance=' + verdict.distanceMeters + 'm'
+      + ' · radius=' + verdict.radiusMeters + 'm'
+      + ' · within=' + verdict.withinFence
+      + ' · override=' + (overrideReason ? 'yes' : 'no'));
+    if (claimed && claimed.withinFence != null && Boolean(claimed.withinFence) !== verdict.withinFence) {
+      logger.warn('Arrival geofence verdict differs from the app\'s · jobId=' + jobId
+        + ' · app=' + Boolean(claimed.withinFence) + ' · server=' + verdict.withinFence
+        + ' — the server verdict is authoritative');
+    }
+  }
+
+  /*
+   * Recorded on tbl_job_location_track — the EasyFix-owned live-track table the
+   * CRM already reads for "where is my technician", indexed on (job_id,
+   * captured_at). The arrival row is the one with within_fence NOT NULL; the
+   * ops abuse report is `WHERE within_fence = 0 AND override_reason IS NOT NULL`.
+   * Best-effort: an audit write must never be what stops a technician working.
+   */
+  try {
+    await jobLocation.addPing(jobId, efrId, {
+      latitude: device.latitude,
+      longitude: device.longitude,
+      accuracy: null,
+      geofence: verdict
+        ? { ...verdict, overrideReason: overrideReason || null }
+        : { distanceMeters: null, withinFence: null, overrideReason: overrideReason || null },
+    });
+  } catch (e) {
+    logger.warn('Arrival geofence audit write failed · jobId=' + jobId + ' · ' + e.message
+      + ' — continuing, the technician is not blocked by an audit failure');
+  }
+
+  /*
+   * Enforcement runs AFTER the audit write, deliberately. A blocked attempt is
+   * the single most interesting row ops can have, and throwing before the
+   * INSERT would make exactly those attempts the ones that leave no trace.
+   * Blocked rows are `within_fence = 0 AND override_reason IS NULL`, so they
+   * sit beside the overrides without polluting the override report.
+   */
+  if (verdict && !verdict.withinFence && !overrideReason && jobLocation.enforcementEnabled()) {
+    logger.warn('Arrival BLOCKED, outside fence with no reason · jobId=' + jobId
+      + ' · distance=' + verdict.distanceMeters + 'm');
+    const e = new Error(
+      'You are ' + Math.round(verdict.distanceMeters) + 'm from the job location '
+      + '(allowed ' + Math.round(verdict.radiusMeters) + 'm). Add a reason to continue.',
+    );
+    e.status = 400;
+    throw e;
+  }
+}
+
 // ─── Reached-location selfie ─────────────────────────────────────────
 /*
  * POST /jobs/:id/selfie { selfieImageId }
@@ -244,9 +355,27 @@ async function sendCheckinSms(jobId, efrId) {
  *
  * Not a status transition — a plain owned-row UPDATE.
  */
-async function saveSelfie(jobId, efrId, { selfieImageId }) {
+async function saveSelfie(jobId, efrId, { selfieImageId, latitude, longitude, geofence }) {
   logger.info('Save reached-location selfie · jobId=' + jobId + ' selfieImageId=' + selfieImageId);
   await getOwnedJob(jobId, efrId);
+
+  /*
+   * ── GEOFENCE (2026-09-07), ENTIRELY ADDITIVE ────────────────────────────
+   *
+   * Runs FIRST, before the tx_selfie_id write, so a hard-mode rejection cannot
+   * leave the job half-mutated.
+   *
+   * A caller that sends no device coordinates — every caller that exists today,
+   * and the CRM forever — takes ZERO new work: no address lookup, no INSERT,
+   * no property read, no new failure mode. The function then behaves byte-for-
+   * byte as it did before this change. That equivalence is the point of the
+   * whole task and it is pinned by a test
+   * (tests/mobile-reached-location-geofence.test.js).
+   */
+  const device = resolveDeviceFix({ latitude, longitude, geofence });
+  if (device) {
+    await recordArrivalGeofence(jobId, efrId, device, geofence);
+  }
 
   if (!(await hasJobColumn('tx_selfie_id'))) {
     // VERIFY: tx_selfie_id confirmed on legacy schema; if a deploy lacks
