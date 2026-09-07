@@ -605,23 +605,132 @@ async function hasLifecycleSchema({ force = false } = {}) {
 
 function resetSchemaProbeForTests() {
   schemaCache = { value: null, checkedAt: 0, promise: null };
+  trainingSchemaCache = { value: null, checkedAt: 0, promise: null };
+}
+
+/*
+ * OVERDUE TRAINING, AS A ROW PREDICATE — the half the offer paths DECIDE from.
+ *
+ * lms.hasOverdueTraining() answers the same question per technician and is what
+ * the display overlay uses. It cannot answer it for a candidate LIST without
+ * one query per row, and the server-authoritative offer gate
+ * (job.service.assertTechniciansCanReceiveJobs) never calls the overlay at all
+ * — it projects rows and asks easyfixer-work-eligibility.fromRow(). So the same
+ * condition is expressed once more here, as SQL, and shipped to every one of
+ * those rows through readProjection() below.
+ *
+ * The DATE is not restated: lms.istToday() is the single definition of "which
+ * calendar day is today" and this reuses it. Deadlines are calendar dates, not
+ * instants (see the note on lms.service.js istToday), so there is deliberately
+ * no timezone conversion here — a plain DATE < DATE comparison.
+ *
+ * Column order matches idx_efr_course_due (easyfixer_id, due_date,
+ * completion_date), so this is an index-only probe per row.
+ */
+function overdueTrainingSql(alias = 'e') {
+  assertSqlAlias(alias);
+  const today = lms.istToday();
+  // istToday() is Intl output, not user input, but this is interpolated rather
+  // than bound (a projection string has no parameter slots), so prove it.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) {
+    throw new Error('istToday() did not return YYYY-MM-DD');
+  }
+  return `EXISTS (SELECT 1
+                    FROM easyfixer_courses ec
+                   WHERE ec.easyfixer_id = ${alias}.efr_id
+                     AND ec.due_date IS NOT NULL
+                     AND ec.due_date < '${today}'
+                     AND ec.completion_date IS NULL)`;
+}
+
+function assertSqlAlias(alias) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) {
+    throw new Error('invalid SQL alias for lifecycle projection');
+  }
+}
+
+/*
+ * due_date / completion_date arrived in migrations/executed/
+ * 2026-08-13-lms-training-due-dates.sql. readProjection() feeds a dozen call
+ * sites including every authenticated mobile request and the CRM easyfixer
+ * lists, so referencing a column that a not-yet-migrated database lacks would
+ * turn a degraded LMS into a 500 on all of them. Probed once, cached like the
+ * lifecycle probe, and — matching PROPERTY 1 of the overlay — a probe that
+ * FAILS resolves to "no restriction" rather than to one.
+ */
+let trainingSchemaCache = { value: null, checkedAt: 0, promise: null };
+
+async function probeTrainingDeadlineSchema() {
+  try {
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS n
+         FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = 'easyfixer_courses'
+          AND column_name IN ('due_date', 'completion_date')`,
+    );
+    const present = Number(row && row.n) === 2;
+    if (!present) {
+      logger.warn('Training-deadline columns absent · overdue training will not gate job offers'
+        + ' (run migrations/executed/2026-08-13-lms-training-due-dates.sql)');
+    }
+    return present;
+  } catch (e) {
+    logger.warn('Training-deadline schema probe failed · ' + e.message + ' · not gating offers');
+    return false;
+  }
+}
+
+async function hasTrainingDeadlineSchema() {
+  const now = Date.now();
+  const ttl = trainingSchemaCache.value ? SCHEMA_POSITIVE_TTL_MS : SCHEMA_NEGATIVE_TTL_MS;
+  if (trainingSchemaCache.value !== null && now - trainingSchemaCache.checkedAt < ttl) {
+    return trainingSchemaCache.value;
+  }
+  // Same in-flight dedupe hasLifecycleSchema uses, and for the same reason:
+  // readProjection() sits in front of every authenticated mobile request, so a
+  // cold cache without this fires one information_schema read per concurrent
+  // request instead of one.
+  if (trainingSchemaCache.promise) return trainingSchemaCache.promise;
+  trainingSchemaCache.promise = probeTrainingDeadlineSchema().then((value) => {
+    trainingSchemaCache = { value, checkedAt: Date.now(), promise: null };
+    return value;
+  });
+  return trainingSchemaCache.promise;
 }
 
 async function readProjection(alias = 'e') {
+  assertSqlAlias(alias);
+  /*
+   * `training_overdue` rides along with the lifecycle columns because it is
+   * read from the same rows by the same consumer: easyfixer-work-eligibility
+   * .fromRow(), the row half of "may this technician receive a NEW job?".
+   * Projecting it here is what makes the block reach the offer/assign/accept
+   * gate, which builds its rows from this projection and nothing else.
+   *
+   * lifecycleFromRow() deliberately ignores the column. getLifecycle() is the
+   * snapshot transition() reads as a precondition, and a lapsed training
+   * deadline must not decide which CRM transitions are legal.
+   */
+  const training = (await hasTrainingDeadlineSchema())
+    ? `${overdueTrainingSql(alias)} AS training_overdue`
+    : '0 AS training_overdue';
   if (!(await hasLifecycleSchema())) {
     return `NULL AS lifecycle_status,
             NULL AS lifecycle_reason_code,
             NULL AS lifecycle_reason,
             NULL AS lifecycle_changed_at,
             NULL AS lifecycle_source,
-            0 AS lifecycle_version`;
+            0 AS lifecycle_version,
+            ${training}`;
   }
   return `${alias}.lifecycle_status,
           ${alias}.lifecycle_reason_code,
           ${alias}.lifecycle_reason,
           ${alias}.lifecycle_changed_at,
           ${alias}.lifecycle_source,
-          ${alias}.lifecycle_version`;
+          ${alias}.lifecycle_version,
+          ${training}`;
 }
 
 /**
@@ -774,9 +883,20 @@ async function overlayOpenJobCapabilities(snapshot, efrId, executor = pool) {
  * reported the plain lifecycle capabilities while the app showed the training
  * wall. One function, called from both paths, removes that blind spot.
  *
- * A technician past the due date on assigned training keeps only what they need
- * to get unstuck or get paid: training itself and claiming money. New work,
- * attendance and every job mutation are withdrawn until they finish.
+ * A technician past the due date on assigned training loses exactly ONE thing:
+ * NEW WORK. Everything they already hold stays theirs to finish — continue,
+ * progress, send for approval — and they keep marking attendance.
+ *
+ * NARROWED 2026-09-07, from the four operational capabilities to one, on the
+ * product owner's rule: "block new offers only ... Tx should be able to take
+ * all actions on jobs already accepted by Tx and job which are in accepted and
+ * further status like in progress, sent for approval, etc". The header below
+ * already made this argument about `claimMoney` — withholding earned money
+ * over an unwatched video would be indefensible — and stopping there was the
+ * bug: stranding a job the technician had already travelled to is the same
+ * wrong, one step earlier. `continueAssignedJobs`, `mutateAssignedJobs` and
+ * `markAttendance` are now left exactly as the snapshot had them, and
+ * tests/easyfixer-training-overlay.test.js pins that they are untouched.
  *
  * Layered on top of the lifecycle capabilities rather than modelled as a new
  * lifecycle STATUS, for three reasons:
@@ -801,8 +921,18 @@ async function overlayOpenJobCapabilities(snapshot, efrId, executor = pool) {
  * legal. Callers overlay it on the snapshot they SHOW, never on the one they
  * DECIDE from.
  *
- * Three properties that must not drift — see the inline notes below and
- * tests/easyfixer-training-overlay.test.js, which pins all three.
+ * THIS OVERLAY IS THEREFORE DISPLAY ONLY, AND ALWAYS WAS. It is what makes the
+ * app and the CRM chip say "restricted"; it has never stopped an offer being
+ * created, because no offer path calls it. The real block lives where offers
+ * are decided — readProjection()'s `training_overdue` column, consumed by
+ * easyfixer-work-eligibility.fromRow(), which is the single row predicate
+ * behind candidate selection AND job.service.assertTechniciansCanReceiveJobs
+ * (offerToTechnicians / assign / acceptOffer). The two must keep agreeing:
+ * overdueTrainingSql() above is the SQL statement of the same condition
+ * lms.hasOverdueTraining() answers here.
+ *
+ * Four properties that must not drift — see the inline notes below and
+ * tests/easyfixer-training-overlay.test.js, which pins all four.
  */
 async function overlayTrainingRestriction(snapshot, efrId) {
   let overdue = false;
@@ -832,22 +962,78 @@ async function overlayTrainingRestriction(snapshot, efrId) {
   if (!overdue) return snapshot;
   /*
    * PROPERTY 3 — ORDERING. Callers must apply this AFTER
-   * overlayOpenJobCapabilities: both write the same operational capabilities,
-   * and the training restriction has to win over the INACTIVE-with-open-jobs
-   * re-grant. Spreading `snapshot.capabilities` last-write-wins only gives the
-   * right answer in that order.
+   * overlayOpenJobCapabilities: both write `receiveNewJobs`, and the training
+   * restriction has to win over the INACTIVE-with-open-jobs re-grant.
+   * Spreading `snapshot.capabilities` last-write-wins only gives the right
+   * answer in that order. (overlayOpenJobCapabilities never re-grants
+   * receiveNewJobs, so today the orders agree on that key — but it does
+   * re-grant the other three, which is exactly why this overlay must no
+   * longer touch them, and why the ordering still has to hold if a future
+   * edit widens either side.)
    */
+  /*
+   * PROPERTY 4 — the restriction withdraws `receiveNewJobs` and NOTHING ELSE.
+   * See the narrowing note in the header. The other three operational
+   * capabilities are the technician's already-accepted work; taking them
+   * strands jobs a customer is waiting on.
+   */
+  const detail = await overdueTrainingDetail(efrId);
   return {
     ...snapshot,
     trainingOverdue: true,
+    // OPTIONAL by contract — omitted, never null and never a zero-count husk,
+    // whenever the courses cannot be listed (see overdueTrainingDetail). The
+    // app must render a correct message without it.
+    ...(detail ? { trainingOverdueDetail: detail } : {}),
     capabilities: {
       ...snapshot.capabilities,
       receiveNewJobs: false,
-      continueAssignedJobs: false,
-      mutateAssignedJobs: false,
-      markAttendance: false,
     },
   };
+}
+
+/*
+ * WHY the technician is blocked, for the app to render.
+ *
+ * Runs only on the overdue path, so it costs nothing for a healthy technician.
+ * Reuses lms.pendingTraining() — the same rows and the same `overdue` rule the
+ * training screen and the reminder cron already read — rather than a second
+ * overdue definition that could eventually disagree with the block itself.
+ * Deadlines stay the calendar dates they were stored as: sliced to YYYY-MM-DD,
+ * never re-parsed into an instant.
+ *
+ * Returns null, not a partial object, when there is nothing truthful to say:
+ *   - the lookup failed (fail OPEN on the EXPLANATION too — a missing reason
+ *     must never become a wrong reason), or
+ *   - hasOverdueTraining() counted a row that pendingTraining() drops. It does
+ *     that for a course with no content yet: an operator assigned a deadline
+ *     to an empty course. The count restricts, the list has nothing to show,
+ *     and an empty `courses: []` with `count: 0` would render as a blank
+ *     parenthetical in the app.
+ */
+async function overdueTrainingDetail(efrId) {
+  try {
+    const { courses } = await lms.pendingTraining(efrId);
+    const overdue = courses.filter((course) => course.overdue);
+    if (!overdue.length) return null;
+    const dueDate = (course) => String(course.due_date).slice(0, 10);
+    return {
+      // The full count; `courses` below is capped, so the app can say
+      // "3 courses" while listing 5 at most without doing arithmetic.
+      count: overdue.length,
+      // pendingTraining() orders by (due_date IS NULL), due_date ASC and every
+      // overdue row has a due_date, so the first is the oldest missed deadline.
+      earliestDueDate: dueDate(overdue[0]),
+      courses: overdue.slice(0, 5).map((course) => ({
+        id: Number(course.course_id),
+        title: String(course.course_name || ''),
+        dueDate: dueDate(course),
+      })),
+    };
+  } catch (e) {
+    logger.warn('Overdue-training detail failed · efrId=' + efrId + ' · ' + e.message);
+    return null;
+  }
 }
 
 async function getLifecycle(efrId) {
@@ -1845,6 +2031,8 @@ module.exports = {
   reconciledWorkEligibleSql,
   capabilitiesForStatus,
   hasLifecycleSchema,
+  hasTrainingDeadlineSchema,
+  overdueTrainingSql,
   readProjection,
   lifecycleFromRow,
   forTechnician,

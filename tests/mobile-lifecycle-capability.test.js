@@ -28,9 +28,10 @@ const fake = installFakePool([
     if (openJobCount < 0) throw new Error('ER_LOCK_WAIT_TIMEOUT: lock wait timeout exceeded');
     return [{ open_jobs: openJobCount }];
   }],
-  // Overdue training is a separate, fail-OPEN overlay that withdraws the SAME
-  // three capabilities the open-job overlay grants. Inert unless a test arms it
-  // — see 'overdue training still wins over the open-job overlay' below.
+  // Overdue training is a separate, fail-OPEN overlay. Since 2026-09-07 it
+  // withdraws receiveNewJobs ALONE, so it no longer contests the three
+  // capabilities the open-job overlay grants. Inert unless a test arms it
+  // — see 'overdue training withdraws new offers only' below.
   [/FROM easyfixer_courses/i, () => [{ n: trainingOverdue ? 1 : 0 }]],
   [/FROM tbl_easyfixer\b/i, [{
     efr_id: 501,
@@ -388,26 +389,37 @@ test('a completed or cancelled job does not keep the inactive screen open', asyn
  * is not stranded, but an untrained technician turning up is the risk the
  * training deadline was created to stop.
  */
-test('overdue training still wins over the open-job overlay', async () => {
+/*
+ * NARROWED 2026-09-07 by product decision, and this test is the record of it.
+ *
+ * Overdue training used to withdraw four capabilities, so a technician who
+ * missed a deadline could not check in to a job he had already accepted and
+ * travelled to, and could not be marked as having worked. That punished the
+ * CUSTOMER of an already-booked visit to discipline the technician.
+ *
+ * The deadline now withholds the NEXT job and nothing else. Everything the
+ * open-job overlay granted survives it — which is why this no longer reads as
+ * one overlay beating another: they overlap on receiveNewJobs alone.
+ */
+test('overdue training withdraws new offers only; accepted work is untouched', async () => {
   const tech = await techRequest(2, { overdue: true });
 
   assert.equal(tech.lifecycle.status, 'INACTIVE');
   assert.equal(tech.lifecycle.trainingOverdue, true);
-  assert.equal(tech.lifecycle.openJobs, 2, 'the grant still happened — it is then overridden');
+  assert.equal(tech.lifecycle.openJobs, 2, 'the open-job grant happened and now SURVIVES');
 
-  assert.equal(tech.lifecycle.capabilities.continueAssignedJobs, false);
-  assert.equal(tech.lifecycle.capabilities.mutateAssignedJobs, false);
-  assert.equal(tech.lifecycle.capabilities.markAttendance, false);
-  assert.equal(tech.lifecycle.capabilities.receiveNewJobs, false);
+  assert.equal(tech.lifecycle.capabilities.receiveNewJobs, false, 'the one thing training withdraws');
+  assert.equal(tech.lifecycle.capabilities.continueAssignedJobs, true);
+  assert.equal(tech.lifecycle.capabilities.mutateAssignedJobs, true);
+  assert.equal(tech.lifecycle.capabilities.markAttendance, true);
 
   const checkin = await invoke(requireTechJobMutationCapability, {
     method: 'POST', path: '/jobs/44/checkin', tech,
   });
-  assert.equal(checkin.nextCalled, false, 'an untrained technician does not check in');
-  assert.equal(checkin.res.body.details.capability, 'mutateAssignedJobs');
+  assert.equal(checkin.nextCalled, true, 'he finishes the job he already accepted');
 
   const attendance = await invoke(requireTechCapability('markAttendance'), {
     method: 'POST', path: '/attendance', tech,
   });
-  assert.equal(attendance.nextCalled, false, 'attendance is withdrawn with the rest');
+  assert.equal(attendance.nextCalled, true, 'and is recorded as having worked');
 });
