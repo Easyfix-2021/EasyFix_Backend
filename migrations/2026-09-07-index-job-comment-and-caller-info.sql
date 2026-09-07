@@ -1,0 +1,41 @@
+-- Two missing indexes on the job comment log and the call log.
+--
+-- WHY. Neither table has ANY index on job_id — the column every consumer joins
+-- and correlates on. Measured on QA (MySQL 8.4.9) before this ran, every one of
+-- these was a full table scan, EXPLAIN type=ALL with key=NULL:
+--
+--   1368ms  auto-unreachable sweep       944,731 rows scanned
+--   2984ms  quicksight per-job aggregate 944,731 rows scanned
+--    541ms  client portal unreachable    754,303 rows scanned
+--    298ms  sections client-request EXISTS, per correlation
+--
+-- Three independent reviews converged on these two indexes, and the consumers
+-- are already in production — this is not speculative work for a new feature:
+--   routes/client/index.js                        (unreachable list + tile)
+--   services/client-request.service.js            (sectionsFor, sectionPredicate)
+--   services/auto-unreachable.service.js          (the sweep)
+--   services/quicksight/quicksight-premature-confirmations.service.js
+--     — which runs GROUP BY job_id over the WHOLE call log with no WHERE at all.
+--
+-- COLUMN ORDER. job_id leads both because it is the join/correlation key, so a
+-- seek replaces the scan. The trailing columns make the common reads
+-- index-only: comment_on + created_on covers "which days was this job marked
+-- unreachable", call_type + inserted_time covers "which days did we call out".
+--
+-- ONLINE, AND IT SAYS SO. ALGORITHM=INPLACE, LOCK=NONE is not decoration: it
+-- makes the server REFUSE the statement rather than silently fall back to a
+-- table-copying rebuild that would block writes on a 944k-row table shared with
+-- five legacy services. If either statement errors on a future MySQL, do not
+-- strip the clause to make it pass — take the outage window deliberately.
+--
+-- NOT IDEMPOTENT, deliberately. MySQL 8 has no ADD INDEX IF NOT EXISTS (that is
+-- MariaDB-only syntax, which this repo's migration style forbids), so a re-run
+-- fails with "Duplicate key name". That is the correct, loud outcome: an index
+-- that already exists is not a problem to paper over.
+--
+-- Adds roughly 25-40MB of index to tbl_job_caller_info, which today carries
+-- 277MB of data and 0MB of index.
+
+ALTER TABLE tbl_job_comment ADD INDEX idx_jc_job_comment_on (job_id, comment_on, created_on), ALGORITHM=INPLACE, LOCK=NONE;
+
+ALTER TABLE tbl_job_caller_info ADD INDEX idx_jci_job_attempt (job_id, call_type, inserted_time), ALGORITHM=INPLACE, LOCK=NONE;
