@@ -136,10 +136,15 @@ test('(b) returns the five catalogue fields and no admin columns', async () => {
   assert.equal(res.body.success, true);
 
   const { items, total, limit, offset } = res.body.data;
-  assert.equal(total, 7);
+  assert.equal(total, 8);
   assert.equal(limit, 2);
   assert.equal(offset, 0);
-  assert.equal(items.length, 2);
+  // THREE, not the requested limit of 2: the fake pool returns every fixture row
+  // and does not honour LIMIT. This used to read 2 only because the serviceable
+  // filter happened to drop one — the assertion believed it was pinning
+  // pagination and was really pinning that filter. What it actually covers is
+  // the PROJECTION below, so it counts the fixture, not the page.
+  assert.equal(items.length, 3);
 
   for (const item of items) {
     assert.deepEqual(
@@ -168,32 +173,50 @@ test('(b) survives the app parser: PINs, city, and the Load-more maths', async (
     }))
     .filter((i) => /^\d{6}$/.test(i.pincode));
 
-  assert.deepEqual(parsed.map((i) => i.pincode), ['560001', '560002']);
+  assert.deepEqual(parsed.map((i) => i.pincode), ['560001', '560002', '560999']);
   assert.equal(parsed[0].city, 'Bengaluru');
   assert.equal(parsed[0].state, 'Karnataka');
   assert.equal(parsed[0].district, 'Bengaluru Urban');
 
   // The picker's hasMore: it reads the TOTAL off the envelope, not the page.
   const parsedTotal = Math.max(parsed.length, Number(pick(raw, ['total', 'count']) ?? parsed.length));
-  assert.equal(parsedTotal, 7);
+  assert.equal(parsedTotal, 8);
   assert.ok(parsed.length < parsedTotal, 'Load more must stay reachable');
 });
 
 // ─── (c) non-serviceable pincodes are excluded ───────────────────────
-test('(c) excludes non-serviceable pincodes', async () => {
+/*
+ * REVERSED 2026-09-07, and this test is the record of why.
+ *
+ * It used to assert the opposite — that a pincode_status = 0 PIN "must never be
+ * offered as work area". That read the flag as a commercial one. It is not:
+ * easyfixer-verification's immediate-serviceable hook sets pincode_status = 1
+ * the moment a technician SAVES a PIN into his set, and the nightly recompute
+ * clears the ones nobody works in. A PIN is serviceable BECAUSE somebody
+ * claimed it.
+ *
+ * So filtering the picker by it meant the grid could only ever show PINs
+ * another technician had already picked, while the manual Add box beside it
+ * accepted anything — and since claiming is what marks a PIN, a city with no
+ * technicians could never populate its own grid. Reported when New Delhi
+ * offered two PINs in the app against a CRM directory full of them.
+ */
+test('(c) offers the whole city, including PINs nobody has claimed yet', async () => {
   fake.reset();
   const res = await call({ cityId: CITY_ID, limit: 50, offset: 0 });
   const codes = res.body.data.items.map((i) => i.pincode);
 
-  assert.ok(!codes.includes('560999'), 'a non-serviceable PIN must never be offered as work area');
-  assert.deepEqual(codes, ['560001', '560002']);
+  assert.ok(codes.includes('560999'),
+    'an unclaimed PIN must be offerable — claiming it is what makes it serviceable');
+  assert.deepEqual(codes, ['560001', '560002', '560999']);
 
   const listSql = fake.calls
     .map((c) => c.sql)
     .find((sql) => /FROM tbl_pincode\s+p\s+LEFT JOIN tbl_city/.test(sql) && !/COUNT\(\*\)/.test(sql));
   assert.ok(listSql, 'the list query must have run');
-  assert.match(listSql, /p\.pincode_status = 1/);
-  // The count the picker pages against must carry the same filter.
+  assert.doesNotMatch(listSql, /p\.pincode_status = 1/,
+    'the picker must not filter on the flag its own save sets');
+  // The count the picker pages against must agree with the page.
   const countSql = fake.calls.map((c) => c.sql).find((sql) => /COUNT\(\*\) AS total/.test(sql));
-  assert.match(countSql, /p\.pincode_status = 1/);
+  assert.doesNotMatch(countSql, /p\.pincode_status = 1/);
 });

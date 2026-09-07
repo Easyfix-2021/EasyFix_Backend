@@ -64,9 +64,29 @@ router.get('/cities',             validate(citiesQuery, 'query'),          async
 // our technician supply and our internal ops, not the PIN catalogue, and a
 // technician JWT reaches this route.
 //
-// `includeInactive` is deliberately NOT part of the contract: listPincodes
-// defaults it false (WHERE p.pincode_status = 1), and a non-serviceable PIN is
-// not somewhere a technician may claim as their work area.
+// THE WORK-AREA PICKER LISTS THE WHOLE CITY, not only already-claimed PINs.
+//
+// This used to default to serviceable-only, on the reasoning that "a
+// non-serviceable PIN is not somewhere a technician may claim as their work
+// area". That reasoning had the causality backwards, and it deadlocked the
+// screen it serves.
+//
+// pincode_status is DERIVED, not commercial: easyfixer-verification.service
+// (the immediate-serviceable hook) flips a PIN to 1 the moment a technician
+// saves it into their set, and the nightly recompute clears ones nobody works
+// in. So a PIN is serviceable BECAUSE somebody claimed it.
+//
+// Filtering the picker by it therefore showed "PINs another technician already
+// picked" while claiming to show "PINs available in this city" — and since the
+// only way to mark one is to claim it, and the grid hid every unclaimed one,
+// a city could never populate its own grid. Reported 2026-09-07: New Delhi
+// offered 2 PINs in the app while the CRM directory listed many. The two that
+// showed had been typed into the manual Add box, which never applied this
+// filter — so the grid and the box beside it disagreed, and the box was right.
+//
+// The picker now passes includeInactive, matching manual Add. Nothing else
+// changes: saving still runs through the same hook, so selecting a PIN here
+// activates it exactly as typing it did.
 //
 // NOT cached, on purpose: ttl-cache's Map never evicts, and the key space here
 // (cityId × limit × offset ≈ 11k cities × pages) is unbounded enough to be the
@@ -76,7 +96,7 @@ router.get('/pincodes',           validate(pincodesQuery, 'query'),        async
   try {
     const { cityId, limit, offset } = req.query;
     logger.info('Lookup pincodes · cityId=' + cityId + ' limit=' + limit + ' offset=' + offset);
-    const { items, total } = await pincode.listPincodes({ cityId, limit, offset });
+    const { items, total } = await pincode.listPincodes({ cityId, limit, offset, includeInactive: true });
     logger.info('Found ' + items.length + ' pincodes · total=' + total);
     modernOk(res, {
       items: items.map((p) => ({
