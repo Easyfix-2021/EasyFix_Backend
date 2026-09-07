@@ -400,6 +400,134 @@ const OPTIONAL = {
   product_additional_image: 'Product CRUD requires migrations/2026-05-12-create-product-tables.sql to be run',
 };
 
+/*
+ * Directories that hold no SQL that ever runs in production. Everything else
+ * under the repo root is walked, which is the point: this is an EXCLUDE list,
+ * not an include list. An include list is one more hand-maintained record — a
+ * new directory holding SQL would silently fall outside it and the scan would
+ * come back clean on a file it never opened. An exclude list fails towards MORE
+ * coverage instead: a new directory is scanned until somebody deliberately
+ * names it here.
+ *
+ * `scripts/` is excluded because this file lives in it — EXPECTED itself is a
+ * pile of column names and scanning it would report every entry as its own
+ * justification. `tests/` because fixtures deliberately name columns that do
+ * not exist, and `migrations/` because a DDL file names the column it is adding.
+ */
+const NON_RUNTIME_DIRS = new Set([
+  'node_modules', 'tests', 'scripts', 'migrations', 'docs', 'deploy', 'uploads',
+  'coverage', 'stt-service',
+]);
+
+function runtimeSourceFiles() {
+  const fs = require('fs');
+  const path = require('path');
+  const root = path.join(__dirname, '..');
+  const out = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith('.') || NON_RUNTIME_DIRS.has(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.js')) out.push(full);
+    }
+  };
+  walk(root);
+  return out.map((f) => ({ rel: path.relative(root, f), src: fs.readFileSync(f, 'utf8') }));
+}
+
+/**
+ * Is EXPECTED itself complete? Needs no database — this compares the list
+ * against the SOURCE, not against the schema.
+ *
+ * WHY THIS EXISTS. EXPECTED is a RECORD: a hand-maintained map somebody updates
+ * when they remember to. verifySchemaAgainstLiveDb() below loops it, and that
+ * makes the loop self-referential — it can only ask "is everything I wrote down
+ * still in the database". A column the code reads and writes but nobody wrote
+ * down here is not reported as unchecked; it is not reported at all. Mutations
+ * of a listed column are caught, ADDITIONS are invisible, and the pass line
+ * counts the record so it cannot disagree with the loop that produced it.
+ *
+ * That is not hypothetical. tbl_job grew `magic_link_sent_at`; three files
+ * (services/whatsapp-conversation.service.js, services/job.service.js,
+ * services/job-magic-link-cron.js) read and write it; this file did not mention
+ * it. The boot gate was passing while blind to a live column — so a deploy that
+ * renamed it would have sailed through and 500'd the magic-link flow in
+ * production, which is precisely the 2026-08-27 shape verify-phantom-columns.js
+ * was written for.
+ *
+ * The CONTRACT is the set of columns the codebase's own SQL names on the tables
+ * EXPECTED claims to guard. That set is derived, not written down, so it grows
+ * on its own when a query does. This iterates it and treats "named by the code,
+ * absent from EXPECTED" as a failure.
+ *
+ * The extraction is scripts/verify-phantom-columns.js's, deliberately reused
+ * rather than reimplemented: one parser means the two gates can never disagree
+ * about which columns the code names, and that parser already carries two
+ * incidents' worth of hard-won rules (NOT_AN_ALIAS, derived aliases, blanked
+ * interpolations). Required lazily so neither it nor a repo-wide file walk ever
+ * enters server.js's boot path.
+ */
+function verifyExpectedIsComplete() {
+  const { scanFile } = require('./verify-phantom-columns');
+
+  /*
+   * scanFile reports columns MISSING from the map it is handed, so handing it
+   * empty sets turns it into an enumerator: every column the SQL names on an
+   * EXPECTED table comes back as a hit.
+   *
+   * The js-fragment pass is dropped. It resolves aliases against a FILE-wide
+   * map, which is safe in verify-phantom-columns because there the map holds
+   * every live table — an alias bound to several tables only counts when the
+   * column is missing from all of them. Here the map holds ~35 tables, so an
+   * alias meaning tbl_reward_claim in one query and `courses` in another
+   * resolves to the only member it knows and invents the finding. Measured:
+   * 124 of 215 hits were that artefact. The alias and bare passes resolve per
+   * QUERY and do not have the problem.
+   */
+  const blank = new Map(Object.keys(EXPECTED).map((t) => [t.toLowerCase(), new Set()]));
+  const referenced = new Map();
+  const files = runtimeSourceFiles();
+  for (const { rel, src } of files) {
+    for (const hit of scanFile(rel, src, blank)) {
+      if (hit.kind === 'js-fragment') continue;
+      if (!referenced.has(hit.table)) referenced.set(hit.table, new Map());
+      const cols = referenced.get(hit.table);
+      if (!cols.has(hit.col.toLowerCase())) cols.set(hit.col.toLowerCase(), rel);
+    }
+  }
+
+  // ── The contract, iterated ──────────────────────────────────────────────
+  // `referenced` is the CONTRACT (what the code's SQL names); EXPECTED is the
+  // RECORD (what somebody listed). Looping the contract is what makes an
+  // unlisted column visible at all — looping EXPECTED, as every other check in
+  // this file does, can only ever revisit entries that already exist.
+  const unlisted = [];
+  let contractColumns = 0;
+  for (const [table, used] of referenced) {
+    const listed = new Set((EXPECTED[table] || []).map((c) => c.toLowerCase()));
+    contractColumns += used.size;
+    for (const [col, rel] of used) if (!listed.has(col)) unlisted.push({ table, col, rel });
+  }
+
+  // ── The reverse direction, reported separately ──────────────────────────
+  // A listed column no literal SELECT names is a different animal from an
+  // unlisted one and must not share its message: it is at worst dead weight,
+  // never a blind spot. It is also weak evidence — this scan reads SELECT lists
+  // and alias references, so a column only ever written by an INSERT (every
+  // tbl_idempotency_key column, most of tbl_job_logs) looks unreferenced while
+  // being entirely live. Counted, never failed on, never used to delete.
+  const unreferenced = [];
+  let listedColumns = 0;
+  for (const [table, columns] of Object.entries(EXPECTED)) {
+    const used = referenced.get(table.toLowerCase()) || new Map();
+    listedColumns += columns.length;
+    for (const col of columns) if (!used.has(col.toLowerCase())) unreferenced.push(`${table}.${col}`);
+  }
+
+  return { unlisted, unreferenced, contractColumns, listedColumns, filesScanned: files.length };
+}
+
 /**
  * Returns { ok, requiredMismatches, invariantMismatches, optionalMissing, ... }.
  *
@@ -562,13 +690,38 @@ function bootWouldFail(report, { strictInvariants } = {}) {
  *                    or the pipeline reintroduces the very coupling that took
  *                    production down (an unshippable release while a hardening
  *                    migration waits on an audited Ops decision).
+ *
+ * EXPECTED's own completeness runs FIRST, and under the default policy only.
+ * First because it needs no database, so it still reports on a host that cannot
+ * reach one. Default-only because an unlisted column is a hole in THIS GATE,
+ * not a runtime fault: the column exists, every query runs, and the container
+ * comes up — so failing --boot-check on it would break the one promise that
+ * mode makes (a faithful prediction of "will the new container start?") for the
+ * same reason the hardening invariants above are not boot-blocking.
  */
 async function cliMain() {
   const bootCheck = process.argv.includes('--boot-check');
+
+  const completeness = verifyExpectedIsComplete();
+  console.log(`\nScanned ${completeness.filesScanned} runtime source files: the code's SQL names ${completeness.contractColumns} columns on the ${Object.keys(EXPECTED).length} required tables; EXPECTED lists ${completeness.listedColumns}`);
+  if (completeness.unlisted.length > 0) {
+    // Not "N mismatches" — these columns are FINE in the database. What is
+    // broken is that the check below never looks at them.
+    console.log(`✗ ${completeness.unlisted.length} column(s) the code READS OR WRITES that EXPECTED does not list — unguarded: a rename or a dropped column here passes every check in this file:`);
+    for (const u of completeness.unlisted) console.log(`  ${u.table}.${u.col}  (first seen in ${u.rel})`);
+    console.log('  → add each to EXPECTED above, or move its table to OPTIONAL if the code truly tolerates it being absent.');
+    if (!bootCheck) process.exitCode = 1;
+  }
+  if (completeness.unreferenced.length > 0) {
+    console.log(`ℹ ${completeness.unreferenced.length} listed column(s) matched by no literal SELECT — most are INSERT-only or built in an interpolated fragment this scan cannot read, so verify by hand before removing any.`);
+  }
+
   const report = await verifySchemaAgainstLiveDb();
   console.log(`\nChecked ${report.columnsChecked} columns, ${report.indexesChecked} required indexes, and ${report.invariantsChecked} schema invariants across ${report.tablesChecked} required tables`);
   if (report.ok) {
-    console.log('✅ All required columns, indexes and invariants exist in production schema.');
+    // Scoped deliberately to "the listed ones". A green tick here while the
+    // completeness pass above is red would read as an overall pass and bury it.
+    console.log(`✅ All ${completeness.unlisted.length > 0 ? 'LISTED ' : ''}columns, indexes and invariants exist in production schema.`);
   } else {
     const strictInvariants = String(process.env.REQUIRE_SCHEMA_INVARIANTS).toLowerCase() === 'true';
     if (report.requiredMismatches.length > 0) {
@@ -603,6 +756,10 @@ async function cliMain() {
 
 module.exports = {
   verifySchemaAgainstLiveDb,
+  // Needs no database, so a test can assert the gate's own completeness without
+  // one — and a caller wanting the full unreferenced list can read it here
+  // rather than from the CLI's deliberately count-only line.
+  verifyExpectedIsComplete,
   bootWouldFail,
   _internals: {
     // Exported so a test can build a faithful INFORMATION_SCHEMA stand-in

@@ -214,34 +214,116 @@ async function liveColumns() {
   return m;
 }
 
+/*
+ * Directories the walk below refuses to enter. This list is the one remaining
+ * hand-maintained RECORD in this file, so it is kept to two entries, every one
+ * of them justified, and checked in reverse (see `unusedSkips`) — an exclusion
+ * that excludes nothing is the same rot that produced the bug above.
+ *
+ *   node_modules  vendor SQL against vendor schemas. Not ours, not fixable by
+ *                 us, and ~40k files we would read on every pre-deploy run.
+ *   tests         MEASURED, not assumed. A repo-wide run reported exactly six
+ *                 findings inside tests/, and all six are fixtures in
+ *                 tests/phantom-column-verifier.test.js — the deliberate
+ *                 `SELECT user_id, city, user_name FROM tbl_easyfixer` that
+ *                 pins the Supply Gap bug, plus `e.nonsense` and friends. A
+ *                 test suite's job is to contain broken SQL; a checker that
+ *                 red-lights on its own fixtures gets switched off. The cost is
+ *                 stated plainly: SQL that only ever runs from a test is not
+ *                 checked here.
+ *
+ * Dot-directories (.git, .github, .githooks, .claude) are skipped by RULE
+ * rather than by name — a predicate cannot go stale the way a list does, and
+ * none of them holds a .js file in this repo.
+ */
+const SKIP_DIRS = new Set(['node_modules', 'tests']);
+
+/*
+ * THE COLLECTION IS THE CONTRACT, and it used to be a record.
+ *
+ * This walked `for (const r of ['services', 'routes'])` — a two-entry literal,
+ * somebody's note of where our SQL lived the day the script was written. The
+ * CONTRACT is every source file in this repo that names a column. The two
+ * stopped matching the moment SQL was written outside those two directories,
+ * and by 2026-09 thirteen files carrying literal SQL were invisible to it —
+ * lib/emp-code.js, lib/scope.js, middleware/basic-auth.js,
+ * middleware/idempotency.js, utils/aadhaar-uniqueness.js,
+ * utils/pan-uniqueness.js, utils/rate-card-calc.js, validators/job.validator.js
+ * and five more under scripts/ and docs/. `npm run verify:phantom-columns`
+ * printed a clean bill on files it had never opened, and verify:all with it.
+ *
+ * That is the failure mode of a record-shaped loop: it can catch a MUTATION of
+ * what somebody wrote down and is structurally blind to an ADDITION. So walk
+ * the repo and subtract, instead of listing and hoping. A new directory full of
+ * SQL is now scanned by default and the only way to hide is to be named above.
+ *
+ * .mjs and .cjs are included for the same reason and on the same evidence:
+ * scripts/check-section-agreement.mjs carries four SQL literals and a .js-only
+ * filter walked straight past it.
+ */
 function sourceFiles() {
   const files = [];
+  const skipsUsed = new Set();
   const walk = (d) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      /*
+       * Matched by NAME, before the isDirectory() test, because a hoisted or
+       * bind-mounted node_modules is a SYMLINK — readdir calls that a link, not
+       * a directory, and testing isDirectory() first reported the exclusion as
+       * stale and failed the gate on a tree where node_modules was plainly
+       * there. The name is what the exclusion is about; the inode type is not.
+       */
+      if (SKIP_DIRS.has(e.name)) { skipsUsed.add(e.name); continue; }
       const full = path.join(d, e.name);
-      if (e.isDirectory()) walk(full);
-      else if (e.name.endsWith('.js')) files.push(full);
+      if (e.isDirectory()) {
+        if (e.name.startsWith('.')) continue;
+        walk(full);
+      } else if (/\.(js|mjs|cjs)$/.test(e.name)) files.push(full);
     }
   };
-  for (const r of ['services', 'routes']) walk(path.join(ROOT, r));
-  return files;
+  walk(ROOT);
+  return { files, unusedSkips: [...SKIP_DIRS].filter((s) => !skipsUsed.has(s)) };
 }
 
 async function verifyPhantomColumns() {
   const cols = await liveColumns();
   const findings = [];
-  const files = sourceFiles();
+  const { files, unusedSkips } = sourceFiles();
+  /*
+   * sqlFiles is the number the PASS line reports, because it is the contract:
+   * files that actually carry a SQL literal, i.e. files this checker owes an
+   * answer about. `filesScanned` alone cannot show a shortfall — it went UP
+   * when the walk was wrong-but-wider and would go up again if someone dropped
+   * a directory of markdown-adjacent .js in. If this number falls while SQL is
+   * being written, the walk has lost sight of something.
+   */
+  let sqlFiles = 0;
   for (const f of files) {
-    findings.push(...scanFile(path.relative(ROOT, f), fs.readFileSync(f, 'utf8'), cols));
+    const src = fs.readFileSync(f, 'utf8');
+    if (sqlLiterals(strip(src)).length) sqlFiles += 1;
+    findings.push(...scanFile(path.relative(ROOT, f), src, cols));
   }
-  return { findings, filesScanned: files.length };
+  return { findings, filesScanned: files.length, sqlFiles, unusedSkips };
 }
 
 async function cliMain() {
-  const { findings, filesScanned } = await verifyPhantomColumns();
-  console.log(`Scanned ${filesScanned} files under services/ and routes/`);
+  const { findings, filesScanned, sqlFiles, unusedSkips } = await verifyPhantomColumns();
+  console.log(`Scanned ${filesScanned} source files across the repo; ${sqlFiles} carry literal SQL`);
+
+  /*
+   * The reverse direction: a name in SKIP_DIRS that matched no directory. Its
+   * own message and its own exit, because it is a different fault — not "the
+   * SQL is wrong" but "the exclusion list has drifted", which is how this
+   * script came to skip most of the codebase in the first place.
+   */
+  if (unusedSkips.length) {
+    console.log(`✗ STALE EXCLUSION(S): SKIP_DIRS names ${unusedSkips.join(', ')} — no such directory in this repo.`);
+    console.log('  An exclusion that excludes nothing is a hand-maintained record rotting. Delete the entry or fix the name.');
+    process.exitCode = 1;
+  }
+
   if (!findings.length) {
-    console.log('✓ No phantom columns — every column our SQL names exists.');
+    if (!unusedSkips.length) console.log('✓ No phantom columns — every column our SQL names exists.');
     return;
   }
   const seen = new Set();

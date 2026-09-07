@@ -88,20 +88,178 @@ test('the After Hours start hour is genuinely outside every window', () => {
 
 // ─── job sort keys ────────────────────────────────────────────────────────
 
-test('every FE sort key is a key of SORTABLE_COLUMNS', () => {
+/*
+ * WHERE THE CRM IS FOUND. Same env-var-first resolution as siblingContract()
+ * below and as resolveFeFile() in job-search-parity.test.js — EASYFIX_CRM_UI_DIR
+ * in CI (the workflow shallow-clones the CRM into RUNNER_TEMP), the sibling
+ * checkout on a developer machine. Deliberately the same mechanism and not a
+ * second one: three different ways to find the same repo is three things to get
+ * wrong.
+ */
+function crmRoot() {
+  return process.env.EASYFIX_CRM_UI_DIR || path.resolve(__dirname, '../../Easyfix_CRM_UI');
+}
+
+/*
+ * Returns the CRM's src/ directory, or null after registering the outcome —
+ * the shape of resolveFeFileOrFail() in job-search-parity.test.js. GitHub
+ * Actions sets CI=true unconditionally, so an absence there can only mean the
+ * "Fetch Easyfix_CRM_UI for cross-repo parity" step broke: a red build, not a
+ * shrug. The t.skip is unreachable in CI, and `npm test` runs through
+ * scripts/test-no-skips.js, which fails on a skip anyway.
+ */
+function crmSrcOrFail(t) {
+  const src = path.join(crmRoot(), 'src');
+  if (fs.existsSync(src)) return src;
+  if (process.env.CI) {
+    assert.fail('Easyfix_CRM_UI is missing in CI. The "Fetch Easyfix_CRM_UI for cross-repo '
+      + 'parity" workflow step must clone it into "$RUNNER_TEMP" and set EASYFIX_CRM_UI_DIR. '
+      + 'The FE sort keys are PARSED from the CRM sources — without them this test verifies '
+      + `nothing, and that must never pass silently. Looked in: ${src}`);
+  }
+  t.skip(`Easyfix_CRM_UI not found beside this repo (looked in ${src}) — FE sort keys NOT verified`);
+  return null;
+}
+
+function walkSources(dir, out = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, entry.name);
+    if (entry.isDirectory()) walkSources(p, out);
+    else if (/\.tsx?$/.test(entry.name)) out.push(p);
+  }
+  return out;
+}
+
+/*
+ * THE CONTRACT: every `col` a jobs-list <SortHeader> actually ships as
+ * ?sortBy=, parsed out of the CRM. THE RECORD it replaces: contract.jobSortKeys
+ * in shared/wire-contract.json, which holds ONE entry.
+ *
+ * The loop below used to iterate that record, which meant it could only ever
+ * re-confirm the single key somebody remembered to write down. A nineteenth
+ * column added to the grid with no SORTABLE_COLUMNS entry was not a failure
+ * here, it was nothing to check — and the 400 in this file's header comment
+ * would ship again, unseen, under a test whose own name promised otherwise.
+ *
+ * The jobs-table sources are DISCOVERED, not enumerated: the marker is a file
+ * that imports JOB_AGE_SORT_KEY and renders <SortHeader>, which is every jobs
+ * grid (three today — jobs/page.tsx, my-orders/page.tsx and the shared
+ * UnconfirmedJobsTable.tsx that neither page's header list mentions). A
+ * hand-written list of those three paths would rebuild exactly this defect one
+ * level up: a fourth grid would sort by keys nobody ever checked.
+ *
+ * Returns { keys: Map<sortKey, sourceFiles[]>, files: string[] }.
+ */
+function feSortKeys(srcDir) {
+  const root = crmRoot();
+  const rel = (f) => path.relative(root, f);
+  // name → Set of literal values, so a col={IDENT} can be resolved back to the
+  // string the browser sends. A Set and not a value: two unrelated files may
+  // export the same const name, and that ambiguity must be reported at the one
+  // name we actually depend on rather than blowing up on every collision.
+  const consts = new Map();
+  const headers = [];
+  for (const file of walkSources(srcDir)) {
+    const src = fs.readFileSync(file, 'utf8');
+    for (const m of src.matchAll(/export const ([A-Za-z_$][\w$]*)\s*=\s*'([^']*)'/g)) {
+      if (!consts.has(m[1])) consts.set(m[1], new Set());
+      consts.get(m[1]).add(m[2]);
+    }
+    if (!src.includes('JOB_AGE_SORT_KEY') || !src.includes('<SortHeader')) continue;
+    src.split('\n').forEach((line, i) => {
+      // Comment lines out first. These files explain themselves at length and
+      // several of those explanations name <SortHeader> in prose — collecting
+      // one would trip the unreadable-header assertion below on a line that
+      // ships no sort key at all.
+      if (/^\s*(?:\/\/|\*|\/\*|\{\/\*)/.test(line)) return;
+      if (line.includes('<SortHeader')) headers.push({ file, lineNo: i + 1, line });
+    });
+  }
+
+  const keys = new Map();
+  const files = new Set();
+  for (const h of headers) {
+    // col="job_id" | col={JOB_AGE_SORT_KEY} | col={'job_id' as SortKey}
+    const m = h.line.match(/\bcol=(?:"([^"]+)"|\{\s*(?:'([^']+)'|([A-Za-z_$][\w$]*)))/);
+    /*
+     * An unreadable header FAILS rather than being passed over. A <SortHeader>
+     * whose col this parse cannot see is a sort key travelling to the validator
+     * unchecked, which is the precise blind spot the test is here to close —
+     * quietly dropping it would restore the bug in a new disguise.
+     */
+    assert.ok(m, `could not read the col= prop of a <SortHeader> at ${rel(h.file)}:${h.lineNo} `
+      + `— has its shape changed?\n  ${h.line.trim()}`);
+    let key = m[1] ?? m[2];
+    if (key === undefined) {
+      const seen = consts.get(m[3]);
+      assert.ok(seen, `${rel(h.file)}:${h.lineNo} sorts by the identifier ${m[3]}, which is not `
+        + 'an exported string const anywhere under the CRM src/ — the key it resolves to cannot '
+        + 'be checked against SORTABLE_COLUMNS.');
+      assert.equal(seen.size, 1, `${rel(h.file)}:${h.lineNo} sorts by ${m[3]}, but that name is `
+        + `exported with ${seen.size} different values under src/ (${[...seen].join(', ')}) — `
+        + 'which one reaches the wire is a guess.');
+      [key] = seen;
+    }
+    if (!keys.has(key)) keys.set(key, []);
+    keys.get(key).push(`${rel(h.file)}:${h.lineNo}`);
+    files.add(h.file);
+  }
+  /*
+   * A parse that finds nothing must not read as "nothing is wrong". Every
+   * discovered source contributes at least one key by construction (each of its
+   * <SortHeader> lines either parses or fails above), so zero sources is the
+   * only way a caller's loop can go vacuous — and it means the marker moved.
+   * Guarded here rather than in one test so that neither direction can report a
+   * confident diagnosis ("the contract is stale") off an empty parse.
+   */
+  assert.ok(files.size > 0,
+    'found no jobs-table sources under the CRM src/ — no file both imports JOB_AGE_SORT_KEY '
+    + 'and renders <SortHeader>. The marker has moved and this test is checking nothing.');
+  return { keys, files: [...files].map(rel) };
+}
+
+test('every FE sort key is a key of SORTABLE_COLUMNS', (t) => {
   /*
    * THE 400 THIS EXISTS TO PREVENT. validators/job.validator.js builds its
    * sortBy allow-list from Object.keys(SORTABLE_COLUMNS), so a key the FE sends
    * that is missing here does not degrade to an unsorted list — it fails
    * validation and blanks the grid.
    */
-  const keys = Object.keys(jobSvc.SORTABLE_COLUMNS);
+  const srcDir = crmSrcOrFail(t);
+  if (!srcDir) return;
+  const { keys, files } = feSortKeys(srcDir);
+  const have = Object.keys(jobSvc.SORTABLE_COLUMNS);
+  for (const [key, where] of keys) {
+    assert.ok(have.includes(key),
+      `the CRM sorts the jobs list by '${key}' (${where.join(', ')}), but '${key}' is not a key `
+      + `of SORTABLE_COLUMNS in services/job.service.js (which has: ${have.join(', ')}). `
+      + 'Joi rejects the unknown sortBy and the whole list 400s — add the column to '
+      + 'SORTABLE_COLUMNS, or stop sending it from the CRM.');
+  }
+  // Counted off the CONTRACT, so a shortfall shows up in the passing line too.
+  t.diagnostic(`${keys.size} FE sort keys from ${files.length} CRM jobs tables `
+    + `(${files.join(', ')}) checked against ${have.length} SORTABLE_COLUMNS keys`);
+});
+
+test('the wire contract records no sort key the CRM has stopped sending', (t) => {
+  /*
+   * The other direction: the RECORD against the CONTRACT. contract.jobSortKeys
+   * is a note of the keys that once burned us, and a note nobody re-reads rots
+   * — rename the column on the FE and the entry here still resolves against
+   * SORTABLE_COLUMNS, still passes, and still describes a click no operator can
+   * make. Distinct from the failure above: nothing is broken in production, the
+   * contract file is simply lying.
+   */
+  const srcDir = crmSrcOrFail(t);
+  if (!srcDir) return;
+  const { keys } = feSortKeys(srcDir);
   for (const [name, key] of Object.entries(contract.jobSortKeys)) {
     if (name === '$doc') continue;
-    assert.ok(
-      keys.includes(key),
-      `contract jobSortKeys.${name} = '${key}' is not a key of SORTABLE_COLUMNS (have: ${keys.join(', ')})`,
-    );
+    assert.ok(keys.has(key),
+      `shared/wire-contract.json records jobSortKeys.${name} = '${key}', but no jobs-list `
+      + `<SortHeader> in Easyfix_CRM_UI sends it (the CRM sends: ${[...keys.keys()].join(', ')}). `
+      + 'Either the FE renamed the column and BOTH copies of the contract are stale, or the '
+      + 'entry never described a real click.');
   }
 });
 
