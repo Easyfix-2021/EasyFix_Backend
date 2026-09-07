@@ -2,7 +2,7 @@
  * QuickSight — City Performance (monthly / weekly) service.
  *
  * Native rebuild of TWO legacy ACD_APIs endpoints that share the same DTO,
- * flag, and date-window helpers, so they MUST migrate together:
+ * period, and date-window helpers, so they MUST migrate together:
  *   1. POST /pmJobs/cityPerformance  → paginated per-city scorecard
  *      (controller PmWorkDetails.java:363-373,
  *       service  JobServiceImpl.java:4655-4834,
@@ -123,8 +123,8 @@ function monthName(isoDate) {
  *   - weekly label  : "Week 1|2|3" (legacy "Week i", i=1 most recent)
  *   - monthly label : full month name (e.g. "JUNE") to match legacy enum name
  */
-function buildPeriods(flag) {
-  if (flag === 'weekly') {
+function buildPeriods(period) {
+  if (period === 'weekly') {
     const weeks = computeLastThreeWeeks(); // oldest→newest
     return weeks
       .slice()
@@ -392,9 +392,9 @@ function zeroBucket(period) {
  * Empty city list → ONE synthetic row { cityId:null, cityName:'No city',
  * stateId:null, stateName:'No state', 3 zeroed periods } (legacy 4699-4729).
  */
-async function getCityPerformance({ flag = 'monthly', page = 1, pageSize = 10, filters = {} } = {}) {
-  logger.info('City performance scorecard · flag=' + flag + ' page=' + page + ' pageSize=' + pageSize);
-  const periods = buildPeriods(flag); // most-recent first, length 3
+async function getCityPerformance({ period = 'monthly', page = 1, pageSize = 10, filters = {} } = {}) {
+  logger.info('City performance scorecard · period=' + period + ' page=' + page + ' pageSize=' + pageSize);
+  const periods = buildPeriods(period); // most-recent first, length 3
   const overallStart = periods[periods.length - 1].startDate; // oldest period start
   // Outer-window upper bound: legacy passes endDate.plusDays(1) as the value
   // and the SQL uses `<= :endDate` (effectively inclusive of the whole end
@@ -564,9 +564,9 @@ async function getCityTatSummaryPeriod({ filters, start, endInclusive }) {
  *     flagged in the report — the correct value is SUM(failed) across cities).
  *   - failedOrderPercentage = 0 (legacy never populates it meaningfully).
  */
-async function getCityTatSummary({ flag = 'monthly', filters = {} } = {}) {
-  logger.info('City TAT summary widget · flag=' + flag);
-  const periods = buildPeriods(flag); // most-recent first, length 3
+async function getCityTatSummary({ period = 'monthly', filters = {} } = {}) {
+  logger.info('City TAT summary widget · period=' + period);
+  const periods = buildPeriods(period); // most-recent first, length 3
 
   const periodSummaries = await Promise.all(
     periods.map(async (p) => {
@@ -630,11 +630,11 @@ async function getCityTatSummary({ flag = 'monthly', filters = {} } = {}) {
  *
  * null percentages render as '-' (matching the on-screen empty cell).
  */
-function toXlsx(payload, flag) {
+function toXlsx(payload, period) {
   const rows = (payload && payload.data) || [];
   const periodLabels =
     rows[0]?.cityPerformanceDataDateWise.map((p) => p.detailsFor) ||
-    buildPeriods(flag).map((p) => p.label);
+    buildPeriods(period).map((p) => p.label);
 
   const columns = [
     { key: 'stateName', header: 'State', width: 22 },

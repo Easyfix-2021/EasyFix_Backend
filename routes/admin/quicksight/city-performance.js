@@ -11,7 +11,7 @@
  * QuickSight family key + the per-report key on top via requireQuickSight.
  *
  * The legacy report was a pair of permitAll() POST endpoints sharing the same
- * JobSearchListDto body + flag, so they MUST migrate together. Native uses GET
+ * JobSearchListDto body + period, so they MUST migrate together. Native uses GET
  * query params (read-only / cacheable; Joi .single() accepts repeatable or
  * scalar id params) — the no-role gate is replaced by the ef-QuickSight family
  * key + this report's view key (registry `accessDenied` hard-403 decision;
@@ -19,10 +19,10 @@
  *
  * Endpoints:
  *   GET /                 — paginated per-city scorecard  (?format=xlsx export)
- *       ?flag=monthly|weekly &page &pageSize
+ *       ?period=monthly|weekly &page &pageSize
  *       &clientId &zonalManagerId &verticalId &serviceCategoryId &stateId &projectManagerId
  *   GET /tat-summary      — 3-period TAT highlights widget (no pagination)
- *       ?flag=monthly|weekly
+ *       ?period=monthly|weekly
  *       &clientId &zonalManagerId &serviceCategoryId &stateId
  *       (deliberately IGNORES verticalId & projectManagerId — legacy asymmetry)
  */
@@ -47,18 +47,40 @@ router.use(requireQuickSight(ACTION_KEY));
 /*
  * Table query schema — jobFilterBase (clientId / verticalId / zonalManagerId /
  * serviceCategoryId / projectManagerId / stateId / cityId / format) extended
- * with flag + pagination. cityId is accepted (present on the legacy DTO) but
+ * with period + pagination. cityId is accepted (present on the legacy DTO) but
  * IGNORED by the service — city is the GROUP dimension here, not a filter.
  * pageSize caps at 200 (the FE "All" → pageSizeToLimit(200) ceiling).
  */
+/*
+ * The monthly/weekly window.
+ *
+ * CANONICAL NAME IS `period`, matching the sibling client-performance report.
+ * This route called it `flag` because the LEGACY DTO did — but these GET routes
+ * are a native rebuild, so nothing outside our own FE ever sent it, and two
+ * sibling reports spelling one concept two ways is a trap for whoever writes
+ * the third.
+ *
+ * `flag` is kept as a DEPRECATED ALIAS rather than removed, so the frontend and
+ * backend can deploy in EITHER ORDER. That is not hypothetical caution: this
+ * month a frontend shipped ahead of the backend that implemented its new query
+ * parameter, and because Joi strips unknown keys the filter was silently
+ * dropped in production. An alias costs one line and removes the ordering
+ * constraint entirely. Remove it once no deployed frontend sends `flag`.
+ *
+ * NEITHER carries a Joi .default(): a default on the alias would always be
+ * present and would mask `period`. The handler resolves the precedence once.
+ */
+const PERIOD = Joi.string().valid('monthly', 'weekly');
+
 const tableSchema = extendJobFilter({
-  flag: Joi.string().valid('monthly', 'weekly').default('monthly'),
+  period: PERIOD,
+  flag: PERIOD,   // deprecated alias — see the note above PERIOD
   page: Joi.number().integer().min(1).default(1),
   pageSize: Joi.number().integer().min(1).max(200).default(10),
 });
 
 /*
- * TAT-summary query schema — flag + ONLY the four filters the legacy widget
+ * TAT-summary query schema — period + ONLY the four filters the legacy widget
  * reads (client / zonal / category / state). verticalId & projectManagerId are
  * intentionally NOT exposed here (legacy commented them out); cityId likewise
  * unused. No pagination — always 3 period summaries. Built fresh (not via
@@ -66,7 +88,9 @@ const tableSchema = extendJobFilter({
  */
 const idArray = Joi.array().items(Joi.number().integer()).single().default([]);
 const tatSummarySchema = Joi.object({
-  flag: Joi.string().valid('monthly', 'weekly').default('monthly'),
+  period: PERIOD,
+  flag: PERIOD,   // deprecated alias
+
   clientId: idArray,
   zonalManagerId: idArray,
   serviceCategoryId: idArray,
@@ -85,8 +109,11 @@ const recentLabel = (columns) => {
 // ── GET / — paginated per-city scorecard ─────────────────────────────
 router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
   try {
-    const { flag, page, pageSize, format } = req.query;
-    logger.info('City Performance scorecard · flag=' + flag + ' page=' + page + ' pageSize=' + pageSize + ' format=' + (format || 'json'));
+    // `period` wins; `flag` is the deprecated alias; 'monthly' is the default
+    // that neither schema now applies, so it lives here in one place.
+    const period = req.query.period || req.query.flag || 'monthly';
+    const { page, pageSize, format } = req.query;
+    logger.info('City Performance scorecard · period=' + period + ' page=' + page + ' pageSize=' + pageSize + ' format=' + (format || 'json'));
     const filters = {
       clientId: req.query.clientId,
       zonalManagerId: req.query.zonalManagerId,
@@ -96,11 +123,11 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
       projectManagerId: req.query.projectManagerId,
     };
 
-    const payload = await service.getCityPerformance({ flag, page, pageSize, filters });
+    const payload = await service.getCityPerformance({ period, page, pageSize, filters });
     logger.info('Found ' + (payload && payload.totalRecords != null ? payload.totalRecords : 0) + ' cities');
 
     if (format === 'xlsx') {
-      const { columns, rows } = service.toXlsx(payload, flag);
+      const { columns, rows } = service.toXlsx(payload, period);
 
       // Enrich the service-built columns with display polish: thousands
       // formatting + in-cell data bars on the VOLUME columns only (Ticket
@@ -132,12 +159,12 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
       // then flatten it for aggregation. The exported TABLE body stays the
       // requested page (`rows`); only the KPI cards span every city.
       const fullPayload = await service.getCityPerformance({
-        flag,
+        period,
         page: 1,
         pageSize: Math.max(payload?.totalRecords || 0, pageSize),
         filters,
       });
-      const fullRows = service.toXlsx(fullPayload, flag).rows;
+      const fullRows = service.toXlsx(fullPayload, period).rows;
 
       // KPIs from the MOST-RECENT period (p0) across the FULL filtered set:
       // total Tickets Created, total Open Orders, and the number of cities
@@ -159,13 +186,13 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
         { label: 'Cities ≥ 85% TAT', value: citiesAtTat, accent: 'FF10B981' },
       ];
 
-      const flagLabel = flag === 'weekly' ? 'Weekly' : 'Monthly';
+      const periodLabel = period === 'weekly' ? 'Weekly' : 'Monthly';
       const cityCount = payload?.totalRecords ?? rows.length;
       const meta =
-        `Period: ${flagLabel} · ${cityCount} ${cityCount === 1 ? 'City' : 'Cities'} · ` +
+        `Period: ${periodLabel} · ${cityCount} ${cityCount === 1 ? 'City' : 'Cities'} · ` +
         `Generated ${displayStamp()}`;
 
-      const filename = `city-performance-${flag}-${fileStamp()}.xlsx`;
+      const filename = `city-performance-${period}-${fileStamp()}.xlsx`;
       logger.info('Streaming City Performance xlsx · ' + rows.length + ' rows · ' + cityCount + ' cities');
       await streamStyledXlsx(res, filename, {
         title: 'EasyFix · City Performance',
@@ -194,8 +221,10 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
 // ── GET /tat-summary — 3-period TAT highlights widget ────────────────
 router.get('/tat-summary', validate(tatSummarySchema, 'query'), async (req, res, next) => {
   try {
-    const { flag } = req.query;
-    logger.info('City TAT summary widget · flag=' + flag);
+    // Same precedence as the table route above — the alias must work here too,
+    // or a frontend mid-deploy gets a filtered table beside an unfiltered widget.
+    const period = req.query.period || req.query.flag || 'monthly';
+    logger.info('City TAT summary widget · period=' + period);
     const filters = {
       clientId: req.query.clientId,
       zonalManagerId: req.query.zonalManagerId,
@@ -203,7 +232,7 @@ router.get('/tat-summary', validate(tatSummarySchema, 'query'), async (req, res,
       stateId: req.query.stateId,
     };
 
-    const summary = await service.getCityTatSummary({ flag, filters });
+    const summary = await service.getCityTatSummary({ period, filters });
     logger.info('Returning City TAT summary');
     return modernOk(res, summary);
   } catch (err) {
