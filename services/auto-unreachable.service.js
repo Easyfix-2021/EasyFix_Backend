@@ -84,11 +84,20 @@ let cachedReasonId;
 async function autoReasonId(pool) {
   if (!pool) pool = defaultPool();
   if (cachedReasonId !== undefined) return cachedReasonId;
-  const [[row]] = await pool.query(
+  /*
+   * Destructured defensively, in two steps rather than `const [[row]] =`.
+   * mysql2 always answers [rows, fields], but a test harness answering with a
+   * bare [] made the nested pattern THROW — and because this runs before the
+   * caller's main query, the throw took out the whole handler rather than
+   * degrading to "no reason row". A lookup that cannot find its row must return
+   * null, never explode into the request it was meant to inform.
+   */
+  const [rows] = await pool.query(
     `SELECT id FROM action_taken_reason
       WHERE action_type = ? AND user_type = ? AND action_desc = ? LIMIT 1`,
     [AUTO_REASON.actionType, AUTO_REASON.userType, AUTO_REASON.desc],
   );
+  const row = Array.isArray(rows) ? rows[0] : undefined;
   cachedReasonId = row ? Number(row.id) : null;
   return cachedReasonId;
 }
@@ -130,9 +139,9 @@ async function findQualifying(pool, { minDays = MIN_DAYS, limit = 500 } = {}) {
   if (!pool) pool = defaultPool();
   const reasonId = await autoReasonId(pool);
   if (reasonId == null) return { reasonId: null, rows: [] };
-  const [rows] = await pool.query(qualifyingSql(),
+  const [res] = await pool.query(qualifyingSql(),
     [...FAILED_CUSTOMER_LEG, ...TERMINAL_STATUSES, reasonId, minDays, limit]);
-  return { reasonId, rows };
+  return { reasonId, rows: Array.isArray(res) ? res : [] };
 }
 
 /*
