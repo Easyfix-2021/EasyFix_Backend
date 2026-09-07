@@ -88,12 +88,26 @@ function resolveOwnerScope(reqUser, ownerIdsFromBody) {
 }
 
 /*
- * Build the three shared dimension filters used by ALL queries (service
- * category / state / city). Column identifiers are trusted (report code,
- * never user input); only VALUES are parameterised via buildInFilter.
+ * Build the four shared dimension filters used by ALL queries (client /
+ * service category / state / city). Column identifiers are trusted (report
+ * code, never user input); only VALUES are parameterised via buildInFilter.
+ *
+ * ⚠ clientId WAS ALREADY BEING ACCEPTED AND SILENTLY DROPPED. Every schema on
+ * this report is built with extendJobFilter(), and jobFilterBase carries
+ * clientId — so a body containing it validated cleanly and then changed
+ * nothing. A caller could filter by client, get a 200, and read the whole
+ * book believing it was one client's. The sibling city-performance report
+ * narrows its schema for exactly this reason ("so the unread filters aren't
+ * silently accepted"); here the filter is genuinely wanted, so it is READ
+ * rather than rejected.
+ *
+ * One line covers the whole report: all four query paths — the grid, its
+ * COUNT, the city drill-down and the XLSX export — go through this function,
+ * so none of them can disagree about what the filter means.
  */
 function buildDimensionFilters(filters, params) {
   let where = '';
+  where += buildInFilter('TJ.fk_client_id', filterZeros(filters.clientId), params);
   where += buildInFilter('TJ.fk_service_catg_id', filterZeros(filters.serviceCategoryId), params);
   where += buildInFilter('TS.state_id', filterZeros(filters.stateId), params);
   where += buildInFilter('TCY.city_id', filterZeros(filters.cityId), params);

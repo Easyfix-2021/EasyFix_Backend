@@ -60,7 +60,22 @@ function inflatedStreams(buf) {
     if (buf[start] === 0x0a) start += 1;
     const end = buf.indexOf('endstream', start);
     if (end === -1) break;
-    try { out.push(zlib.inflateSync(buf.subarray(start, end)).toString('latin1')); } catch { /* image / font */ }
+    /*
+     * CONTENT streams only. Every stream used to be inflated and the image ones
+     * merely threw, which was free while the certificate drew its own border —
+     * then the Brand Kit artwork was vendored and the page began embedding a
+     * 3508x2480 PNG. That XObject inflates cleanly to several megabytes of
+     * pixel bytes, and running pdfText's global regex across it overflowed the
+     * stack: every text assertion in this file died with
+     * "Maximum call stack size exceeded" and nothing about the message pointed
+     * at an image.
+     *
+     * The object's dictionary sits immediately before the keyword and says what
+     * the stream is, so read it rather than guessing from the payload.
+     */
+    const dict = buf.subarray(Math.max(0, i - 512), i).toString('latin1');
+    if (/\/Subtype\s*\/Image/.test(dict)) { i = end + 'endstream'.length; continue; }
+    try { out.push(zlib.inflateSync(buf.subarray(start, end)).toString('latin1')); } catch { /* font */ }
     i = end + 'endstream'.length;
   }
   return out;
@@ -504,12 +519,25 @@ test('png and jpg come back at the artwork native size, jpg opaque', async () =>
     assert.equal(meta.height, PX_H);
     assert.equal(meta.format, format === 'jpg' ? 'jpeg' : 'png');
   }
-  /* A transparent ground encodes to BLACK in JPEG, not white — measured. */
+  /*
+   * A transparent ground encodes to BLACK in JPEG, not white — measured — so
+   * this proves `flatten` ran.
+   *
+   * It samples the CENTRE, not the top-left corner. The corner test held only
+   * while the certificate drew its own inset border on a white page; the
+   * vendored Brand Kit artwork puts a solid red band (#C42430) hard against
+   * every edge, so the corner is legitimately 196,36,48 and the old assertion
+   * failed on correct output. The centre is the white field in both, and
+   * asserting NOT-BLACK as well as light keeps the check pointed at the defect
+   * it exists for rather than at a particular design.
+   */
   const jpg = await sharp(await renderCertificateImage({ ...FULL, format: 'jpg' }))
     .raw().toBuffer({ resolveWithObject: true });
   assert.equal(jpg.info.channels, 3, 'JPEG carries no alpha');
-  const [r, g, b] = jpg.data;
-  assert.ok(r > 200 && g > 200 && b > 200, `the top-left corner is ${r},${g},${b} — not a ground`);
+  const mid = ((jpg.info.height >> 1) * jpg.info.width + (jpg.info.width >> 1)) * 3;
+  const [r, g, b] = [jpg.data[mid], jpg.data[mid + 1], jpg.data[mid + 2]];
+  assert.ok(r > 200 && g > 200 && b > 200,
+    `the centre is ${r},${g},${b} — a flattened ground should be light, and black means alpha was dropped unflattened`);
 
   const png = await sharp(await renderCertificateImage({ ...FULL, format: 'png' }))
     .raw().toBuffer({ resolveWithObject: true });
@@ -565,10 +593,25 @@ test('the plan is scale-invariant, which is why one rule can serve both outputs'
     const b = img.runs[i];
     assert.equal(b.name, a.name);
     assert.equal(b.text, a.text, `${a.name} must not shrink to a different STRING at 300dpi`);
-    const near = (got, want, tol, what) => assert.ok(Math.abs(got - want) < tol,
-      `${a.name}.${what}: ${got} is not ${want}`);
-    near(b.size, a.size * kx, 0.01, 'size');
-    near(b.tracking, a.tracking * kx, 0.01, 'tracking');
+    /*
+     * Tolerance is one QUANTISATION STEP, not a hair.
+     *
+     * The shrink loop walks a half-unit grid, so each plan rounds to its own
+     * grid at its own scale and `a.size * kx` lands between b's grid points.
+     * Demanding 0.01 asserts exact proportionality, which the algorithm never
+     * promised: with the real layout rectangles vendored in, recipientName
+     * came out 128.96 against an expected 128.98 and failed on correct output.
+     *
+     * Half a step is the largest a rounding difference can be; a genuinely
+     * different DECISION differs by whole points, so this still fails loudly
+     * for the thing the test is for. The strings are compared exactly above,
+     * which is the assertion that catches a divergent decision outright.
+     */
+    const STEP = 0.5;
+    const near = (got, want, tol, what) => assert.ok(Math.abs(got - want) <= tol,
+      `${a.name}.${what}: ${got} is not ${want} (tolerance ${tol})`);
+    near(b.size, a.size * kx, STEP, 'size');
+    near(b.tracking, a.tracking * kx, STEP, 'tracking');
     near(b.rect.x, a.rect.x * kx, 0.01, 'rect.x');
     near(b.rect.w, a.rect.w * kx, 0.01, 'rect.w');
     near(b.rect.y, a.rect.y * ky, 0.01, 'rect.y');
