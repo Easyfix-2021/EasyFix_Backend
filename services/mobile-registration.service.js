@@ -472,6 +472,20 @@ async function getRemaining(efrId) {
  *
  * COALESCE-guards every optional column so a partial submit never blanks
  * a previously-saved value.
+ *
+ * HOME PINCODE IS WRITE-ONCE (product rule, 2026-09-07). efr_pin_no is the
+ * technician's home pincode: the first pincode they supply becomes it, and an
+ * existing one is NEVER replaced through this flow. Relocation is an operator
+ * action (services/easyfixer.service.js MUTABLE_COLUMNS, PUT /api/admin/
+ * easyfixers/:id), not a side effect of re-saving Work Area. Without this the
+ * COALESCE below overwrote on every submit, and since the serviceable-pincode
+ * store is an unordered CSV with no "home" marker, the app's `selected[0]`
+ * silently relocated the technician on each round-trip.
+ *
+ * A conflicting pincode is preserved SILENTLY (warn log + the effective value
+ * in the return), never a 4xx: the app queues this write in a durable outbox,
+ * so rejecting it would dead-letter the save and raise the "Some saved changes
+ * need your attention" banner over a difference the technician cannot fix.
  */
 async function persistPersonalDetails(efrId, body, runner, location = null) {
   logger.info('Save personal details · hasName=' + Boolean(body.name) + ' hasPincode=' + (body.pincode != null) + ' hasAddress=' + Boolean(body.addressLine1 || body.addressLine2));
@@ -487,6 +501,29 @@ async function persistPersonalDetails(efrId, body, runner, location = null) {
     .filter(Boolean)
     .join(', ') || null;
 
+  // Read the stored home BEFORE the write (same runner, so the work-area path
+  // reads it inside its own transaction). This is the row read the tbl_user
+  // mirror needed anyway — widened by one column, not an extra query.
+  const [[row]] = await runner.query(
+    'SELECT user_id, efr_pin_no FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+    [efrId],
+  );
+  const storedHome   = row?.efr_pin_no == null ? '' : String(row.efr_pin_no).trim();
+  const incomingHome = body.pincode == null ? null : String(body.pincode).trim();
+  // Only a DIFFERENT incoming pincode is suppressed. Re-sending the same home
+  // stays a write so a half-enriched row (pincode set, efr_cityId still 0) can
+  // still have its city FK / user mirror backfilled.
+  const keepStoredHome = storedHome !== '' && incomingHome !== null && incomingHome !== storedHome;
+  if (keepStoredHome) {
+    logger.warn(
+      { efrId, storedHome, rejectedHome: incomingHome },
+      'Home pincode is write-once — keeping the stored value',
+    );
+  }
+  // The city FK / state mirror describe the home pincode, so they are
+  // suppressed together with it. Never let them drift onto a rejected PIN.
+  const effectiveLocation = keepStoredHome ? null : location;
+
   await runner.query(
     `UPDATE tbl_easyfixer
         SET efr_name        = COALESCE(?, efr_name),
@@ -501,8 +538,8 @@ async function persistPersonalDetails(efrId, body, runner, location = null) {
       fullName || null,
       firstName,
       lastName,
-      body.pincode != null ? String(body.pincode).trim() : null,
-      location?.cityId ?? null,
+      keepStoredHome ? null : incomingHome,
+      effectiveLocation?.cityId ?? null,
       addressLine,
       efrId,
     ],
@@ -511,10 +548,6 @@ async function persistPersonalDetails(efrId, body, runner, location = null) {
   // Mark the personal step as submitted on tbl_user so the gate machine
   // advances out of `personal_pending`. Only writes when a linked user
   // row exists (idle leads with no user account are a no-op).
-  const [[row]] = await runner.query(
-    'SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
-    [efrId],
-  );
   if (row?.user_id) {
     await runner.query(
       `UPDATE tbl_user
@@ -524,19 +557,25 @@ async function persistPersonalDetails(efrId, body, runner, location = null) {
               state = COALESCE(?, state)
         WHERE user_id = ?`,
       [
-        location?.pincode ?? null,
-        location?.city ?? null,
-        location?.state ?? null,
+        effectiveLocation?.pincode ?? null,
+        effectiveLocation?.city ?? null,
+        effectiveLocation?.state ?? null,
         row.user_id,
       ],
     );
   }
 
-  return { userId: row?.user_id || null };
+  return {
+    userId: row?.user_id || null,
+    // What efr_pin_no holds after this call — the stored home when it was
+    // preserved, otherwise what was just written (or what was already there).
+    homePincode: keepStoredHome ? storedHome : (incomingHome || storedHome || null),
+    homePincodeKept: keepStoredHome,
+  };
 }
 
 async function savePersonalDetails(efrId, body) {
-  const { userId } = await persistPersonalDetails(efrId, body, pool);
+  const { userId, homePincode } = await persistPersonalDetails(efrId, body, pool);
 
   // Best-effort location enrichment (2026-07-09): resolve the submitted
   // pincode into a city FK + state + GPS centroid so the CRM Registered-
@@ -548,11 +587,14 @@ async function savePersonalDetails(efrId, body) {
   // Fail-soft by contract — a geocode miss or Google outage must never fail
   // the submit (the raw pincode is already saved above; the CRM verification
   // page also backfills lazily, and an operator can resolve the FK by hand).
-  if (body.pincode != null) {
+  // Enrich the EFFECTIVE home, not the submitted one: when a stored home was
+  // preserved above, enriching the rejected pincode would stamp its city FK and
+  // GPS centroid onto a technician who does not live there.
+  if (homePincode) {
     const { enrichEasyfixerLocationFromPincode } = require('./easyfixer-location.service');
     enrichEasyfixerLocationFromPincode({
       efrId,
-      pincode: body.pincode,
+      pincode: homePincode,
       userId,
       deviceLat: body.latitude,
       deviceLng: body.longitude,
@@ -604,6 +646,8 @@ async function saveWorkArea(efrId, body, database = pool) {
   let transactionStarted = false;
   let location;
   let replacement;
+  let effectiveHome = homePincode;
+  let persistedPincodes = pincodes;
   try {
     // Resolve through the existing one-query registration lookup before taking
     // write locks. All actual profile + service-area writes remain inside the
@@ -622,20 +666,28 @@ async function saveWorkArea(efrId, body, database = pool) {
 
     await conn.beginTransaction();
     transactionStarted = true;
-    await persistPersonalDetails(
+    const personal = await persistPersonalDetails(
       efrId,
       { ...(name ? { name } : {}), pincode: homePincode },
       conn,
       location,
     );
+    // Rule (b): the home pincode is ALWAYS in the serviceable set. The
+    // validator already requires the client's homePincode to be in `pincodes`,
+    // but the effective home may be the STORED one (write-once, above), which
+    // an older client had no way to include.
+    effectiveHome = personal.homePincode || homePincode;
+    persistedPincodes = pincodes.includes(effectiveHome)
+      ? pincodes
+      : [effectiveHome, ...pincodes];
     replacement = await verificationService.replaceServiceablePincodes(
       efrId,
-      pincodes,
+      persistedPincodes,
       null,
       conn,
       { representation: 'value' },
     );
-    if (Number(replacement.updated) !== pincodes.length) {
+    if (Number(replacement.updated) !== persistedPincodes.length) {
       // The shared CRM helper intentionally tolerates a partial catalogue
       // match. This endpoint is a full-replacement offline contract, so an ACK
       // must mean every requested PIN was persisted. Roll back on catalogue
@@ -662,8 +714,12 @@ async function saveWorkArea(efrId, body, database = pool) {
   return {
     ok: true,
     name: name || null,
-    homePincode,
-    pincodes,
+    // The EFFECTIVE home + set as persisted — not what the client asked for.
+    // The app reconciles against these, which is how a stale client learns its
+    // requested home was rejected in favour of the stored one.
+    homePincode: effectiveHome,
+    homePincodeKept: effectiveHome !== homePincode,
+    pincodes: persistedPincodes,
     location,
     serviceablePincodesUpdated: replacement.updated,
     finalization,

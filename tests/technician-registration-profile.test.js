@@ -13,7 +13,10 @@ const PIN_ROW = {
 
 function transactionDb({
   pincodeRow = PIN_ROW,
-  identityRow = { efr_no: '9013877370', user_id: 8379, linked_user_id: 8379 },
+  // efr_pin_no null = a technician with no home pincode yet, which is when
+  // verify-otp is allowed to write one. Tests that want the write-once branch
+  // override it.
+  identityRow = { efr_no: '9013877370', user_id: 8379, linked_user_id: 8379, efr_pin_no: null },
 } = {}) {
   const events = [];
   const conn = {
@@ -24,7 +27,10 @@ function transactionDb({
     async query(sql, params) {
       events.push({ type: 'query', sql: String(sql), params });
       if (/FROM tbl_pincode p/i.test(sql)) return [pincodeRow ? [pincodeRow] : [], []];
-      if (/SELECT e\.efr_no, e\.user_id, u\.user_id AS linked_user_id/i.test(sql)) {
+      // Matched on the JOIN's alias, not the column list: pinning the exact
+      // SELECT made this fixture fail with "object is not iterable" the moment a
+      // column was added, which reads as a service bug rather than a stale fixture.
+      if (/AS linked_user_id[\s\S]*FOR UPDATE/i.test(sql)) {
         return [identityRow ? [identityRow] : [], []];
       }
       if (/INSERT INTO tbl_user/i.test(sql)) return [{ insertId: 9001, affectedRows: 1 }, []];
@@ -162,4 +168,37 @@ test('a verify named-lock connection is reused and never released by profile per
     db.events.filter((event) => ['begin', 'commit', 'rollback'].includes(event.type)).map((event) => event.type),
     ['begin', 'commit'],
   );
+});
+
+/*
+ * WRITE-ONCE, the verify-otp half. persistPersonalDetails gained this guard on
+ * 2026-09-07; this hook runs on EVERY verify, so without the same guard any later
+ * verification carrying a different PIN silently relocated the technician — the
+ * one path that could still undo the fix in the other file.
+ */
+test('verify-otp never relocates a technician who already has a home pincode', async () => {
+  const { events, getConnection } = transactionDb({
+    identityRow: { efr_no: '9013877370', user_id: 8379, linked_user_id: 8379, efr_pin_no: '560001' },
+  });
+
+  await registrationProfile.persistVerifiedProfile(4242, { homePincode: '110001' }, { getConnection });
+
+  const located = events.filter((e) => /SET efr_pin_no|SET pin_code/i.test(e.sql));
+  assert.deepEqual(located, [],
+    'a stored home pincode must survive a verify carrying a different one');
+});
+
+test('verify-otp still backfills when the stored home is empty, and when it is unchanged', async () => {
+  for (const stored of [null, '', '110001']) {
+    const { events, getConnection } = transactionDb({
+      identityRow: { efr_no: '9013877370', user_id: 8379, linked_user_id: 8379, efr_pin_no: stored },
+    });
+
+    await registrationProfile.persistVerifiedProfile(4242, { homePincode: '110001' }, { getConnection });
+
+    const located = events.filter((e) => /SET efr_pin_no|SET pin_code/i.test(e.sql));
+    assert.equal(located.length, 2,
+      `stored=${JSON.stringify(stored)} must still write both location stores — `
+      + 're-sending the same PIN is how a row with efr_cityId 0 gets repaired');
+  }
 });

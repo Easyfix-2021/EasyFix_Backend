@@ -59,8 +59,11 @@ async function resolvePincode(pincode, runner = pool) {
  * proven. The caller installs this as tech-auth's pre-consume hook: if any
  * write fails the transaction rolls back AND the OTP remains reusable.
  *
- * Home pincode is the latest source of truth, so both legacy representations
- * move together in one transaction. Referral is first-touch/immutable: the
+ * Home pincode is WRITE-ONCE, matching persistPersonalDetails: the first PIN a
+ * technician gives becomes their home, and a later verify never relocates them.
+ * When it is written, both legacy representations move together in one
+ * transaction. Re-sending the SAME pincode is still a write, so a half-enriched
+ * row (pincode set, efr_cityId 0) can still be backfilled. Referral is first-touch/immutable: the
  * additive side table's PK plus the no-op duplicate clause makes concurrent
  * verifies idempotent without ever overwriting the original answer.
  */
@@ -105,8 +108,11 @@ async function persistVerifiedProfile(efrId, fields = {}, database = pool) {
       throw httpError(422, 'home pincode has no complete city and state mapping');
     }
 
+    /* efr_pin_no is read here rather than in a second query: this is already a
+     * locking read of the row we are about to update, so the stored home cannot
+     * change between the check and the write. */
     const [[identity]] = await conn.query(
-      `SELECT e.efr_no, e.user_id, u.user_id AS linked_user_id
+      `SELECT e.efr_no, e.user_id, e.efr_pin_no, u.user_id AS linked_user_id
          FROM tbl_easyfixer e
          LEFT JOIN tbl_user u ON u.user_id = e.user_id
         WHERE e.efr_id = ?
@@ -135,14 +141,30 @@ async function persistVerifiedProfile(efrId, fields = {}, database = pool) {
         }
         logger.info({ efrId: id, userId: linkedUserId }, 'Repaired missing technician user profile link');
       }
-      await conn.query(
-        'UPDATE tbl_easyfixer SET efr_pin_no = ?, efr_cityId = ? WHERE efr_id = ?',
-        [location.pincode, location.cityId, id],
-      );
-      await conn.query(
-        'UPDATE tbl_user SET pin_code = ?, city = ?, state = ? WHERE user_id = ?',
-        [location.pincode, location.city, location.state, linkedUserId],
-      );
+      /*
+       * WRITE-ONCE. A technician who already has a home pincode keeps it — this
+       * hook runs on every verify-otp, so without the guard any later
+       * verification carrying a different PIN silently relocated them, which is
+       * the same defect persistPersonalDetails carried until 2026-09-07. The
+       * serviceable list is not touched here at all, so skipping is safe: it
+       * cannot leave home and list disagreeing.
+       */
+      const storedHome = String(identity.efr_pin_no ?? '').trim();
+      if (storedHome && storedHome !== location.pincode) {
+        logger.warn(
+          { efrId: id, storedHome, submitted: location.pincode },
+          'Kept the stored home pincode; verify-otp does not relocate a technician',
+        );
+      } else {
+        await conn.query(
+          'UPDATE tbl_easyfixer SET efr_pin_no = ?, efr_cityId = ? WHERE efr_id = ?',
+          [location.pincode, location.cityId, id],
+        );
+        await conn.query(
+          'UPDATE tbl_user SET pin_code = ?, city = ?, state = ? WHERE user_id = ?',
+          [location.pincode, location.city, location.state, linkedUserId],
+        );
+      }
     }
 
     if (referralSource) {

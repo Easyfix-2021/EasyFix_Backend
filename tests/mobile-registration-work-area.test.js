@@ -6,7 +6,12 @@ const lifecycle = require('../services/easyfixer-lifecycle.service');
 
 const originalFinalize = lifecycle.finalizeMobileRegistrationGate1;
 
-function transactionDb({ homeRow = null, resolvedPincodes = ['110001', '110062'] } = {}) {
+function transactionDb({
+  homeRow = null,
+  resolvedPincodes = ['110001', '110062'],
+  // Stored home pincode on tbl_easyfixer. '' = the technician has none yet.
+  storedHome = '',
+} = {}) {
   const defaultHome = {
     pincode: '110001',
     city_id: 12,
@@ -27,8 +32,8 @@ function transactionDb({ homeRow = null, resolvedPincodes = ['110001', '110062']
       if (/FROM tbl_pincode p[\s\S]*LEFT JOIN tbl_city/i.test(text)) {
         return [resolvedHome ? [resolvedHome] : [], []];
       }
-      if (/^\s*SELECT user_id FROM tbl_easyfixer/i.test(text)) {
-        return [[{ user_id: 99 }], []];
+      if (/^\s*SELECT user_id, efr_pin_no FROM tbl_easyfixer/i.test(text)) {
+        return [[{ user_id: 99, efr_pin_no: storedHome }], []];
       }
       if (/^\s*SELECT (?:DISTINCT )?pincode FROM tbl_pincode/i.test(text)) {
         return [resolvedPincodes.map((pincode) => ({ pincode })), []];
@@ -243,4 +248,98 @@ test('allows Work Area before Identity by preserving an absent name', async () =
     event.type === 'query' && /UPDATE tbl_easyfixer[\s\S]*efr_cityId/i.test(event.sql)
   ));
   assert.equal(easyfixerUpdate.params[0], null, 'COALESCE must preserve the existing name');
+});
+
+/*
+ * Home pincode is WRITE-ONCE (product rule, 2026-09-07).
+ *
+ * The technician's home lives in tbl_easyfixer.efr_pin_no; the serviceable set
+ * is an unordered CSV with no "home" marker, so a client that derives the home
+ * from `selected[0]` proposes a different PIN on every round-trip. The service
+ * must keep the stored one, and must still guarantee it is in the persisted
+ * serviceable set (rule (b)) even when the client's list omitted it.
+ */
+test('never overwrites an existing home pincode, and keeps it in the serviceable set', async () => {
+  const database = transactionDb({
+    storedHome: '110062',
+    resolvedPincodes: ['110062', '110001', '110005'],
+  });
+  lifecycle.finalizeMobileRegistrationGate1 = async () => ({
+    changed: false,
+    schemaInstalled: true,
+    lifecycle: { status: 'REGISTRATION_INCOMPLETE' },
+  });
+
+  const result = await registration.saveWorkArea(8379, {
+    homePincode: '110001',
+    pincodes: ['110001', '110005'],
+  }, database);
+
+  assert.equal(result.homePincode, '110062', 'the stored home survives the save');
+  assert.equal(result.homePincodeKept, true);
+
+  const easyfixerUpdate = database.events.find((event) => (
+    event.type === 'query' && /UPDATE tbl_easyfixer[\s\S]*efr_cityId/i.test(event.sql)
+  ));
+  assert.equal(easyfixerUpdate.params[3], null, 'efr_pin_no must not be rewritten');
+  assert.equal(easyfixerUpdate.params[4], null, 'the city FK follows the home pincode');
+
+  const userUpdate = database.events.find((event) => (
+    event.type === 'query' && /UPDATE tbl_user[\s\S]*pin_code/i.test(event.sql)
+  ));
+  assert.deepEqual(
+    userUpdate.params,
+    [null, null, null, 99],
+    'the tbl_user mirror must not drift onto the rejected pincode',
+  );
+
+  // Rule (b): the effective home is in the persisted set even though the
+  // client never sent it.
+  const insert = database.events.find((event) => (
+    event.type === 'query' && /INSERT INTO tbl_efr_serviceable_pincodes/i.test(event.sql)
+  ));
+  assert.equal(insert.params[1], '110062,110001,110005');
+  assert.deepEqual(result.pincodes, ['110062', '110001', '110005']);
+});
+
+test('adopts the submitted pincode as home when the technician has none stored', async () => {
+  const database = transactionDb({ storedHome: '', resolvedPincodes: ['110001', '110062'] });
+  lifecycle.finalizeMobileRegistrationGate1 = async () => ({
+    changed: false,
+    schemaInstalled: true,
+    lifecycle: { status: 'REGISTRATION_INCOMPLETE' },
+  });
+
+  const result = await registration.saveWorkArea(8379, {
+    homePincode: '110001',
+    pincodes: ['110001', '110062'],
+  }, database);
+
+  assert.equal(result.homePincode, '110001');
+  assert.equal(result.homePincodeKept, false);
+  const easyfixerUpdate = database.events.find((event) => (
+    event.type === 'query' && /UPDATE tbl_easyfixer[\s\S]*efr_cityId/i.test(event.sql)
+  ));
+  assert.equal(easyfixerUpdate.params[3], '110001');
+  assert.equal(easyfixerUpdate.params[4], 12, 'the resolved city FK is written with the first home');
+});
+
+test('re-saving the SAME home still backfills a half-enriched city FK', async () => {
+  const database = transactionDb({ storedHome: '110001', resolvedPincodes: ['110001'] });
+  lifecycle.finalizeMobileRegistrationGate1 = async () => ({
+    changed: false,
+    schemaInstalled: true,
+    lifecycle: { status: 'REGISTRATION_INCOMPLETE' },
+  });
+
+  const result = await registration.saveWorkArea(8379, {
+    homePincode: '110001',
+    pincodes: ['110001'],
+  }, database);
+
+  assert.equal(result.homePincodeKept, false);
+  const easyfixerUpdate = database.events.find((event) => (
+    event.type === 'query' && /UPDATE tbl_easyfixer[\s\S]*efr_cityId/i.test(event.sql)
+  ));
+  assert.equal(easyfixerUpdate.params[4], 12, 'an unchanged home must not block city-FK backfill');
 });
