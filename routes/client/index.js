@@ -7,7 +7,6 @@ const { pool } = require('../../db');
 const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
 const clientRequest = require('../../services/client-request.service');
-const autoUnreachable = require('../../services/auto-unreachable.service');
 const { modernOk, modernError } = require('../../utils/response');
 const { sendXlsx } = require('../../utils/xlsx-export');
 const { STATUS_LABELS } = require('../../services/integration.service');
@@ -2414,58 +2413,34 @@ router.get('/unreachable-jobs', async (req, res, next) => {
      * answer as "nobody has asked for anything", which is true there.
      */
     const reqIds = await clientRequest.reasonIds(pool);
-    /*
-     * The AUTO marker's id. A comment carrying it was written by the
-     * auto-unreachable sweep, which only fires after three distinct days of
-     * failed calls — so its mere presence already satisfies this rule by a
-     * STRONGER measure (calls placed, not outcomes typed). Counting it as one
-     * day like any other comment would hide exactly the jobs the sweep exists
-     * to surface: it writes ONE row, so an auto-marked job would sit at 1 of 3
-     * forever and never reach this list.
-     *
-     * 0 when unseeded — no row has id 0, so the flag is simply never set and
-     * the rule falls back to counting days, which is the pre-sweep behaviour.
-     */
-    const autoReasonId = (await autoUnreachable.autoReasonId(pool)) ?? 0;
     const params = [
-      // ORDER MIRRORS THE SQL, and the first entry is new: the auto-marker flag
-      // sits in the CTE's SELECT list, which mysql2 reads before the CTE's
-      // WHERE. Put it anywhere else and every later value binds one column off,
-      // silently — the failure this file has warned about since the reason-id
-      // subquery was added.
-      autoReasonId,
-      req.spoc.client_id, ...scopeParams,
+      // ORDER MIRRORS THE SQL: the correlated reason-id subquery sits in the
+      // SELECT list, which mysql2 reads before the outer WHERE.
       reqIds?.cancel ?? 0, reqIds?.retry ?? 0,
       req.spoc.client_id, ...scopeParams,
       limit,
     ];
     const [rows] = await pool.query(`
-      WITH cl AS (
-        SELECT DISTINCT c.job_id, DATE(c.created_on) AS d,
-               (c.enum_reason_id = ?) AS auto_marked
-          FROM tbl_job_comment c
-          JOIN tbl_job j ON j.job_id = c.job_id
-         WHERE c.comment_on = 16
-           AND j.fk_client_id = ?
-           ${scopeSql}
-           AND j.job_status NOT IN (3,5,6,7)
-      ), qualified AS (
-        /*
-         * THREE DISTINCT DAYS, no window. This was a self-join finding three
-         * dates inside any rolling three-day span — stricter than the rule ops
-         * actually stated ("called on 3 days, at least once each day"), and
-         * strictly so: a customer unreachable on Monday, Wednesday and the
-         * following Tuesday qualifies under the rule and did not under the
-         * span. Measured on the open book, the span version surfaced ONE job,
-         * which is why this tile has always looked broken.
-         *
-         * DISTINCT still does the load-bearing work: several calls on one day
-         * collapse to one date, so "three calls in one afternoon" does not
-         * qualify — that was never the window's job.
-         */
-        SELECT job_id FROM cl GROUP BY job_id
-         HAVING COUNT(DISTINCT d) >= 3 OR MAX(auto_marked) = 1
-      )
+      /*
+       * ANY UNREACHABLE MARKER QUALIFIES — the same rule the CRM's "Pending
+       * Action from Client" section uses, so the two surfaces cannot disagree
+       * about a job.
+       *
+       * This used to require three distinct days, and a cl + qualified CTE
+       * pair existed solely to count them. Both are GONE rather than relaxed:
+       * the main query already joins tbl_job_comment on comment_on = 16, so
+       * with no threshold the CTEs were re-deriving a restriction the join
+       * already applies. The days and attempts are still SELECTed and shown —
+       * they are useful context on a row, they are just no longer a gate.
+       *
+       * The auto-marker special case went with them. It existed because the
+       * sweep writes one comment and could never reach three days; with no
+       * threshold it qualifies like any other marker, and the extra parameter
+       * it needed — the one that caused a temporal-dead-zone crash — is gone.
+       *
+       * Expect the count to rise sharply: measured on the open book, three
+       * days qualified 1 job and any marker qualifies 71.
+       */
       SELECT j.job_id, j.job_reference_id, j.client_ref_id, j.job_status,
              COALESCE(city.city_name, 'Unknown')            AS city_name,
              COALESCE(TSC.service_catg_name, 'Uncategorised') AS category,
@@ -2491,7 +2466,6 @@ router.get('/unreachable-jobs', async (req, res, next) => {
                ORDER BY rq.comment_id DESC
                LIMIT 1) AS client_request_reason_id
         FROM tbl_job j
-        JOIN (SELECT DISTINCT job_id FROM qualified) q ON q.job_id = j.job_id
         JOIN tbl_job_comment c ON c.job_id = j.job_id AND c.comment_on = 16
         LEFT JOIN tbl_address      A    ON A.address_id = j.fk_address_id
         LEFT JOIN tbl_city         city ON city.city_id = A.city_id
@@ -2628,9 +2602,6 @@ router.get('/dashboard-summary', async (req, res, next) => {
      * unreachable three days running last week and still open is still a job
      * the client should chase.
      */
-    // Same id the list endpoint resolves; see the note there. 0 when unseeded,
-    // which no row can match, so the tile falls back to counting days.
-    const autoReasonIdForCount = (await autoUnreachable.autoReasonId(pool)) ?? 0;
     const [[unreachable]] = await pool.query(
       `SELECT COUNT(*) AS n FROM (
          SELECT c.job_id
@@ -2641,14 +2612,11 @@ router.get('/dashboard-summary', async (req, res, next) => {
             ${teamFilter}
             AND j.job_status NOT IN (3,5,6,7)
           GROUP BY c.job_id
-         HAVING COUNT(DISTINCT DATE(c.created_on)) >= 3
-             OR MAX(c.enum_reason_id = ?) = 1
        ) q`,
-      // ONE copy of the filter parameters (dropping the self-join dropped its
-      // duplicate subquery), then the auto-marker id LAST, because its
-      // placeholder is in the HAVING — the tile must qualify a job on exactly
-      // the same two grounds as the list it opens.
-      [req.spoc.client_id, ...teamParams, autoReasonIdForCount]
+      // The tile counts jobs with ANY unreachable marker — the same rule as the
+      // list it opens, and as the CRM. No threshold means no HAVING and no
+      // extra parameter.
+      [req.spoc.client_id, ...teamParams]
     );
 
     // Donut slices — return labels + colours pre-baked so the FE just

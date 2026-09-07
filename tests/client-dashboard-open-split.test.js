@@ -168,34 +168,29 @@ test('the count comes from the comment history, NOT the call_later flag', async 
   assert.doesNotMatch(q.sql, /call_later/, 'the flag cannot express three days');
 });
 
-test('DISTINCT dates — three calls in ONE day must not qualify', async () => {
-  await call('/dashboard-summary');
-  const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
-  // The invariant, not the spelling: several calls in one afternoon collapse to
-  // a single date. This assertion used to name the self-join's `b.d` alias and
-  // broke when the join went away, even though the guarantee never changed —
-  // so it now matches the COUNT DISTINCT over a DATE, however it is aliased.
-  assert.match(q.sql, /COUNT\(DISTINCT\s+(?:\w+\.)?(?:d\b|DATE\(c\.created_on\))\)\s*>=\s*3/,
-    'three distinct DATES, not three rows');
-});
-
-test('THREE DISTINCT DAYS, with no rolling-window restriction', async () => {
+test('ANY unreachable marker qualifies — the same rule as the CRM', () => {
   /*
-   * CHANGED 2026-09-07, deliberately. This used to require the three dates to
-   * fall inside a rolling three-day span, which is stricter than the rule ops
-   * stated ("called on 3 days, at least once each day") and strictly so: a
-   * customer unreachable on Monday, Wednesday and the following Tuesday met the
-   * rule and failed the span. Measured on the open book the span version
-   * surfaced ONE job, which is why this tile looked broken.
+   * CHANGED 2026-09-07, per ops. This tile used to require three distinct days
+   * of unreachable markers (and before that, three inside a rolling three-day
+   * span). The CRM's "Pending Action from Client" section has always qualified
+   * a job on the FIRST marker, so the two surfaces disagreed about the same
+   * job: ops saw it waiting on the client, the client saw nothing.
    *
-   * The assertion is the absence of the window, because that is the whole
-   * change; the DISTINCT-days guarantee is pinned by the test above.
+   * They now agree. The threshold is gone entirely rather than lowered — the
+   * query already joins tbl_job_comment on comment_on = 16, so the day-counting
+   * CTEs were re-deriving a restriction the join applies. The day and attempt
+   * counts survive as CONTEXT on each row; they are no longer a gate.
+   *
+   * Measured impact on the open book: 1 job qualified before, 71 after.
    */
-  await call('/dashboard-summary');
-  const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
-  assert.doesNotMatch(q.sql, /INTERVAL 2 DAY/,
-    'no rolling window — any three distinct days qualify');
-  assert.doesNotMatch(q.sql, /BETWEEN a\.d AND/, 'and the self-join it needed is gone');
+  return call('/dashboard-summary').then(() => {
+    const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
+    assert.doesNotMatch(q.sql, /HAVING/i,
+      'no threshold — one marker is enough, exactly as the CRM decides it');
+    assert.doesNotMatch(q.sql, /INTERVAL 2 DAY/, 'and no rolling window survives');
+    assert.match(q.sql, /comment_on = 16/,
+      'the marker itself is still what qualifies a job');
+  });
 });
 
 test('only OPEN jobs count — a closed job is not still unreachable', async () => {
