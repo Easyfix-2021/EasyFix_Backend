@@ -52,7 +52,7 @@ const logger = require('../logger');
  * schedule changed_by=54 count, same for checkout. The CRM stamps it; the API
  * never did. This module is the CRM, so it stamps it.)
  *
- * ── THE ONE NEW EVENT ───────────────────────────────────────────────────────
+ * ── THE NEW EVENTS ──────────────────────────────────────────────────────────
  * The new CRM does something the legacy stack never logged: a general STATUS
  * TRANSITION. setStatus() moves a job between any two of thirteen states, and
  * of those only CANCELLED leaves a dated row anywhere (tbl_job.cancel_*). That
@@ -60,6 +60,28 @@ const logger = require('../logger');
  * an existing value. Overloading 'schedule' or 'checkout' to also mean "some
  * status moved" would retroactively change what a decade of rows means.
  * old_data / new_data carry the before and after.
+ *
+ * Two more joined it when the customer PIN (tbl_job.otp) moved from gating job
+ * START to gating job CLOSE — 'customer pin resent' and 'completed without
+ * customer pin'. Both name an OPS action that sits outside that gate, and
+ * neither had any home in job history before (the first wrote an application
+ * log line only; the second was indistinguishable from an ordinary ops close).
+ * Same reasoning as 'status change': a new fact gets a new log_for.
+ *
+ * ADDING A log_for IS SAFE FOR THE LEGACY STACK, and that was checked rather
+ * than assumed. tbl_job_logs is written by three legacy writers but READ by
+ * exactly one code path: EasyFix_CRM JobsLogDaoImpl.getRescheduledReasonByJobId,
+ * which filters `log_for like '<value>'` and whose only two live callers
+ * (JobAction.java:1142 and :2355) pass the literal "Re-visit Required". A row
+ * whose log_for is neither of those is never selected, so it cannot be rendered
+ * as anything — least of all as a reschedule reason. (The DAO does skip the
+ * filter when status is null/empty and then takes the job's LATEST row, which
+ * WOULD be reachable; no caller does that, and getRescheduledReasonByJobId1,
+ * the Criteria variant, has no callers at all.) EasyFix_API's JobsLogDAO and
+ * ACD_APIs' JobLogsRepository only ever persist. Every column is a plain
+ * varchar/tinytext on both sides — the Hibernate entities map log_for,
+ * old_data, new_data and comments to String — so there is no enum, lookup or
+ * check constraint for a new value to violate.
  *
  * ── changed_by: ONE NAMESPACE, NO EXCEPTIONS ────────────────────────────────
  * See ACTOR_RULE below. This is the part most likely to be got wrong, because
@@ -153,6 +175,9 @@ const LOG_FOR = {
   REVISIT_REQUIRED: 'Re-visit Required',
   // New, because the legacy stack never logged a generic transition. See above.
   STATUS_CHANGE: 'status change',
+  // New, because the legacy stack had no customer-PIN-on-close gate to bypass.
+  CUSTOMER_PIN_RESENT: 'customer pin resent',
+  COMPLETED_WITHOUT_PIN: 'completed without customer pin',
 };
 
 /*
@@ -164,6 +189,8 @@ const NEW_DATA_TOKEN = {
   [LOG_FOR.SCHEDULE]: 'schedule',
   [LOG_FOR.CHECKOUT]: 'checkOut',
   [LOG_FOR.REVISIT_REQUIRED]: 'revisit',
+  [LOG_FOR.CUSTOMER_PIN_RESENT]: 'pinResent',
+  [LOG_FOR.COMPLETED_WITHOUT_PIN]: 'noCustomerPin',
 };
 
 /*
@@ -177,8 +204,12 @@ const ETA_STATUS = {
   [LOG_FOR.RESCHEDULE]: null,
   [LOG_FOR.REVISIT_REQUIRED]: '01',
   // No legacy eta code describes a generic transition, and inventing one would
-  // put a value into eta_status that no reader can interpret.
+  // put a value into eta_status that no reader can interpret. Same for the two
+  // customer-PIN events: eta_status reports on the ETA lifecycle, which neither
+  // a re-send nor a PIN-less close touches.
   [LOG_FOR.STATUS_CHANGE]: null,
+  [LOG_FOR.CUSTOMER_PIN_RESENT]: null,
+  [LOG_FOR.COMPLETED_WITHOUT_PIN]: null,
 };
 
 /*
@@ -514,6 +545,84 @@ async function logStatusChange(jobId, { from = null, to = null } = {}, actor, at
   });
 }
 
+/*
+ * 'customer pin resent' — ops re-sent the customer PIN from the CRM
+ * (POST /api/admin/jobs/:id/resend-customer-pin).
+ *
+ * WHY IT IS A HISTORY ROW AND NOT A logger.info
+ * The PIN gates job CLOSE. When a technician cannot close, the question asked
+ * afterwards is "why couldn't this job close?", and it is asked on the job —
+ * not in Dozzle. An application log line is invisible there, is not attributed
+ * to a person on the job, and rolls off. This is the same reasoning that put
+ * the cancel audit comment on the job in setStatus().
+ *
+ * THE PIN ITSELF IS NEVER WRITTEN. The signature has nowhere to put it: the row
+ * records that a re-send happened, by whom and when. The code lives on
+ * tbl_job.otp and goes to the customer's phone — the whole point of the route
+ * being a re-send rather than a "show me the PIN" panel is that ops never sees
+ * it, and a log row that carries it would hand it back.
+ *
+ * "Resent", not "delivered": the route awaits the SMS service, which discards
+ * its provider result, so nothing here can honestly assert delivery.
+ */
+async function logCustomerPinResent(jobId, actor, at) {
+  return write({
+    logFor: LOG_FOR.CUSTOMER_PIN_RESENT,
+    jobId,
+    newData: `${NEW_DATA_TOKEN[LOG_FOR.CUSTOMER_PIN_RESENT]}_${positiveIntOrNull(jobId)}`,
+    actor,
+    at,
+  });
+}
+
+/*
+ * 'completed without customer pin' — a CRM close where the PIN gate was not
+ * satisfied.
+ *
+ * THIS IS A FACT, NOT AN ACCUSATION. Ops closing a job for a technician who
+ * cannot reach the customer is legitimate, and is exactly why the escape hatch
+ * exists — the mobile checkout enforces the PIN, the CRM deliberately does not
+ * (routes/mobile/index.js POST /jobs/:id/checkout says so in as many words).
+ * The row exists so the two closes are TELLABLE APART afterwards, which they
+ * were not: an ops close was already attributed (logStatusChange + logCheckout
+ * both carry the actor) but looked identical to any other ops close.
+ *
+ * TWO CONDITIONS, BOTH REQUIRED, both checked here rather than at the call site
+ * so the judgement lives next to the actor classifier it depends on:
+ *
+ *  1. pinOutstanding — the job still carries a non-empty tbl_job.otp. The
+ *     caller passes a BOOLEAN, never the code: this module's standing rule is
+ *     that no secret and no free text can reach the table by signature rather
+ *     than by remembering to strip it, and the PIN is the strongest example.
+ *     When tbl_job has no otp column at all (older deploys — see
+ *     job.service.hasOtpColumn) the caller has nothing to report and passes
+ *     false, so nothing is recorded rather than a value being invented.
+ *
+ *  2. the actor is a CRM user — resolveActor puts a real tbl_user id in
+ *     changedBy for exactly those. Without this the row would be a LIE on the
+ *     commonest close in the system: the technician app closes through the same
+ *     setStatus(), it verifies the PIN by COMPARING it and never clears
+ *     tbl_job.otp, so "otp is still set" is true of a correctly PIN-verified
+ *     technician close too. Integration and system closes (changedBy 0, no
+ *     actor) are excluded for the plainer reason that no PIN gate applies to
+ *     them, so there is nothing there to have bypassed.
+ *
+ * Returns null without writing when either fails — the same shape logStatusChange
+ * uses for a transition that did not actually move.
+ */
+async function logCompletedWithoutCustomerPin(jobId, { pinOutstanding = false } = {}, actor, at) {
+  if (!pinOutstanding) return null;
+  const { changedBy } = resolveActor(actor);
+  if (!changedBy) return null;
+  return write({
+    logFor: LOG_FOR.COMPLETED_WITHOUT_PIN,
+    jobId,
+    newData: `${NEW_DATA_TOKEN[LOG_FOR.COMPLETED_WITHOUT_PIN]}_${positiveIntOrNull(jobId)}`,
+    actor,
+    at,
+  });
+}
+
 module.exports = {
   logNewJob,
   logSchedule,
@@ -521,6 +630,8 @@ module.exports = {
   logReschedule,
   logRevisitRequired,
   logStatusChange,
+  logCustomerPinResent,
+  logCompletedWithoutCustomerPin,
   // Exported for tests + for anyone auditing the conventions against production.
   LOG_FOR,
   ETA_STATUS,

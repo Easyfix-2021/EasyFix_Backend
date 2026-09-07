@@ -26,6 +26,11 @@ const { installFakePool } = require('./helpers/fake-pool');
  *   droppedTable       — one table INFORMATION_SCHEMA reports as non-existent,
  *   droppedColumn      — one {table, col} INFORMATION_SCHEMA omits,
  *                        both for the schema-verify severity tests at the bottom.
+ *   jobOtp             — tbl_job.otp on the row getJobMeta reads. null (the
+ *                        default) is a job with no customer PIN; a string is a
+ *                        job whose PIN is still outstanding at close.
+ *   jobStatus          — that row's CURRENT job_status, so a transition can be
+ *                        driven from somewhere other than BOOKED.
  */
 const scenario = {
   insertError: null,
@@ -33,6 +38,8 @@ const scenario = {
   revisitReasonError: null,
   droppedTable: null,
   droppedColumn: null,
+  jobOtp: null,
+  jobStatus: 0,
 };
 
 const fake = installFakePool([
@@ -71,12 +78,20 @@ const fake = installFakePool([
   // Everything below exists only for the end-to-end fail-soft test at the
   // bottom, which drives the real job.service.setStatus(): the column probes,
   // getJobMeta's read, and the UPDATE. No other test in this file queries them.
+  // job.service.hasOtpColumn() probes with this exact statement, and an
+  // unmatched query returns [] — i.e. "column absent", which makes getJobMeta
+  // emit `NULL AS otp` and would silently defeat every customer-PIN assertion
+  // below. Answered explicitly so those tests test the PIN, not the probe. The
+  // answer is memoised per process on first call, so it cannot be a knob; the
+  // absent-column behaviour is the same code path as "no PIN on the row"
+  // (existing.otp === null), which IS covered.
+  [/SHOW\s+COLUMNS\s+FROM\s+tbl_job\s+LIKE\s+'otp'/i, () => [{ Field: 'otp' }]],
   [/INFORMATION_SCHEMA/i, () => [{ n: 3 }]],
   [/UPDATE\s+tbl_job\s+SET/i, () => ({ affectedRows: 1 })],
   [/FROM\s+tbl_job\s+WHERE\s+job_id/i, () => [{
-    job_id: 42, job_status: 0, fk_easyfixter_id: 7, fk_customer_id: 3,
+    job_id: 42, job_status: scenario.jobStatus, fk_easyfixter_id: 7, fk_customer_id: 3,
     fk_client_id: 5, requested_date_time: '2026-08-20 10:00:00',
-    booking_cut_off_time_slot: null, otp: null,
+    booking_cut_off_time_slot: null, otp: scenario.jobOtp,
   }]],
 ]);
 
@@ -91,6 +106,8 @@ beforeEach(() => {
   scenario.revisitReasonError = null;
   scenario.droppedTable = null;
   scenario.droppedColumn = null;
+  scenario.jobOtp = null;
+  scenario.jobStatus = 0;
 });
 
 function insert() {
@@ -148,11 +165,44 @@ test('the five continued log_for values are byte-identical to production', () =>
   assert.equal(jobLog.LOG_FOR.REVISIT_REQUIRED, 'Re-visit Required');
 });
 
-test('the new status-transition event does NOT reuse a legacy value', () => {
-  assert.ok(
-    !LIVE_LOG_FOR_VALUES.includes(jobLog.LOG_FOR.STATUS_CHANGE),
-    'a generic transition must get its own log_for, never overload an existing one',
-  );
+test('every NEW event gets its own log_for and reuses no legacy value', () => {
+  // Overloading 'checkout' to also mean "and the PIN gate was not satisfied"
+  // would retroactively change what a decade of checkout rows means.
+  for (const key of ['STATUS_CHANGE', 'CUSTOMER_PIN_RESENT', 'COMPLETED_WITHOUT_PIN']) {
+    assert.ok(
+      !LIVE_LOG_FOR_VALUES.includes(jobLog.LOG_FOR[key]),
+      `LOG_FOR.${key} must not overload a value the legacy stack already writes`,
+    );
+  }
+  // Distinct from each other too, so a history reader can filter on one.
+  const all = Object.values(jobLog.LOG_FOR);
+  assert.equal(new Set(all).size, all.length, 'two events sharing a log_for is one event');
+});
+
+/*
+ * The legacy stack READS this table in exactly one place: EasyFix_CRM
+ * JobsLogDaoImpl.getRescheduledReasonByJobId, `log_for like '<value>'`, and its
+ * only two live callers (JobAction.java:1142, :2355) pass "Re-visit Required".
+ * A new log_for is therefore never selected by anything legacy — provided it is
+ * not a LIKE match for that literal. The wildcards are the trap: '%' and '_' in
+ * a new value would make it match patterns nobody intended.
+ */
+test('a new log_for cannot be caught by the one legacy SELECT', () => {
+  for (const value of Object.values(jobLog.LOG_FOR)) {
+    assert.doesNotMatch(value, /[%_]/, 'a LIKE wildcard in a log_for makes it match other filters');
+  }
+  for (const key of ['STATUS_CHANGE', 'CUSTOMER_PIN_RESENT', 'COMPLETED_WITHOUT_PIN']) {
+    assert.notEqual(jobLog.LOG_FOR[key], 'Re-visit Required');
+  }
+});
+
+test('every written value fits the live column widths', () => {
+  // log_for / old_data / new_data are varchar(255), comments tinytext (255 B).
+  // clip() protects the composed strings; these two are constants and would be
+  // truncated silently by MySQL rather than clipped.
+  for (const value of Object.values(jobLog.LOG_FOR)) {
+    assert.ok(Buffer.byteLength(value) <= 255, `${value} exceeds varchar(255)`);
+  }
 });
 
 test('the six dead log_for values are not written by anything here', () => {
@@ -445,8 +495,16 @@ test('every exported writer is fail-soft, not just the one we sampled', async ()
     () => jobLog.logReschedule(42, { newEasyfixerId: 5 }, { user_id: 7 }),
     () => jobLog.logRevisitRequired(42, { reasonId: 3 }, { user_id: 7 }),
     () => jobLog.logStatusChange(42, { from: 0, to: 2 }, { user_id: 7 }),
+    () => jobLog.logCustomerPinResent(42, { user_id: 7 }),
+    () => jobLog.logCompletedWithoutCustomerPin(42, { pinOutstanding: true }, { user_id: 7 }),
   ];
   for (const w of writers) assert.equal(await w(), null);
+  // Every exported writer, not just the ones this list remembered.
+  const exported = Object.keys(jobLog).filter((k) => k.startsWith('log'));
+  assert.equal(
+    exported.length, writers.length,
+    `writers added to the module must be added here too — exported: ${exported.join(', ')}`,
+  );
 });
 
 test('a row with no job id is refused rather than written NULL', async () => {
@@ -487,6 +545,150 @@ test('setStatus writes the transition on the shared pool AFTER the UPDATE, not i
   // separate events, so two rows is correct.
   const kinds = logs.map((c) => c.params[COL.log_for]).sort();
   assert.deepEqual(kinds, ['checkout', 'status change']);
+});
+
+/* ── The two ops actions that sit OUTSIDE the customer-PIN gate ───────────── */
+
+/*
+ * The customer PIN (tbl_job.otp) gates job CLOSE in the technician app. Two ops
+ * actions bypass that gate, and neither used to appear in job history:
+ *   1. ops re-sends the PIN from the CRM;
+ *   2. ops closes the job the technician could not.
+ * Someone asking "why couldn't this job close?" reads the job's history, so
+ * that is where both now land.
+ */
+
+test('an ops PIN re-send is a history row with the operator on it', async () => {
+  await jobLog.logCustomerPinResent(481851, { user_id: 5776 });
+  const q = insert();
+  assert.ok(q, 'the re-send must reach job history, not only the application log');
+  assert.equal(q.params[COL.log_for], 'customer pin resent');
+  assert.equal(q.params[COL.new_data], 'pinResent_481851');
+  assert.equal(q.params[COL.old_data], null);
+  assert.equal(q.params[COL.eta_status], null);
+  assert.equal(q.params[COL.job_id], 481851);
+  assert.equal(q.params[COL.changed_by], 5776, 'the acting operator, joinable to tbl_user');
+  assert.equal(q.params[COL.comments], 'Changed by New CRM');
+});
+
+test('the PIN itself can never be written by either new event', async () => {
+  // Neither signature has anywhere to put it: the re-send takes a job id, and
+  // the close marker takes a BOOLEAN. A code smuggled into the boolean slot is
+  // read for truthiness and never rendered.
+  await jobLog.logCustomerPinResent(42, { user_id: 7 });
+  await jobLog.logCompletedWithoutCustomerPin(42, { pinOutstanding: '9137' }, { user_id: 7 });
+  const written = fake.calls
+    .filter((c) => /INSERT\s+INTO\s+tbl_job_logs/i.test(c.sql))
+    .flatMap((c) => c.params.map(String));
+  assert.equal(written.some((p) => p.includes('9137')), false,
+    'the customer PIN is a secret the customer holds — a log row must not hand it back');
+});
+
+test('the close marker needs BOTH an outstanding PIN and a CRM actor', async () => {
+  const cases = [
+    // [pinOutstanding, actor, shouldWrite, why]
+    [true,  { user_id: 5776 },              true,  'ops closed a job whose PIN was never presented'],
+    [false, { user_id: 5776 },              false, 'no PIN on the job — there was no gate to bypass'],
+    [true,  { user_id: 2702, efr_id: 2702 }, false, 'the app VERIFIES the PIN and never clears it'],
+    [true,  { user_id: 'efr:2702' },        false, 'same technician, shared-principal form'],
+    [true,  { user_id: null },              false, 'integration / system closes have no PIN gate'],
+    [true,  undefined,                      false, 'no actor at all'],
+  ];
+  for (const [pinOutstanding, actor, shouldWrite, why] of cases) {
+    fake.calls.length = 0;
+    const id = await jobLog.logCompletedWithoutCustomerPin(42, { pinOutstanding }, actor);
+    assert.equal(Boolean(insert()), shouldWrite, why);
+    assert.equal(id === null, !shouldWrite);
+  }
+});
+
+test('an ops close of a job whose PIN was never presented says so, as a fact', async () => {
+  scenario.jobOtp = '9137';
+  await jobService.setStatus(42, { status: 3 }, { user_id: 5776 });
+
+  const logs = fake.calls.filter((c) => /INSERT\s+INTO\s+tbl_job_logs/i.test(c.sql));
+  const marker = logs.find((c) => c.params[COL.log_for] === 'completed without customer pin');
+  assert.ok(marker, 'a CRM close that skipped the PIN must be tellable apart from one that did not');
+  assert.equal(marker.params[COL.new_data], 'noCustomerPin_42');
+  assert.equal(marker.params[COL.changed_by], 5776);
+  // Alongside — not instead of — the two rows the transition already wrote.
+  assert.deepEqual(
+    logs.map((c) => c.params[COL.log_for]).sort(),
+    ['checkout', 'completed without customer pin', 'status change'],
+  );
+});
+
+test('the PIN is read from the row setStatus ALREADY fetched — no second query', async () => {
+  scenario.jobOtp = '9137';
+  await jobService.setStatus(42, { status: 3 }, { user_id: 5776 });
+  // getJobMeta selects `otp` (behind hasOtpColumn) so the BOOKED branch can
+  // decide whether to mint one. The marker reuses that read; a SELECT issued
+  // just to fetch the PIN again would show up here.
+  const otpReads = fake.calls.filter((c) => /\botp\b/i.test(c.sql) && /^\s*SELECT/i.test(c.sql));
+  assert.equal(otpReads.length, 1, `expected only getJobMeta to read otp, saw:\n${otpReads.map((c) => c.sql).join('\n')}`);
+});
+
+test('a technician closing the SAME job is not marked — the app verified the PIN', async () => {
+  // The regression this guards: routes/mobile POST /jobs/:id/checkout compares
+  // the PIN and never CLEARS tbl_job.otp, then completes through this very
+  // setStatus. "otp is still set" is therefore true of a correct close too, so
+  // the PIN alone would libel every technician in the system.
+  scenario.jobOtp = '9137';
+  await jobService.setStatus(42, { status: 3 }, { user_id: 7, efr_id: 7 });
+  const kinds = fake.calls
+    .filter((c) => /INSERT\s+INTO\s+tbl_job_logs/i.test(c.sql))
+    .map((c) => c.params[COL.log_for]);
+  assert.equal(kinds.includes('completed without customer pin'), false);
+  assert.deepEqual(kinds.sort(), ['checkout', 'status change'], 'and nothing else changed');
+});
+
+test('a move between two terminal codes does not re-mark an already-closed job', async () => {
+  // 3 -> 5 is COMPLETED -> COMPLETED_ALT. Entering-only, same guard as the
+  // checkout row it sits beside.
+  scenario.jobOtp = '9137';
+  scenario.jobStatus = 3;
+  await jobService.setStatus(42, { status: 5 }, { user_id: 5776 });
+  const kinds = fake.calls
+    .filter((c) => /INSERT\s+INTO\s+tbl_job_logs/i.test(c.sql))
+    .map((c) => c.params[COL.log_for]);
+  assert.deepEqual(kinds, ['status change']);
+});
+
+/*
+ * THE PROPERTY THE WHOLE CHANGE RESTS ON.
+ *
+ * This is a log line, not a gate. New logic was allowed into setStatus — the
+ * transition the CRM completes through — on exactly one condition: that it
+ * cannot reject anything. The writers swallow their own errors, so the earlier
+ * insert-throws test proves nothing about the CALLER: it never sees an
+ * exception. This one breaks the promise at the seam and asserts the caller
+ * survives anyway.
+ */
+test('a log-writer that THROWS must not fail the status change', async () => {
+  scenario.jobOtp = '9137';
+  const originals = {};
+  const writerNames = Object.keys(jobLog).filter((k) => k.startsWith('log'));
+  for (const name of writerNames) {
+    originals[name] = jobLog[name];
+    jobLog[name] = async () => { throw new Error(`${name} exploded`); };
+  }
+  try {
+    for (const status of [3, 10, 6]) {
+      fake.calls.length = 0;
+      await assert.doesNotReject(
+        () => jobService.setStatus(42, { status }, { user_id: 5776 }),
+        `a thrown history write must not reject a status change to ${status}`,
+      );
+      assert.ok(
+        fake.calls.some((c) => /UPDATE\s+tbl_job\s+SET/i.test(c.sql)),
+        'and the transition itself must still have been issued',
+      );
+    }
+  } finally {
+    // Restored in `finally`: an assertion that throws must not leak throwing
+    // writers into every test after this one.
+    for (const name of writerNames) jobLog[name] = originals[name];
+  }
 });
 
 /* ── The admin route must be able to CARRY the revisit reason at all ───────── */

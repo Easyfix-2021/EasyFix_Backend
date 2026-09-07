@@ -152,14 +152,37 @@ test('supplied values are trimmed before they are stamped', async () => {
   assert.equal(captured.extras.checkin_address, 'Indiranagar');
 });
 
-// ─── The PIN gate is untouched by this change ────────────────────────
+// ─── The PIN no longer gates check-in (2026-09-07) ───────────────────
+//
+// Was: a wrong or missing PIN returned 409 INVALID_CHECKIN_PIN. Product moved
+// the PIN to the CLOSE — starting a job needs only location + selfie — so these
+// pin the new rule. The closing gate itself lives in tests/mobile-close-pin.test.js.
 
-test('a wrong customer PIN still blocks check-in before any write', async () => {
+test('a wrong customer PIN no longer blocks check-in', async () => {
   jobService.getById = async () => ({ ...JOB, otp: '1234' });
   const res = await checkin({ otp: '9999', gps: '12.9,77.5' });
-  assert.equal(res.status, 409, 'PIN mismatch must still 409');
-  assert.equal(res.body?.error?.code ?? res.body?.code, 'INVALID_CHECKIN_PIN');
-  assert.equal(captured, null, 'no status write may happen on a PIN mismatch');
+  assert.equal(res.status, 200, 'the PIN is a closing control now — it must not block the start');
+  assert.ok(captured, 'the status write must happen');
+  assert.equal(captured.status, 2, 'transition to IN_PROGRESS still runs');
+  jobService.getById = async () => ({ ...JOB });
+});
+
+test('check-in with NO PIN starts a job that HAS one', async () => {
+  jobService.getById = async () => ({ ...JOB, otp: '1234' });
+  const res = await checkin({ gps: '12.9,77.5' });
+  assert.equal(res.status, 200, 'location + selfie are the only start requirements');
+  assert.equal(res.body?.data?.pinMatched, null, 'nothing submitted → nothing checked, not "wrong"');
+  jobService.getById = async () => ({ ...JOB });
+});
+
+test('a volunteered PIN is still verified — a wrong one is reported, not swallowed', async () => {
+  // Silently accepting it would let the tech work the whole job holding a PIN
+  // that cannot close it. Report at the door, block at the close.
+  jobService.getById = async () => ({ ...JOB, otp: '1234' });
+  const wrong = await checkin({ otp: '9999' });
+  assert.equal(wrong.body?.data?.pinMatched, false, 'a wrong volunteered PIN must come back false');
+  const right = await checkin({ otp: ' 1234 ' });
+  assert.equal(right.body?.data?.pinMatched, true, 'the right PIN, trimmed, comes back true');
   jobService.getById = async () => ({ ...JOB });
 });
 

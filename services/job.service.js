@@ -4712,7 +4712,7 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   await pool.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, values);
 
   /*
-   * tbl_job_logs. Three rows are possible on one transition and they answer
+   * tbl_job_logs. Four rows are possible on one transition and they answer
    * different questions, so they are not collapsed:
    *   'status change'      — NEW event (the legacy stack never logged a generic
    *                          transition; only CANCELLED left a dated row).
@@ -4721,14 +4721,46 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
    *                          they pass the CURRENT status to ride the extras path.
    *   'checkout'           — legacy vocabulary, on the visit being closed out.
    *   'Re-visit Required'  — legacy vocabulary, on the visit needing another one.
-   * All three are fail-soft and run after the UPDATE has already committed.
+   *   'completed without customer pin'
+   *                        — NEW event, on a CRM close that did not satisfy the
+   *                          customer-PIN gate. See below.
+   * All four are fail-soft and run after the UPDATE has already committed.
+   *
+   * FAIL OPEN — DELIBERATELY, AND THIS try/catch IS THE PROOF. Everything in
+   * this block is a RECORD of a change that has already committed; none of it is
+   * a gate, and none of it may turn a landed transition into a 500. The writers
+   * each swallow their own errors, but that is a promise made in another file:
+   * a caller that would fail if one of them ever broke it is one refactor away
+   * from rejecting completions for the sake of a history row. So the promise is
+   * enforced here too, on the side that pays for it.
    */
-  await jobLog.logStatusChange(jobId, { from: existing.job_status, to: Number(status) }, actor);
-  if (COMPLETED_STATES.has(Number(status)) && !COMPLETED_STATES.has(Number(existing.job_status))) {
-    await jobLog.logCheckout(jobId, actor);
-  }
-  if (Number(status) === STATUS.REVISIT && Number(existing.job_status) !== STATUS.REVISIT) {
-    await jobLog.logRevisitRequired(jobId, { reasonId: extras?.revisit_reason_id }, actor);
+  try {
+    await jobLog.logStatusChange(jobId, { from: existing.job_status, to: Number(status) }, actor);
+    if (COMPLETED_STATES.has(Number(status)) && !COMPLETED_STATES.has(Number(existing.job_status))) {
+      await jobLog.logCheckout(jobId, actor);
+      /*
+       * Did this close satisfy the customer-PIN gate?
+       *
+       * `existing.otp` is ALREADY IN HAND — getJobMeta selects it (behind
+       * hasOtpColumn(), which emits `NULL AS otp` when the column is absent) so
+       * the BOOKED branch above can decide whether to mint one. Reused here; no
+       * second query, and on a deploy without the column this is null, which
+       * records nothing rather than inventing a value.
+       *
+       * Only the BOOLEAN crosses into the log writer — the PIN is a secret the
+       * customer holds, and tbl_job_logs is a table two other stacks read. The
+       * writer applies the second half of the test (is this a CRM actor?), which
+       * belongs next to its actor classifier; a technician close verifies the PIN
+       * without clearing it, so "otp still set" alone would libel every one.
+       */
+      const pinOutstanding = existing.otp != null && String(existing.otp).trim() !== '';
+      await jobLog.logCompletedWithoutCustomerPin(jobId, { pinOutstanding }, actor);
+    }
+    if (Number(status) === STATUS.REVISIT && Number(existing.job_status) !== STATUS.REVISIT) {
+      await jobLog.logRevisitRequired(jobId, { reasonId: extras?.revisit_reason_id }, actor);
+    }
+  } catch (e) {
+    logger.warn('Job history write failed (non-fatal) · id=' + jobId + ' · ' + e.message);
   }
 
   const eventName = statusToEventName(existing.job_status, Number(status));

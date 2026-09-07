@@ -13,6 +13,12 @@ const {
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
 const requireStageForTransition = require('../../middleware/require-stage');
+const requireAction = require('../../middleware/require-action');
+const { rateLimit } = require('../../middleware/rate-limit');
+// Reused (NOT re-implemented) for POST /:id/resend-customer-pin — see that route.
+const mobileLifecycle = require('../../services/mobile-job-lifecycle.service');
+// tbl_job_logs writer — the same one job.service uses. See the resend route.
+const jobLog = require('../../services/job-log.service');
 // Still used by GET /escalated/export.xlsx (small, styled, buffered — fine
 // at that size). The big Manage Job Report uses the streaming writer below.
 const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
@@ -2539,6 +2545,132 @@ router.post('/:id/notify-unreachable', validate(idParam, 'params'), scopedJob, a
     modernOk(res, result, result.sent ? 'Customer notified' : 'SMS not sent');
   } catch (e) { logger.error('Notify unreachable failed · jobId=' + req.params.id + ' · ' + e.message); next(e); }
 });
+
+// ─── Re-send the customer PIN (ops escape hatch) ─────────────────────
+/*
+ * POST /jobs/:id/resend-customer-pin
+ *
+ * WHY IT EXISTS
+ *   tbl_job.otp is the 4-digit code minted on the BOOKED transition
+ *   (job.service setStatus) and read back by the customer at the door. It is
+ *   moving from a START control to a CLOSE control, which changes the cost of
+ *   a technician who cannot get it: he used to be unable to start (annoying);
+ *   he is now unable to CLOSE a job he has already finished — work done,
+ *   customer gone, job stuck open and unbillable. His only self-serve escape
+ *   is the app's own POST /mobile/jobs/:id/checkin-sms. When that fails (wrong
+ *   number on file, customer deleted the SMS) ops had NO way to help, because
+ *   the CRM can neither see nor re-send the PIN. This is that way.
+ *
+ * WHY THE NAME IS NOT "checkin-sms"
+ *   The mobile route is named for the transition that consumed the PIN. Once
+ *   the PIN gates CLOSE instead of START, "check-in" names the wrong moment
+ *   and would read wrong within the week. This one is named for the artifact
+ *   and the act — re-send the customer PIN — which stays true whichever
+ *   transition consumes it.
+ *
+ * OWNERSHIP: mobileLifecycle.sendCheckinSms() opens with getOwnedJob(jobId,
+ *   efrId), which is the technician-app guard ("is this MY job?"). Ops is not
+ *   a technician, and that service belongs to the mobile flow — adding an
+ *   admin bypass inside it would put an "or the caller is staff" hole in the
+ *   one check that stops a technician touching another technician's job. So
+ *   the bypass is resolved HERE, from the caller's side: we pass the job's own
+ *   assigned technician (tbl_job.fk_easyfixter_id), which satisfies the guard
+ *   by being true rather than by being skipped. Authorisation for ops is the
+ *   requireAction + scopedJob pair below, which is the admin tier's own model.
+ *
+ * NO TECHNICIAN ASSIGNED is a normal state for an unscheduled job, so it must
+ *   not reach the service at all. Passing NULL through would satisfy
+ *   getOwnedJob only by coincidence — Number(null) === Number(null) === 0 —
+ *   i.e. the guard would pass because both sides are junk, and any future
+ *   tightening there would turn this into a silent 404 for ops. We answer 409
+ *   with an actionable sentence instead: nothing to close, nobody to read the
+ *   PIN back, assign first.
+ *
+ * THE RESPONSE NEVER CARRIES THE PIN. Ops triggers the SMS; the code goes to
+ *   the customer's phone and nowhere else — that is the entire reason this is
+ *   a re-send rather than a "show me the PIN" panel. The payload is rebuilt
+ *   here as a literal instead of spreading the service's return value, so a
+ *   later change in that file (which this route does not own) cannot widen
+ *   what ops sees.
+ */
+
+// Bound: 3 ATTEMPTS per job per 5 minutes — charged on the way in, before the
+// scope read, so it can over-count a refusal but can never under-count a send.
+// Keyed on the JOB, not the operator —
+// what needs protecting is one customer's phone, and a per-operator key would
+// let a second operator (or the same person in a second tab) start a fresh
+// budget against the same customer. A legitimate "they didn't get it, try
+// again" is 1-2 sends; thirty is a stuck button. Module scope, once:
+// rateLimit() closes over its own Map, so building it per-request caps
+// nothing. Per-process, like every limiter here — with N replicas the real
+// ceiling is 3N per window, which is a backstop, not an exact quota.
+const customerPinResendLimiter = rateLimit({
+  windowMs: 5 * 60_000,
+  max: 3,
+  key: (req) => `job-pin-resend:${req.params.id}`,
+});
+
+router.post('/:id/resend-customer-pin',
+  requireAction('isJobCustomerPinResend'),
+  validate(idParam, 'params'),
+  customerPinResendLimiter,
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const jobId = Number(req.params.id);
+      const efrId = Number(req.scopedJob.fk_easyfixter_id || 0);
+      logger.info('Re-send customer PIN · jobId=' + jobId + ' by userId=' + (req.user?.user_id ?? '-'));
+
+      if (!efrId) {
+        logger.warn('Re-send customer PIN refused · jobId=' + jobId + ' · no technician assigned');
+        return modernError(
+          res,
+          409,
+          'No technician is assigned to this job yet — assign one, then re-send the PIN',
+        );
+      }
+
+      // Reuse: the service owns the customer-mobile lookup, the DLT template
+      // (job_stage='CHECK_IN') with its inline-text fallback, and the 422s for
+      // "no mobile on file" / "no PIN minted". Its e.status flows through
+      // middleware/error-handler as a real 4xx with its own message.
+      await mobileLifecycle.sendCheckinSms(jobId, efrId);
+
+      /*
+       * "Triggered", not "delivered" — and the wording is deliberate.
+       * sendCheckinSms() awaits smsService.send() and DISCARDS its result, so
+       * it returns { sent: true } even when the provider rejected the message
+       * or NOTIFICATIONS_DISABLE short-circuited it. This route cannot see
+       * that from the outside and must not assert a delivery it never
+       * observed (the magic-link route learned the same lesson the loud way).
+       * Fixing it means threading `delivered` out of the service, which lives
+       * in a file this change does not own — reported, not patched.
+       */
+      /*
+       * Into JOB HISTORY, not just the application log. The line above is
+       * invisible on the job, unattributed to a person there, and rolls off —
+       * and "why couldn't this job close?" is a question asked on the job.
+       *
+       * FAIL OPEN. The SMS has already gone to the customer; a failed history
+       * row must not turn that into a 500 that has ops press the button again
+       * (and spend another slot of the 3-per-5-minutes budget) for a message
+       * that was already sent. jobLog.write() swallows its own errors, but this
+       * route does not depend on a promise made in another file.
+       */
+      try {
+        await jobLog.logCustomerPinResent(jobId, req.user);
+      } catch (le) {
+        logger.warn('PIN re-send history row failed (non-fatal) · jobId=' + jobId + ' · ' + le.message);
+      }
+
+      logger.info('Customer PIN re-send dispatched · jobId=' + jobId);
+      return modernOk(res, { sent: true }, 'PIN re-send triggered');
+    } catch (e) {
+      logger.warn('Re-send customer PIN failed · jobId=' + req.params.id + ' · ' + e.message);
+      return next(e);
+    }
+  },
+);
 
 // ─── Job Feedback sub-resource (legacy tbl_customer_feedback) ─────────
 const jobFeedback = require('../../services/job-feedback.service');

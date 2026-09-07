@@ -731,41 +731,57 @@ router.post('/jobs/:id/eta', validate(Joi.object({
   }
 });
 
+// The customer PIN (tbl_job.otp — the 4-digit code SMS'd to the customer) as
+// stored and as submitted: null, undefined and blank all mean "no PIN". ONE
+// definition, shared by check-in (where it is advisory) and checkout (where it
+// is the gate), so the two can never drift into disagreeing about a PIN.
+const normalisePin = (v) => (v == null ? '' : String(v).trim());
+
 // Status: → 2 (IN_PROGRESS). `setStatus` fires the TechStart webhook
 // automatically based on the transition (BOOKED|SCHEDULED → IN_PROGRESS).
 // Mobile-specific stamps (GPS, address, pincode, fk_checkin_by) ride
 // through the `extras` whitelist so the transition rules + stamps land
 // in a single shared UPDATE — no duplication of status-transition logic.
 router.post('/jobs/:id/checkin', validate(Joi.object({
-  // Location stamp is nice-to-have, NOT a gate — the customer PIN is the real
-  // check-in control. Requiring gps used to 400 the whole request before the PIN
-  // verify ran whenever coords were unavailable (GPS off / permission denied),
-  // effectively making check-in unreachable. Optional keeps the tech unblocked.
+  // Location stamp is nice-to-have, NOT a gate. Requiring gps used to 400 the
+  // whole request whenever coords were unavailable (GPS off / permission
+  // denied), effectively making check-in unreachable. Optional keeps the tech
+  // unblocked. (The selfie is captured by POST /jobs/:id/selfie, its own route.)
   gps: Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).optional().allow('', null),
   address: Joi.string().max(500).optional(),
   pincode: Joi.string().pattern(/^[0-9]{6}$/).optional(),
-  otp: Joi.string().optional(),
+  // Still accepted — a tech who has the PIN in hand can have it checked early
+  // (see the handler). Nothing here requires it: the PIN gates /checkout now.
+  otp: Joi.string().optional().allow('', null),
 })), async (req, res, next) => {
   try {
     logger.info('Check in to job · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    // Verify the customer check-in PIN (tbl_job.otp, the 4-digit code SMS'd to
-    // the customer). When the job carries a PIN it MUST match — a wrong PIN can
-    // never start the job (legacy parity: the dedicated verify-otp-customer step).
-    // Jobs without a PIN (empty otp) skip the check so existing flows don't break.
-    const jobPin = job.otp == null ? '' : String(job.otp).trim();
-    const submittedOtp = req.body.otp == null ? '' : String(req.body.otp).trim();
-    if (jobPin && jobPin !== submittedOtp) {
-      logger.warn('Check-in blocked · id=' + req.params.id + ' · PIN mismatch');
-      // Structured error so the app re-prompts for the PIN specifically, instead
-      // of mislabelling every 4xx as "wrong PIN". modernError only auto-sets the
-      // HTTP-log hint for string errors, so set it manually for the object form.
-      if (res.locals) res.locals.logHint = 'check-in PIN mismatch';
-      return modernError(res, 409, {
-        message: 'Incorrect check-in PIN. Ask the customer for the PIN sent to them.',
-        code: 'INVALID_CHECKIN_PIN',
-      });
+    /*
+     * The customer PIN does NOT gate check-in (2026-09-07). Starting a job needs
+     * the location and the selfie; the PIN is now the CLOSING control and is
+     * enforced by /jobs/:id/checkout below.
+     *
+     * What this used to do, and why it changed: when tbl_job.otp was set, a
+     * missing or wrong submitted PIN returned 409 INVALID_CHECKIN_PIN — "a wrong
+     * PIN can never start the job (legacy parity: the dedicated
+     * verify-otp-customer step)". That rule stranded a technician standing at a
+     * door whose customer had lost the SMS: they could not start the work they
+     * were there to do. Product moved the control to the close, where the PIN
+     * proves the customer signed the job off rather than merely opened the door.
+     *
+     * A volunteered PIN is still VERIFIED, just never enforced. Silently
+     * swallowing a wrong one would let the tech work the whole job believing
+     * they hold a PIN that will not close it; the verdict rides back as
+     * `pinMatched` so the app can say so now, while the customer is present.
+     * null = nothing was checked (none submitted, or the job carries no PIN).
+     */
+    const jobPin = normalisePin(job.otp);
+    const submittedPin = normalisePin(req.body.otp);
+    const pinMatched = (jobPin && submittedPin) ? jobPin === submittedPin : null;
+    if (pinMatched === false) {
+      logger.warn('Check-in PIN mismatch · id=' + req.params.id + ' · NOT blocking (PIN gates checkout)');
     }
     /*
      * Location stamps are NON-DESTRUCTIVE — absence is not a value.
@@ -817,7 +833,7 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
       { user_id: req.tech.efr_id, efr_id: req.tech.efr_id },
     );
     logger.info('Checked in · id=' + job.job_id + ' · status->IN_PROGRESS');
-    modernOk(res, { checkedIn: true });
+    modernOk(res, { checkedIn: true, pinMatched });
   } catch (e) {
     if (e.status) {
       logger.warn('Check in failed · id=' + req.params.id + ' · ' + e.message);
@@ -837,6 +853,11 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
 // after the transition. A revisit stamps both revisit_date + revisit_time_slot.
 router.post('/jobs/:id/checkout',
   validate(Joi.object({
+    // The customer PIN. Deliberately OPTIONAL here and required in the handler
+    // instead: a job whose row carries no PIN must stay closable, and Joi cannot
+    // see the row. A required() would 400 those with a generic validation error
+    // rather than the structured 409 the app can act on.
+    otp:                      Joi.string().max(10).optional().allow('', null),
     haveProblemWithJob:       Joi.boolean().default(false),
     problemReasonId:          Joi.number().integer().positive().optional().allow(null),
     otherRemark:              Joi.string().max(1000).optional().allow('', null),
@@ -854,6 +875,38 @@ router.post('/jobs/:id/checkout',
     logger.info('Check out of job · id=' + req.params.id + ' · isNextVisit=' + (req.body.isNextVisit === true) + ' · cashCollected=' + (req.body.isCashCollected === true));
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
+    /*
+     * The customer PIN is the CLOSING control (moved off check-in 2026-09-07):
+     * the technician reads back the code SMS'd to the customer, which is what
+     * proves the customer signed the work off rather than merely opened the door.
+     *
+     * MOBILE ONLY, on purpose. The CRM completes through
+     * PATCH /api/admin/jobs/:id/status → job.setStatus(), a different route this
+     * gate cannot reach, so ops can always close a job the technician could not
+     * (customer unreachable, wrong number on file, PIN never delivered).
+     *
+     * A job whose row carries no PIN skips the check — same as check-in always
+     * did. Not every job goes through the BOOKED-confirm path that mints one, so
+     * enforcing unconditionally would make those permanently uncloseable.
+     * `/jobs/:id/checkin-sms` re-sends the PIN when the customer has lost it.
+     */
+    const jobPin = normalisePin(job.otp);
+    const submittedPin = normalisePin(req.body.otp);
+    if (jobPin && jobPin !== submittedPin) {
+      logger.warn('Check out blocked · id=' + req.params.id + ' · PIN ' + (submittedPin ? 'mismatch' : 'missing'));
+      // Structured error so the app prompts for the PIN specifically instead of
+      // mislabelling every 4xx. modernError only auto-sets the HTTP-log hint for
+      // string errors, so set it manually for the object form.
+      if (res.locals) res.locals.logHint = 'checkout PIN ' + (submittedPin ? 'mismatch' : 'missing');
+      return modernError(res, 409, {
+        // One code for both cases: the app's action is identical (prompt for the
+        // PIN, offer Resend). Only the human-facing sentence differs.
+        message: submittedPin
+          ? 'Incorrect closing PIN. Ask the customer for the PIN sent to them.'
+          : 'Closing PIN required. Ask the customer for the PIN sent to them.',
+        code: 'INVALID_CHECKOUT_PIN',
+      });
+    }
     const b = req.body;
     const isRevisit = b.isNextVisit === true;
     const extras = {
