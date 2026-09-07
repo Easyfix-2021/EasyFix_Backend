@@ -2832,6 +2832,16 @@ async function ackDocument(efrId, contentId) {
 async function certificateData(courseId, efrId) {
   const [[row]] = await pool.query(
     `SELECT ec.id            AS enrolment_id,
+            /*
+             * Carried so the row alone is enough to RECORD the certificate —
+             * certificate.service::issueForEnrolment stores who and which
+             * course, and taking those from the row rather than from each
+             * route's own variables is what stops the CRM download and the
+             * technician's own download filing the same certificate
+             * differently.
+             */
+            ec.easyfixer_id  AS efr_id,
+            ec.course_id,
             ec.completion_date,
             ec.badge_earned_at,
             ec.score,

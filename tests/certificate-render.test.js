@@ -541,8 +541,31 @@ test('the manual render validates the generic payload, with the stated limits', 
   assert.ok(!schema.validate({ recipientName: 'x'.repeat(120), title: 'T' }).error);
   assert.ok(schema.validate({ recipientName: 'A', title: 'x'.repeat(161) }).error, 'title max 160');
   assert.ok(!schema.validate({ recipientName: 'A', title: 'x'.repeat(160) }).error);
-  assert.ok(schema.validate({ recipientName: 'A', title: 'T', certificateId: 'x'.repeat(41) }).error,
-    'certificateId max 40');
+  /*
+   * certificateId IS NO LONGER A FIELD (2026-09-07). Numbers are server-issued
+   * from tbl_certificate, so an operator-typed one — which looks official and
+   * validates as unknown — must not reach the renderer.
+   *
+   * RUN THROUGH THE MIDDLEWARE, not schema.validate(). Bare Joi rejects an
+   * unknown key; validate() passes stripUnknown, which DROPS it instead. Only
+   * the middleware's options decide what a real request does, and asserting
+   * against a copy of them here would keep passing on the day they change.
+   * A stale HRMS build therefore still gets its certificate — just without a
+   * number it made up.
+   */
+  const req = {
+    method: 'POST',
+    originalUrl: '/api/admin/certificates/render',
+    body: { recipientName: 'A', title: 'T', certificateId: 'EF-FAKE-1' },
+  };
+  const res = responseDouble();
+  let passed = false;
+  v(req, res, () => { passed = true; });
+  assert.equal(passed, true, 'an old caller is not broken, just ignored');
+  assert.equal('certificateId' in req.body, false,
+    'a typed certificate number must never reach the renderer');
+  assert.equal(req.body.recipientName, 'A', 'POSITIVE CONTROL: the body did survive validation');
+
   assert.ok(!schema.validate({ recipientName: 'A', title: 'T', dateText: '' }).error,
     "'' is how a caller suppresses the date pair, so it must validate");
 
@@ -567,9 +590,18 @@ test('the manual render streams the document, attached and uncached', () => {
    */
   const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   assert.doesNotMatch(code, /modernOk/, 'the body is the document, not an envelope');
-  /* Purely a render: nothing may be written anywhere. */
-  assert.doesNotMatch(code, /INSERT|UPDATE|pool\.query|s3\./i,
-    'a certificate is a projection — there is no row and no file to own');
+  /*
+   * It issues now, but the ROUTE still owns no SQL and no file. tbl_certificate
+   * has exactly one writer (services/certificate.service.js) — that is what
+   * makes uq_certificate_no a real backstop rather than a hope, since a second
+   * INSERT site is free to skip it.
+   */
+  assert.doesNotMatch(code, /INSERT\s|pool\.query|s3\./i,
+    'the table has ONE writer — the route asks the service, it does not write');
+  assert.match(code, /certificates\.issueManual\(/,
+    'the render must record the issuance it prints the number from');
+  assert.match(code, /issueManual\([\s\S]{0,400}?\.catch\(/,
+    'recording must not be able to break a download');
 });
 
 test('the manual render is mounted under /api/admin/certificates', () => {

@@ -3,6 +3,7 @@ const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
 const lms = require('../../services/lms.service');
+const certificates = require('../../services/certificate.service');
 const { modernOk } = require('../../utils/response');
 const logger = require('../../logger');
 const { renderCertificatePdf } = require('../../utils/pdf-certificate');
@@ -118,6 +119,16 @@ router.get('/courses/:courseId/certificate', validate(courseIdParam, 'params'), 
     const courseId = Number(req.params.courseId);
     logger.info('Certificate requested (technician) · efrId=' + efrId + ' · courseId=' + courseId);
     const row = await lms.certificateData(courseId, efrId);
+
+    /*
+     * Same issuance record as the CRM's download — keyed on the enrolment, so
+     * whichever surface serves it first creates the row and the other finds it.
+     * The technician's number can therefore never change between the app and
+     * the Training Report. Fail-open on purpose: a bookkeeping error must not
+     * cost a technician his certificate.
+     */
+    await certificates.issueForEnrolment(row).catch((e) => logger.warn(
+      'Certificate record failed · enrolment=' + row.enrolment_id + ' · ' + e.message));
 
     const safeName = String(row.course_name || 'course')
       .replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'course';

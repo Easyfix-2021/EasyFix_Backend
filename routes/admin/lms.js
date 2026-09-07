@@ -7,6 +7,7 @@ const validate = require('../../middleware/validate');
 const requireAction = require('../../middleware/require-action');
 const { buildRequestScope } = require('../../lib/scope');
 const svc = require('../../services/lms.service');
+const certificates = require('../../services/certificate.service');
 const s3 = require('../../utils/s3-storage');
 const { renderCertificatePdf } = require('../../utils/pdf-certificate');
 const { modernOk, modernError } = require('../../utils/response');
@@ -490,6 +491,18 @@ router.get('/courses/:courseId/certificate/:easyfixerId', requireLmsManage,
       const efrId = Number(req.params.easyfixerId);
       logger.info('Certificate requested · courseId=' + courseId + ' · efrId=' + efrId);
       const row = await svc.certificateData(courseId, efrId);
+
+      /*
+       * RECORD THE ISSUANCE, but never at the cost of the download. The upsert
+       * is keyed on the enrolment, so this download and the technician's own
+       * (routes/mobile/lms.js) converge on ONE row and one number however often
+       * either is served. If it fails, a warning and the certificate still
+       * goes out: a technician's certificate matters more than our bookkeeping,
+       * and the number is derived from the enrolment either way — recording is
+       * what makes it VALIDATABLE, not what makes it correct.
+       */
+      await certificates.issueForEnrolment(row).catch((e) => logger.warn(
+        'Certificate record failed · enrolment=' + row.enrolment_id + ' · ' + e.message));
 
       const safeName = String(row.course_name || 'course')
         .replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'course';

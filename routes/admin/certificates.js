@@ -6,6 +6,7 @@ const requireAction = require('../../middleware/require-action');
 const {
   renderCertificatePdf, renderCertificateImage, OUTPUT_FORMATS,
 } = require('../../utils/pdf-certificate');
+const certificates = require('../../services/certificate.service');
 const logger = require('../../logger');
 
 /*
@@ -20,18 +21,24 @@ const logger = require('../../logger');
  * so the LMS download would fire, or a second renderer that would drift from
  * the first. Nine strings in, one PDF out, no row invented anywhere.
  *
- * ─── IT IS PURELY A RENDER ─────────────────────────────────────────────────
+ * ─── IT RENDERS, AND IT ISSUES ─────────────────────────────────────────────
  *
- * Nothing is written. No certificate table, no stored file, no issued_on, no
- * revoke — the same decision the LMS certificate rides on. There is therefore
- * no issuance event to duplicate and no cleanup to own: this endpoint turns a
- * request body into bytes and forgets it.
+ * It used to write nothing at all, and `certificateId` was whatever the caller
+ * typed. Both are gone (2026-09-07). A typed number looks official on the
+ * document and validates as unknown, and nothing stopped two certificates
+ * carrying the same one — so the field is no longer accepted, and the number
+ * comes from the record certificate.service::issueManual writes:
+ * EF-GEN-<issue year>-<row id>, derived server-side from the row's own
+ * AUTO_INCREMENT and therefore unique by construction.
  *
- * That also fixes the identifier question. `certificateId` is whatever the
- * caller types, or nothing at all — an operator-typed certificate has no
- * unique key to derive one from, and minting a serial would create exactly the
- * idempotency problem the stateless design avoids. When the id is absent the
- * line is omitted rather than printed empty.
+ * Recording cannot break the render. If the insert fails the certificate is
+ * still served, without an id line — exactly what this endpoint produced
+ * before, which is the right degradation for a document somebody is waiting on.
+ *
+ * One record per certificate, not per download: unlike the LMS path there is no
+ * natural key here, so every call to this endpoint IS a new issuance. That is
+ * the correct reading — an operator pressing the button twice has deliberately
+ * issued two documents, and each gets its own number.
  *
  * ─── THE GATE ──────────────────────────────────────────────────────────────
  *
@@ -58,7 +65,11 @@ const renderBody = Joi.object({
   heading: Joi.string().trim().max(80).optional(),
   eyebrow: Joi.string().trim().max(120).optional(),
   dateText: Joi.string().trim().allow('').max(60).optional(),
-  certificateId: Joi.string().trim().max(40).optional(),
+  /*
+   * NO certificateId. The number is server-issued now, so a caller that still
+   * sends one has it dropped by validate()'s stripUnknown rather than printed —
+   * a stale HRMS build cannot put an operator-typed number on a document.
+   */
   signatoryName: Joi.string().trim().max(80).optional(),
   signatoryTitle: Joi.string().trim().max(80).optional(),
   /*
@@ -95,6 +106,23 @@ router.post('/render', requireAction('isCertificateIssue'), validate(renderBody)
         + ' · by=' + (req.user?.user_id ?? '?'));
 
       /*
+       * The issuance, BEFORE the render — the number has to exist to be printed
+       * on the document. A failure here is a warning and a certificate with no
+       * id line, never a 500: see the header note.
+       *
+       * Recording ahead of the render also means a render that then fails has
+       * burned a number. That is deliberate: a number handed out once must not
+       * come back, and a gap in the sequence costs nothing.
+       */
+      const rec = await certificates.issueManual(b, req.user?.user_id ?? null)
+        .catch((e) => {
+          logger.warn('Certificate record failed · recipient=' + b.recipientName
+            + ' · ' + e.message);
+          return null;
+        });
+      const values = { ...b, certificateId: rec?.certificate_no };
+
+      /*
        * `undefined` is what makes the renderer default to today in IST, so an
        * omitted dateText must NOT be normalised to '' anywhere on the way in —
        * that would mean "print no date at all", a different request. Spreading
@@ -102,7 +130,7 @@ router.post('/render', requireAction('isCertificateIssue'), validate(renderBody)
        * would turn every omission into an explicit undefined, which is the same
        * thing here but stops being so the moment a default is added above.
        */
-      const image = out.ext === 'pdf' ? null : await renderCertificateImage({ ...b, format });
+      const image = out.ext === 'pdf' ? null : await renderCertificateImage({ ...values, format });
 
       const safeName = String(b.recipientName)
         .replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'certificate';
@@ -112,7 +140,7 @@ router.post('/render', requireAction('isCertificateIssue'), validate(renderBody)
         `attachment; filename="EasyFix-Certificate-${safeName}.${out.ext}"`);
 
       if (image) return res.end(image);
-      renderCertificatePdf({ ...b, stream: res });
+      renderCertificatePdf({ ...values, stream: res });
       return undefined;
     } catch (e) {
       return next(e);
