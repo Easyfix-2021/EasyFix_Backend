@@ -929,7 +929,7 @@ function clientJobFilters(req, hier) {
  *
  * Returns null once it has answered the request — callers `if (!job) return;`.
  */
-async function loadJobForWrite(req, res, what) {
+async function loadJobInScope(req, res, what) {
   const job = await jobService.getById(Number(req.params.id));
   if (!job || job.fk_client_id !== req.spoc.client_id) {
     logger.warn(what + ' target not found / not owned · id=' + req.params.id);
@@ -974,11 +974,21 @@ router.use('/jobs', require('./jobs-upload'));
 router.get('/jobs/:id', async (req, res, next) => {
   try {
     logger.info('Fetch client job · id=' + req.params.id);
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      logger.warn('Client job not found / not owned · id=' + req.params.id);
-      return modernError(res, 404, 'job not found');
-    }
+    /*
+     * READS GO THROUGH THE SAME TWO LAYERS AS WRITES. This handler used to
+     * inline the tenancy check alone, which is the weaker half: it stopped a
+     * SPOC reading another CLIENT's job but not another BRANCH's job inside
+     * their own client. The list endpoint has always applied the hierarchy, so
+     * a job the caller cannot see in a list was readable by typing its id —
+     * and /jobs now has a search box that hands out ids.
+     *
+     * The write path closed this in August by centralising both layers in one
+     * helper; the read path simply never adopted it. Reusing that helper rather
+     * than adding a second hierarchy check is the point — two copies of a scope
+     * rule is how the halves drifted apart in the first place.
+     */
+    const job = await loadJobInScope(req, res, 'Fetch');
+    if (!job) return;
     modernOk(res, job);
   } catch (e) { next(e); }
 });
@@ -987,7 +997,7 @@ router.get('/jobs/:id', async (req, res, next) => {
 router.patch('/jobs/:id/approve', async (req, res, next) => {
   try {
     logger.info('SPOC approve job · id=' + req.params.id);
-    const job = await loadJobForWrite(req, res, 'Approve');
+    const job = await loadJobInScope(req, res, 'Approve');
     if (!job) return;
     await pool.query('UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = NOW() WHERE job_id = ?',
       [req.spoc.id, job.job_id]);
@@ -999,7 +1009,7 @@ router.patch('/jobs/:id/approve', async (req, res, next) => {
 router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(3).max(500).required() })), async (req, res, next) => {
   try {
     logger.info('SPOC reject job · id=' + req.params.id);
-    const job = await loadJobForWrite(req, res, 'Reject');
+    const job = await loadJobInScope(req, res, 'Reject');
     if (!job) return;
     await pool.query(
       'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = NOW() WHERE job_id = ?',
@@ -1019,7 +1029,7 @@ router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(
 router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
   try {
     logger.info('SPOC approve estimate · id=' + req.params.id);
-    const job = await loadJobForWrite(req, res, 'Estimate-approve');
+    const job = await loadJobInScope(req, res, 'Estimate-approve');
     if (!job) return;
     if ([3, 5, 6].includes(job.job_status)) {
       logger.warn('Estimate-approve blocked · id=' + job.job_id + ' status=' + job.job_status);
@@ -1044,7 +1054,7 @@ router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
 router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.string().min(3).max(500).required() })), async (req, res, next) => {
   try {
     logger.info('SPOC reject estimate · id=' + req.params.id);
-    const job = await loadJobForWrite(req, res, 'Estimate-reject');
+    const job = await loadJobInScope(req, res, 'Estimate-reject');
     if (!job) return;
     if ([3, 5, 6].includes(job.job_status)) {
       logger.warn('Estimate-reject blocked · id=' + job.job_id + ' status=' + job.job_status);
@@ -1085,7 +1095,7 @@ router.post('/jobs/:id/cancel', validate(Joi.object({
   reasonId: Joi.number().integer().allow(null).optional(),
 })), async (req, res, next) => {
   try {
-    const job = await loadJobForWrite(req, res, 'Client cancel');
+    const job = await loadJobInScope(req, res, 'Client cancel');
     if (!job) return;
     if (job.job_status === 6) return modernError(res, 409, 'job is already cancelled');
     if ([3, 5].includes(job.job_status)) return modernError(res, 409, 'cannot cancel a completed job');
@@ -1116,7 +1126,7 @@ const clientImageUpload = multerClientImg({
 router.post('/jobs/:id/images', clientImageUpload.single('file'), async (req, res, next) => {
   const jobId = Number(req.params.id);
   try {
-    const job = await loadJobForWrite(req, res, 'Client image upload');
+    const job = await loadJobInScope(req, res, 'Client image upload');
     if (!job) return;
     const result = await jobImageService.uploadJobImage({ jobId, file: req.file, category: 'Booking' });
     modernOk(res, result, 'image uploaded');
@@ -1170,7 +1180,7 @@ router.post('/jobs/:id/client-request', validate(Joi.object({
   comment: Joi.string().allow('').max(500).optional(),
 })), async (req, res, next) => {
   try {
-    const job = await loadJobForWrite(req, res, 'Client request');
+    const job = await loadJobInScope(req, res, 'Client request');
     if (!job) return;
 
     /*
@@ -1238,7 +1248,7 @@ router.post('/jobs/:id/escalate', validate(Joi.object({
   comment: Joi.string().allow('').max(500).optional(),
 })), async (req, res, next) => {
   try {
-    const job = await loadJobForWrite(req, res, 'Client escalate');
+    const job = await loadJobInScope(req, res, 'Client escalate');
     if (!job) return;
     logger.info('Client escalate job · id=' + job.job_id + ' · reason=' + req.body.reasonId + ' · spoc=' + req.spoc.id);
     const escalatedBy = req.spoc.contact_name || null;
@@ -1978,11 +1988,11 @@ router.get('/jobs/:id/estimate-preview', async (req, res, next) => {
   try {
     const jobId = Number(req.params.id);
     logger.info('Build estimate-preview · jobId=' + jobId);
-    const job = await jobService.getById(jobId);
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      logger.warn('Estimate-preview target not found / not owned · id=' + req.params.id);
-      return modernError(res, 404, 'job not found');
-    }
+    // Same two-layer check as every other by-id route. This one inlined the
+    // tenancy half, so it exposed a colleague's PRICING — per-service charges
+    // and the grand total — to any SPOC in the client who guessed the id.
+    const job = await loadJobInScope(req, res, 'Estimate-preview');
+    if (!job) return;
 
     const [services] = await pool.query(
       `SELECT js.job_service_id, js.job_id, js.service_id,
@@ -2419,12 +2429,20 @@ router.get('/unreachable-jobs', async (req, res, next) => {
            ${scopeSql}
            AND j.job_status NOT IN (3,5,6,7)
       ), qualified AS (
-        SELECT a.job_id
-          FROM cl a
-          JOIN cl b ON b.job_id = a.job_id
-           AND b.d BETWEEN a.d AND DATE_ADD(a.d, INTERVAL 2 DAY)
-         GROUP BY a.job_id, a.d
-        HAVING COUNT(DISTINCT b.d) >= 3
+        /*
+         * THREE DISTINCT DAYS, no window. This was a self-join finding three
+         * dates inside any rolling three-day span — stricter than the rule ops
+         * actually stated ("called on 3 days, at least once each day"), and
+         * strictly so: a customer unreachable on Monday, Wednesday and the
+         * following Tuesday qualifies under the rule and did not under the
+         * span. Measured on the open book, the span version surfaced ONE job,
+         * which is why this tile has always looked broken.
+         *
+         * DISTINCT still does the load-bearing work: several calls on one day
+         * collapse to one date, so "three calls in one afternoon" does not
+         * qualify — that was never the window's job.
+         */
+        SELECT job_id FROM cl GROUP BY job_id HAVING COUNT(DISTINCT d) >= 3
       )
       SELECT j.job_id, j.job_reference_id, j.client_ref_id, j.job_status,
              COALESCE(city.city_name, 'Unknown')            AS city_name,
@@ -2578,10 +2596,11 @@ router.get('/dashboard-summary', async (req, res, next) => {
      * tbl_job_comment at comment_on = 16, one row per Unreachable outcome
      * (see job-comment.service.js, which stamps the flag AND writes the row).
      *
-     * The self-join finds any anchor date with >= 3 DISTINCT dates in
-     * [anchor, anchor+2]. DISTINCT is doing the work: it collapses several
-     * calls on one day to a single date, which is exactly the "three calls in
-     * one day" case that must not qualify.
+     * THREE DISTINCT DAYS, no window — reconciled with the list endpoint's
+     * `qualified` CTE, which is the invariant this block already documents:
+     * the tile and the list it opens must answer one question. DISTINCT is
+     * doing the work, collapsing several calls on one day to a single date, so
+     * "three calls in one afternoon" does not qualify.
      *
      * No recency filter, on purpose: the job being OPEN is the recency. A job
      * unreachable three days running last week and still open is still a job
@@ -2589,27 +2608,21 @@ router.get('/dashboard-summary', async (req, res, next) => {
      */
     const [[unreachable]] = await pool.query(
       `SELECT COUNT(*) AS n FROM (
-         SELECT a.job_id
-           FROM (SELECT DISTINCT c.job_id, DATE(c.created_on) AS d
-                   FROM tbl_job_comment c
-                   JOIN tbl_job j ON j.job_id = c.job_id
-                  WHERE c.comment_on = 16
-                    AND j.fk_client_id = ?
-                    ${teamFilter}
-                    AND j.job_status NOT IN (3,5,6,7)) a
-           JOIN (SELECT DISTINCT c.job_id, DATE(c.created_on) AS d
-                   FROM tbl_job_comment c
-                   JOIN tbl_job j ON j.job_id = c.job_id
-                  WHERE c.comment_on = 16
-                    AND j.fk_client_id = ?
-                    ${teamFilter}
-                    AND j.job_status NOT IN (3,5,6,7)) b
-             ON b.job_id = a.job_id
-            AND b.d BETWEEN a.d AND DATE_ADD(a.d, INTERVAL 2 DAY)
-          GROUP BY a.job_id, a.d
-         HAVING COUNT(DISTINCT b.d) >= 3
+         SELECT c.job_id
+           FROM tbl_job_comment c
+           JOIN tbl_job j ON j.job_id = c.job_id
+          WHERE c.comment_on = 16
+            AND j.fk_client_id = ?
+            ${teamFilter}
+            AND j.job_status NOT IN (3,5,6,7)
+          GROUP BY c.job_id
+         HAVING COUNT(DISTINCT DATE(c.created_on)) >= 3
        ) q`,
-      [req.spoc.client_id, ...teamParams, req.spoc.client_id, ...teamParams]
+      // ONE copy of the filter parameters now, not two: dropping the self-join
+      // dropped its duplicate subquery. mysql2 binds positionally, so leaving
+      // the second copy here would have shifted nothing visibly and filtered by
+      // a client id in the LIMIT's place on the next query to be added.
+      [req.spoc.client_id, ...teamParams]
     );
 
     // Donut slices — return labels + colours pre-baked so the FE just

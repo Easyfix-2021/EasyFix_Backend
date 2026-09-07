@@ -55,7 +55,7 @@ test('allStores is not re-applied at any call site', () => {
  * than an omission. A new unscoped job route fails this test.
  *
  * The four PATCH /jobs/:id/* writes are NOT here: they go through
- * loadJobForWrite, which applies the same resolver, so read scope and write
+ * loadJobInScope, which applies the same resolver, so read scope and write
  * scope give one answer. They used to check tenancy only, which let any SPOC
  * who guessed a job id approve a colleague's job they could not see anywhere
  * on the site.
@@ -86,7 +86,7 @@ test('every job-listing route routes through the shared scope', () => {
     // `new RegExp` per call: a /g literal's lastIndex persists across .test()
     // and would make every other route read as clean.
     if (!/tbl_job\b|jobService\.(list|getStatusCounts|getAttentionSummary)/.test(body)) return;
-    if (/hierarchyFilter\(|clientJobFilters\(|loadJobForWrite\(/.test(body)) return;
+    if (/hierarchyFilter\(|clientJobFilters\(|loadJobInScope\(/.test(body)) return;
     if (EXEMPT.has(s.label)) return;
     unscoped.push(s.label);
   });
@@ -119,7 +119,7 @@ test('the EXEMPT list has no dead entries', () => {
     const end = idx + 1 < starts.length ? starts[idx + 1].i : lines.length;
     const body = lines.slice(s2.i, end)
       .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
-    if (/hierarchyFilter\(|clientJobFilters\(|loadJobForWrite\(/.test(body)) nowScoped.push(s2.label);
+    if (/hierarchyFilter\(|clientJobFilters\(|loadJobInScope\(/.test(body)) nowScoped.push(s2.label);
   });
   assert.deepEqual(nowScoped, [],
     'these are scoped now — drop the exemption so it stops vouching for them');
@@ -127,7 +127,7 @@ test('the EXEMPT list has no dead entries', () => {
 
 /* ── read scope and write scope are ONE answer ────────────────────────── */
 
-test('every client write on a job goes through the shared ownership check', () => {
+test('every client route that resolves a job by id goes through the shared ownership check', () => {
   const lines = RAW.split('\n');
   const starts = [];
   lines.forEach((l, i) => {
@@ -137,23 +137,30 @@ test('every client write on a job goes through the shared ownership check', () =
 
   const bare = [];
   starts.forEach((s2, idx) => {
-    if (s2.method === 'get') return;
-    if (!/^\/jobs\/:id\//.test(s2.path)) return;
+    /*
+     * READS ARE NO LONGER EXEMPT. This skipped GET, and the exemption outlived
+     * its reason: a SPOC reading a colleague's job by guessing its id leaks the
+     * same row a blocked list query would have withheld, and the portal now has
+     * a search box that hands ids out. The bare `/jobs/:id` is included too —
+     * the old pattern required a trailing segment, so the detail route itself,
+     * the most obvious one, was never examined.
+     */
+    if (!/^\/jobs\/:id(\/|$)/.test(s2.path)) return;
     const end = idx + 1 < starts.length ? starts[idx + 1].i : lines.length;
     const body = lines.slice(s2.i, end)
       .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
     if (!/jobService\.getById/.test(body)) return;
-    if (/loadJobForWrite\(/.test(body)) return;
+    if (/loadJobInScope\(/.test(body)) return;
     bare.push(`${s2.method.toUpperCase()} ${s2.path}`);
   });
 
   assert.deepEqual(bare, [],
-    'a write that resolves a job by id and checks only fk_client_id lets any SPOC '
-    + "act on a colleague's job by guessing its id");
+    'a route that resolves a job by id and checks only fk_client_id lets any SPOC '
+    + "read or act on a colleague's job by guessing its id");
 });
 
 test('the ownership check refuses a job with no reporting contact, for scoped callers only', () => {
-  const fn = /async function loadJobForWrite[\s\S]*?\n}/.exec(RAW);
+  const fn = /async function loadJobInScope[\s\S]*?\n}/.exec(RAW);
   assert.ok(fn, 'the helper must exist');
   assert.match(fn[0], /Array\.isArray\(scopeIds\)/,
     'undefined means unrestricted — an allStores or top-of-tree SPOC must still act');
