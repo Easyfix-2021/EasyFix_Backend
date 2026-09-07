@@ -65,41 +65,50 @@ test('THE REPORTED GAP: a clientId reaches both dimension-filtered queries', asy
   }
 });
 
-test('the two KPI chips stay global — deliberate legacy parity, pinned so it is a CHOICE', () => {
+test('THE KPI CHIPS FOLLOW THE FILTER BAR — all four queries, one population', () => {
   /*
-   * Open Escalation and Unconfirmed have never respected ANY dimension filter,
-   * not client and not the three that predate it. That is copied from the
-   * legacy repository and documented at the call site.
+   * CHANGED 2026-09-07, per ops, and deliberately AGAINST legacy parity.
    *
-   * Pinned here for two reasons: so nobody "fixes" it by accident while adding
-   * a filter, and so that if ops ever asks why the chips ignore the filter bar,
-   * the answer is a decision with a citation rather than a mystery.
+   * Open Escalation and Unconfirmed were owner-scoped only, copied from
+   * JobRepository.java:889-899 / :901-909. So narrowing the grid to one client
+   * or city left the chips beside it describing the whole book — two figures on
+   * one screen answering different questions, and the chips are the half nobody
+   * suspects because they carry no filter UI of their own.
+   *
+   * This is the assertion that used to say the opposite. It is inverted rather
+   * than deleted so the history of the decision survives in the file that
+   * enforces it.
    */
   return service.grid(ADMIN, { clientId: [7], cityId: [3] }, { pageNo: 1, pageSize: 10 })
     .then(() => {
       const kpis = fake.calls.filter(isKpiQuery);
       assert.equal(kpis.length, 2, 'the escalated and unconfirmed counts');
       for (const q of kpis) {
-        assert.doesNotMatch(q.sql, /fk_client_id|fk_service_catg_id|TCY\.city_id IN/,
-          'these are owner-scoped only by design (JobRepository.java:889-899); '
-          + 'changing that is a product decision, not a filter fix');
+        assert.match(q.sql, /TJ\.fk_client_id IN \(/, 'the chip must respect the client filter');
+        assert.match(q.sql, /TCY\.city_id IN \(/, 'and every other dimension too');
+        assert.ok((q.params || []).includes(7) && (q.params || []).includes(3),
+          'the values must be BOUND');
       }
     });
 });
 
-test('the city drill-down and the export carry it too', async () => {
-  fake.reset();
-  await service.cityJobs(ADMIN, { clientId: [7], cityId: [3] });
-  for (const q of jobQueries()) assert.match(q.sql, /TJ\.fk_client_id IN \(/, 'drill-down');
-
-  fake.reset();
-  await service.copyData(ADMIN, { clientId: [7] });
-  const ex = jobQueries();
-  assert.ok(ex.length >= 1, 'the export must run a job query');
-  for (const q of ex) {
-    assert.match(q.sql, /TJ\.fk_client_id IN \(/,
-      'the export is the artefact that gets emailed — an unfiltered one is the '
-      + 'most expensive version of this bug');
+test('a query that FILTERS on city/state also JOINS them — or it cannot run at all', async () => {
+  /*
+   * The precondition that made this more than a one-line change. The dimension
+   * filters bind to TCY / TS, which only exist through the address→city→state
+   * chain. A query that applies the filters without the joins references an
+   * undefined alias and fails outright; one that omits both silently answers a
+   * different question — which is exactly what the KPI counts did.
+   *
+   * Asserted over EVERY statement the report issues, so a query added later
+   * cannot pick one without the other.
+   */
+  await service.grid(ADMIN, { cityId: [3], stateId: [2] }, { pageNo: 1, pageSize: 10 });
+  for (const q of fake.calls) {
+    const filtersGeo = /TCY\.city_id IN \(|TS\.state_id IN \(/.test(q.sql);
+    if (!filtersGeo) continue;
+    assert.match(q.sql, /LEFT JOIN tbl_city TCY/, 'filters on TCY without joining it');
+    assert.match(q.sql, /LEFT JOIN tbl_state TS/, 'filters on TS without joining it');
   }
 });
 

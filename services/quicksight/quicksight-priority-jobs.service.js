@@ -88,6 +88,25 @@ function resolveOwnerScope(reqUser, ownerIdsFromBody) {
 }
 
 /*
+ * The join chain that makes TCY / TS reachable from a job, so the city and
+ * state filters have something to bind to.
+ *
+ * Named because it is a PRECONDITION of buildDimensionFilters, not decoration:
+ * a query that applies those filters without these joins references undefined
+ * aliases and fails, and a query that omits BOTH silently answers a different
+ * question. The two KPI counts were the second case for as long as this report
+ * has existed.
+ *
+ * cityJobs() keeps its own copy — its chain is interleaved with the joins that
+ * fetch the drill-down's own columns, so folding it in here would reorder that
+ * query for no gain.
+ */
+const GEO_JOINS = `
+    LEFT JOIN tbl_address TA ON TA.address_id = TJ.fk_address_id
+    LEFT JOIN tbl_city TCY ON TCY.city_id = TA.city_id
+    LEFT JOIN tbl_state TS ON TS.state_id = TCY.state_id`;
+
+/*
  * Build the four shared dimension filters used by ALL queries (client /
  * service category / state / city). Column identifiers are trusted (report
  * code, never user input); only VALUES are parameterised via buildInFilter.
@@ -161,9 +180,7 @@ async function grid(reqUser, filters = {}, { pageNo = 1, pageSize = 10 } = {}) {
       COUNT(CASE WHEN TIMESTAMPDIFF(DAY, TJ.ticket_created_date_time, NOW()) > 7 THEN 1 END) AS greater_than_7_count,
       COUNT(TJ.job_id) AS total_count
     FROM tbl_job TJ
-    LEFT JOIN tbl_address TA ON TA.address_id = TJ.fk_address_id
-    LEFT JOIN tbl_city TCY ON TCY.city_id = TA.city_id
-    LEFT JOIN tbl_state TS ON TS.state_id = TCY.state_id
+${GEO_JOINS}
     WHERE TJ.job_status NOT IN (3, 5, 6, 7, 9)${gridDim}${gridOwner}
     GROUP BY TCY.city_id, TCY.city_name, TS.state_name
     ORDER BY total_count DESC, TCY.city_id ASC
@@ -177,30 +194,44 @@ async function grid(reqUser, filters = {}, { pageNo = 1, pageSize = 10 } = {}) {
   const sizeSql = `
     SELECT COUNT(DISTINCT TCY.city_id) AS total
     FROM tbl_job TJ
-    LEFT JOIN tbl_address TA ON TA.address_id = TJ.fk_address_id
-    LEFT JOIN tbl_city TCY ON TCY.city_id = TA.city_id
-    LEFT JOIN tbl_state TS ON TS.state_id = TCY.state_id
+${GEO_JOINS}
     WHERE TJ.job_status NOT IN (3, 5, 6, 7, 9)${sizeDim}${sizeOwner}
   `;
 
-  // ── Escalated KPI (JobRepository.java:889-899) — owner scope only ─────
+  /*
+   * ── Escalated KPI (JobRepository.java:889-899) ───────────────────────
+   *
+   * DELIBERATELY DIVERGES FROM LEGACY, per ops (2026-09-07). The legacy
+   * repository scoped these two counts by OWNER ONLY, so the chips ignored the
+   * filter bar entirely: narrow the grid to one client or city and the numbers
+   * beside it still described the whole book. Two figures on one screen
+   * answering different questions is the failure this report keeps producing,
+   * and the chips are the half nobody suspects because they carry no filter UI
+   * of their own.
+   *
+   * The dimension filters need GEO_JOINS to resolve TCY / TS — that is why the
+   * joins come with them rather than being optional.
+   */
   const escParams = [];
+  const escDim = buildDimensionFilters(filters, escParams);
   const escOwner = buildOwnerFilter(scope, escParams);
   const escSql = `
     SELECT COUNT(TJ.job_id) AS cnt
     FROM tbl_job TJ
-    LEFT JOIN tbl_easyfixer_rating_by_customer TRC ON TJ.job_id = TRC.job_id
+    LEFT JOIN tbl_easyfixer_rating_by_customer TRC ON TJ.job_id = TRC.job_id${GEO_JOINS}
     WHERE TJ.job_status NOT IN (3, 5, 6, 7)
-      AND TRC.is_escalated IS NOT NULL${escOwner}
+      AND TRC.is_escalated IS NOT NULL${escDim}${escOwner}
   `;
 
-  // ── Unconfirmed KPI (JobRepository.java:901-909) — owner scope only ───
+  // ── Unconfirmed KPI (JobRepository.java:901-909) ─────────────────────
+  // Same deliberate divergence as the escalated count above.
   const uncParams = [];
+  const uncDim = buildDimensionFilters(filters, uncParams);
   const uncOwner = buildOwnerFilter(scope, uncParams);
   const uncSql = `
     SELECT COUNT(TJ.job_id) AS cnt
-    FROM tbl_job TJ
-    WHERE TJ.job_status = 9${uncOwner}
+    FROM tbl_job TJ${GEO_JOINS}
+    WHERE TJ.job_status = 9${uncDim}${uncOwner}
   `;
 
   const [[gridRows], [[sizeRow]], [[escRow]], [[uncRow]]] = await Promise.all([
