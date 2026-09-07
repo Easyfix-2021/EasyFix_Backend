@@ -179,6 +179,12 @@ router.use('/lms',               require('./lms'));
  * looks at to find out what needs doing today. Same pattern /jobs already
  * uses across several files. Order does not matter — the paths are disjoint. */
 router.use('/lms',               require('./lms-action'));
+// Manual certificate rendering (2026-09-07) — POST /certificates/render turns a
+// typed payload into the company certificate artwork, for the awards the LMS
+// does not issue. Pure render: nothing is stored. Gated isCertificateIssue —
+// its own key, because issuing a document in someone's name is not the same
+// privilege as managing LMS content, and this page lives under HRMS.
+router.use('/certificates',      require('./certificates'));
 // Rewards (added 2026-08-13) — shop catalogue, claims queue, points ledger.
 router.use('/rewards',           require('./rewards'));
 // router.use('/clients',        require('./clients'));     // later

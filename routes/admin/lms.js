@@ -498,13 +498,14 @@ router.get('/courses/:courseId/certificate/:easyfixerId', requireLmsManage,
       res.setHeader('Content-Disposition',
         `attachment; filename="EasyFix-Certificate-${safeName}-${efrId}.pdf"`);
 
-      renderCertificatePdf({
-        technician: { efr_name: row.efr_name, efr_no: row.efr_no },
-        course: { name: row.course_name },
-        completedOn: row.completion_date,
-        score: row.score,
-        stream: res,
-      });
+      /*
+       * The renderer is domain-blind — it takes nine strings and knows nothing
+       * about technicians or courses. certificatePayload() is the ONE place the
+       * LMS row becomes those strings, shared with the technician's own
+       * download in routes/mobile/lms.js so the two surfaces cannot print
+       * different certificates for the same enrolment.
+       */
+      renderCertificatePdf({ ...svc.certificatePayload(row), stream: res });
       return undefined;
     } catch (e) {
       return next(e);

@@ -126,13 +126,8 @@ router.get('/courses/:courseId/certificate', validate(courseIdParam, 'params'), 
     res.setHeader('Content-Disposition',
       `attachment; filename="EasyFix-Certificate-${safeName}.pdf"`);
 
-    renderCertificatePdf({
-      technician: { efr_name: row.efr_name, efr_no: row.efr_no },
-      course: { name: row.course_name },
-      completedOn: row.completion_date,
-      score: row.score,
-      stream: res,
-    });
+    // Same mapping as the CRM's download — see lms.service::certificatePayload.
+    renderCertificatePdf({ ...lms.certificatePayload(row), stream: res });
     return undefined;
   } catch (e) {
     return next(e);

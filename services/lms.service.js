@@ -2,6 +2,8 @@ const { pool } = require('../db');
 const { cityScopeSql } = require('../lib/scope');
 const logger = require('../logger');
 const s3 = require('../utils/s3-storage');
+// The certificate's date spelling, so the PDF and the CRM agree.
+const { formatDate } = require('../utils/pdf-certificate');
 
 /*
  * LMS — courses, course content, assignment and completion reporting.
@@ -2848,6 +2850,72 @@ async function certificateData(courseId, efrId) {
   return row;
 }
 
+/*
+ * ─── The certificate NUMBER, and why it is derived rather than stored ──────
+ *
+ * Nothing is persisted for a certificate — no table, no serial column, no
+ * issued_on. The number therefore cannot be allocated; it has to be a pure
+ * function of facts that already exist. `easyfixer_courses.id` is unique and
+ * already exists; it just needs a printable spelling. Rendering the same
+ * certificate twice produces the same number, which is the property an
+ * operator verifying one over the phone actually depends on.
+ *
+ * The YEAR comes from the same date the certificate PRINTS, never from the
+ * clock: a technician downloading his 2026 certificate in 2028 must not get a
+ * 2028 number for the same document.
+ *
+ * That date is completion_date — the day the training was finished — and it is
+ * read here in the same order certificatePayload() reads it, because the two
+ * must not disagree. They did until 2026-09-07: the number took its year from
+ * badge_earned_at while the printed date came from completion_date, so a
+ * certificate could read "31 December 2026" above the number EF-TR-2027-0007.
+ *
+ * Not hypothetical. stampBadges sets badge_earned_at = NOW() for any completed
+ * enrolment once certificate_enabled is switched on, so enabling that flag for
+ * an older course stamps last year's completions with today's date and every
+ * certificate then contradicts itself. Both rules were individually defensible,
+ * which is why no single-field test caught the pair.
+ *
+ * Four digits is a FLOOR, not a width. padStart never truncates, so enrolment
+ * 198765 prints in full rather than becoming somebody else's number.
+ */
+function certificateNumber(row) {
+  const stamp = String(row.completion_date || row.badge_earned_at || istToday());
+  const year = /^(\d{4})/.exec(stamp);
+  return `EF-TR-${year ? year[1] : String(istToday()).slice(0, 4)}`
+    + `-${String(row.enrolment_id).padStart(4, '0')}`;
+}
+
+/*
+ * The ONE place a certificateData() row becomes the generic renderer's payload.
+ *
+ * The renderer takes nine strings and knows nothing about this domain, so the
+ * mapping has to live somewhere; two inline copies is how the CRM's download
+ * and the technician's own end up printing different certificates for the same
+ * fact, so the CRM route and the mobile route both call this.
+ *
+ * `score` is deliberately not mapped: the document says the training was
+ * completed, not how narrowly.
+ */
+const CERTIFICATE_SIGNATORY_NAME = 'J. Ranjan';
+const CERTIFICATE_SIGNATORY_TITLE = 'Training Head';
+
+function certificatePayload(row) {
+  return {
+    recipientName: row.efr_name,
+    title: row.course_name,
+    /*
+     * The day the training was FINISHED, not today — and the SAME expression
+     * certificateNumber() derives its year from, so the number can never
+     * contradict the date printed beneath it.
+     */
+    dateText: formatDate(row.completion_date || row.badge_earned_at),
+    certificateId: certificateNumber(row),
+    signatoryName: CERTIFICATE_SIGNATORY_NAME,
+    signatoryTitle: CERTIFICATE_SIGNATORY_TITLE,
+  };
+}
+
 async function coursesForTech(efrId) {
   const efr = Number(efrId);
   // Probed: this is the technician's own LMS screen, and both the projection
@@ -2977,6 +3045,8 @@ async function coursesForTech(efrId) {
 module.exports = {
   stampBadges,
   certificateData,
+  certificatePayload,
+  certificateNumber,
   mandatoryVideoIdsSql,
   visibleVideoIdsSql,
   lmsFlagColumns,
