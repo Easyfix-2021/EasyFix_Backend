@@ -33,6 +33,20 @@ const cr = require('../services/client-request.service');
 
 const UNCONFIRMED_STATUS = 9;
 
+/*
+ * The calendar date each fixture row's SQL appointment expression resolves to.
+ * Kept beside PLAN so the two descriptions of one row cannot drift.
+ */
+function apptOf(row, todayYmd) {
+  const m = /INTERVAL (-?\d+) DAY/.exec(row.appt);
+  if (row.appt === 'NULL') return null;
+  const days = row.appt === 'CURDATE()' ? 0 : Number(m[1]);
+  const d = new Date(`${todayYmd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+
 let pool;
 try {
   ({ pool } = require('../db'));
@@ -62,6 +76,127 @@ try {
   const todayYmd = today instanceof Date
     ? new Date(today.getTime() - today.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
     : String(today);
+
+  /*
+   * ─── SYNTHETIC BOOK ──────────────────────────────────────────────────────
+   *
+   * WHY. Running against the live book only tests the predicates that happen to
+   * have rows today. Measured when this was written: overdue 121,
+   * pending_with_client 29, and ZERO in the other three — so mutation-testing
+   * this check caught a broken `overdue` and sailed straight past a broken
+   * `upcoming` and a broken `future_unscheduled`. It reported a clean run while
+   * exercising 2 of 5 expressions.
+   *
+   * So before comparing the real book, build one. Eight jobs pinned to the
+   * DATABASE's own CURDATE() cover every section, both date boundaries, the
+   * NULL-appointment branch, and the precedence rule that a client request wins
+   * over an unreachable outcome — none of which today's data can test.
+   *
+   * INSERTED AND ROLLED BACK, never committed. QA's Unconfirmed tab is a real
+   * screen real people use; seeding permanent fixtures into it would trade a
+   * blind check for a dirty book. A transaction gives the real tables and the
+   * real predicates with no residue.
+   *
+   * The column list is derived from INFORMATION_SCHEMA rather than hardcoded,
+   * so a future NOT NULL column added to tbl_job makes this fill it in instead
+   * of failing — the same lesson as check:migrations.
+   */
+  const conn = await pool.getConnection();
+  let syntheticFailures = 0;
+  try {
+    await conn.beginTransaction();
+
+    const [cols] = await conn.query(
+      `SELECT COLUMN_NAME n, DATA_TYPE d FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'tbl_job'
+          AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT IS NULL
+          AND EXTRA NOT LIKE '%auto_increment%' AND EXTRA NOT LIKE '%GENERATED%'`,
+      [process.env.DB_NAME],
+    );
+    // A zero value per type: enough to satisfy NOT NULL, meaningless by design.
+    const filler = (d) => (/int|decimal|double|float|bit|year/i.test(d) ? 0
+      : /date|time/i.test(d) ? '2000-01-01 00:00:00' : 'check:sections fixture');
+    const fixed = cols.filter((c) => !['job_status', 'requested_date_time'].includes(c.n));
+
+    /*
+     * appt is SQL, evaluated by the database, so both sides of the comparison
+     * are answering about the same day even if this process's clock differs.
+     */
+    const PLAN = [
+      { tag: 'req-only',       appt: 'NULL',                                        req: true,  unr: false, want: 'actioned_by_client' },
+      { tag: 'req-and-unr',    appt: 'DATE_ADD(CURDATE(), INTERVAL -3 DAY)',        req: true,  unr: true,  want: 'actioned_by_client' },
+      { tag: 'unr-only',       appt: 'DATE_ADD(CURDATE(), INTERVAL -3 DAY)',        req: false, unr: true,  want: 'pending_with_client' },
+      { tag: 'overdue',        appt: 'DATE_ADD(CURDATE(), INTERVAL -1 DAY)',        req: false, unr: false, want: 'overdue' },
+      { tag: 'today',          appt: 'CURDATE()',                                   req: false, unr: false, want: 'upcoming' },
+      { tag: 'tomorrow',       appt: 'DATE_ADD(CURDATE(), INTERVAL 1 DAY)',         req: false, unr: false, want: 'upcoming' },
+      { tag: 'day-after',      appt: 'DATE_ADD(CURDATE(), INTERVAL 2 DAY)',         req: false, unr: false, want: 'future_unscheduled' },
+      { tag: 'no-appointment', appt: 'NULL',                                        req: false, unr: false, want: 'future_unscheduled' },
+    ];
+
+    const made = [];
+    for (const row of PLAN) {
+      const names = [...fixed.map((c) => c.n), 'job_status', 'requested_date_time'];
+      const vals = fixed.map((c) => filler(c.d));
+      const [res] = await conn.query(
+        `INSERT INTO tbl_job (${names.map((n) => `\`${n}\``).join(', ')})
+         VALUES (${vals.map(() => '?').join(', ')}, ?, ${row.appt})`,
+        [...vals, UNCONFIRMED_STATUS],
+      );
+      const id = res.insertId;
+      made.push({ ...row, id });
+      if (row.req) {
+        await conn.query('INSERT INTO tbl_job_comment (job_id, comments, enum_reason_id) VALUES (?, ?, ?)',
+          [id, 'fixture: client request', ids.cancel]);
+      }
+      if (row.unr) {
+        await conn.query('INSERT INTO tbl_job_comment (job_id, comments, comment_on) VALUES (?, ?, 16)',
+          [id, 'fixture: unreachable outcome']);
+      }
+    }
+
+    const idList = made.map((m) => m.id);
+    const placeholders = idList.map(() => '?').join(', ');
+    const matched = new Map();
+    for (const section of cr.SECTIONS) {
+      const pred = cr.sectionPredicate(section, ids);
+      const [rows] = await conn.query(
+        `SELECT j.job_id FROM tbl_job j
+          WHERE j.job_id IN (${placeholders}) AND j.job_status = ? AND (${pred.sql})`,
+        [...idList, UNCONFIRMED_STATUS, ...pred.params],
+      );
+      for (const r of rows) {
+        const id = Number(r.job_id);
+        if (matched.has(id)) {
+          console.error(`  ✗ fixture job ${id} matches BOTH ${matched.get(id)} and ${section}`);
+          syntheticFailures += 1;
+        }
+        matched.set(id, section);
+      }
+    }
+
+    console.log(`  synthetic book: ${made.length} job(s) covering all ${cr.SECTIONS.length} sections`);
+    for (const m of made) {
+      const got = matched.get(m.id) || '<no section>';
+      // The JS classifier gets the SAME facts, so a divergence here is the two
+      // expressions disagreeing rather than the fixture being wrong.
+      const js = cr.sectionFor(
+        { hasClientRequest: m.req, hasUnreachableOutcome: m.unr, appointmentYmd: apptOf(m, todayYmd) },
+        todayYmd,
+      );
+      const ok = got === m.want && js === m.want;
+      if (!ok) syntheticFailures += 1;
+      console.log(`    ${ok ? '✓' : '✗'} ${m.tag.padEnd(15)} want ${m.want.padEnd(19)} sql ${got.padEnd(19)} js ${js}`);
+    }
+    if (syntheticFailures) {
+      console.error(`\n  ${syntheticFailures} synthetic case(s) wrong — the section rule is broken for a`);
+      console.error('  case the live book cannot show you. Fix sectionFor AND sectionPredicate.');
+      process.exitCode = 1;
+    }
+  } finally {
+    // Never committed. The fixture exists for the length of this check only.
+    await conn.rollback();
+    conn.release();
+  }
 
   const [facts] = await pool.query(
     `SELECT j.job_id,
@@ -133,17 +268,23 @@ try {
    * `future_unscheduled`. It agreed on 2 of 5 predicates and was blind to the
    * rest, while printing a clean result.
    *
-   * So the coverage is stated rather than implied. The five branches ARE fully
-   * covered on the JS side by tests/client-request-sections.test.js, which is
-   * pure and needs no data; this line says how much of the SQL side today's
-   * book could exercise.
+   * That gap is now closed by the SYNTHETIC BOOK above, which exercises all
+   * five predicates (plus both date boundaries and the precedence rule) on any
+   * environment, including a fresh one. Both mutations that used to slip
+   * through — `upcoming` shifted a day, `future` losing its NULL branch — are
+   * caught by it and exit 1.
+   *
+   * This line is kept anyway, because the two books answer different questions:
+   * the synthetic one asks "is the rule right?", the live one asks "does the
+   * rule still partition the data we actually have?". Only the live book can
+   * find a row shape nobody thought to invent.
    */
   const exercised = cr.SECTIONS.filter((s) => counts[s] > 0);
   const blind = cr.SECTIONS.filter((s) => counts[s] === 0);
-  console.log(`  coverage: ${exercised.length} of ${cr.SECTIONS.length} SQL predicates had rows to test`);
+  console.log(`  coverage: live book exercised ${exercised.length} of ${cr.SECTIONS.length}; `
+    + `synthetic book exercised all ${cr.SECTIONS.length}`);
   if (blind.length) {
-    console.log(`  ⚠ NOT exercised by this data (agreement above says nothing about them): ${blind.join(', ')}`);
-    console.log('    The JS side of these IS covered by tests/client-request-sections.test.js.');
+    console.log(`    (no live rows today for: ${blind.join(', ')} — covered synthetically above)`);
   }
 
   if (disagree.length || onlySql.length || process.exitCode === 1) {
