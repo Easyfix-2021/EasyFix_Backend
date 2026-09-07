@@ -39,7 +39,14 @@ const idParam = Joi.object({
  * error.
  */
 const testBody = Joi.object({
-  mobile: Joi.string().trim().min(10).max(15).pattern(/^[\d+\-\s()]+$/).required(),
+  /*
+   * OPTIONAL here since 2026-09-07, and required per-job inside testJob().
+   * One body schema serves every job, so it cannot know that only the three
+   * message-dispatching jobs need a mobile — requiring it here forced the six
+   * ACTION jobs (auto-reactivation, status-drift repair, attendance/training
+   * reminders, rewards, conference reaper) to collect a number they discard.
+   */
+  mobile: Joi.string().trim().min(10).max(15).pattern(/^[\d+\-\s()]+$/).optional(),
   sourceId: Joi.alternatives()
     .try(Joi.number().integer().positive(), Joi.string().trim().allow(''))
     .optional(),
@@ -120,7 +127,9 @@ router.post(
       );
       logger.info('Test send scheduled job · id=' + req.params.id + ' · sourceId=' + sourceId);
       const result = await sj.test(req.params.id, {
-        mobile: String(req.body.mobile).trim(),
+        // Absent for an ACTION job. String(undefined) would hand the tester the
+        // literal "undefined" and a message job would then "pass" its own guard.
+        mobile: req.body.mobile == null ? null : String(req.body.mobile).trim(),
         sourceId,
       });
       logger.info('Scheduled job test sent · id=' + req.params.id);

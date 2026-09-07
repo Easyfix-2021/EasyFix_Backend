@@ -63,9 +63,22 @@ function registerJob({
   // typed { mobile, sourceId } and is expected to dispatch a single
   // test message — never to the original recipient — and return a
   // structured result the route surfaces back to the FE.
-  // `testSourceLabel` + `testSourceHelp` drive the modal's optional
-  // source-id input copy (e.g. "Easyfixer ID" / "Unconfirmed Job ID").
-  tester, testSourceLabel, testSourceHelp,
+  // `testSourceLabel` + `testSourceHelp` drive the modal's source-id
+  // input copy (e.g. "Easyfixer ID" / "Unconfirmed Job ID").
+  //
+  // `testKind` says what the test actually DOES, which decides the shape of
+  // the modal (2026-09-07):
+  //   'message' — dispatches one message to an operator-typed mobile. Mobile
+  //               is required; the source id only pulls real content into it.
+  //   'action'  — performs the job's real work for ONE row and sends nothing
+  //               to a typed number. Mobile is meaningless, and the source id
+  //               is the whole input, so it is required instead.
+  //
+  // Defaults to 'message' because that was the only shape until now. It was
+  // also assumed by the modal for every job, so 7 of the 10 jobs with a tester
+  // demanded a mobile number they then ignored — one of them worked around it
+  // by labelling its unused source field "Not required".
+  tester, testSourceLabel, testSourceHelp, testKind,
   // Optional real-interrupt hook — see requestCancel(). Its presence is what
   // makes the FE show a Stop button for this job.
   canceller,
@@ -82,6 +95,7 @@ function registerJob({
     progressText: null,
     testSourceLabel: testSourceLabel || null,
     testSourceHelp: testSourceHelp || null,
+    testKind: testKind === 'action' ? 'action' : 'message',
     registered: false,
     skipReason: skipReason || null,
     task: null,
@@ -764,6 +778,8 @@ Note: this task only runs automatically if the property "attendance.reminder.ena
       return result;
     },
     tester: ({ sourceId }) => attendanceReminderCron.runTest({ sourceId }),
+    // Sends nothing to a typed number — this runs the job's real work for one row.
+    testKind: 'action',
     testSourceLabel: 'Easyfixer ID (efr_id)',
     testSourceHelp:
       'Required. The reminder push is sent to THIS easyfixer\'s registered device(s). In a test environment with TEST_FCM_TOKEN set, every send is redirected to the operator token — so it lands on your test device, never the real technician.',
@@ -828,6 +844,8 @@ Note: this task only runs automatically if the property "training.reminder.enabl
       return result;
     },
     tester: ({ sourceId }) => trainingReminderCron.runTest({ sourceId }),
+    // Sends nothing to a typed number — this runs the job's real work for one row.
+    testKind: 'action',
     testSourceLabel: 'Easyfixer ID (efr_id)',
     testSourceHelp:
       'Required. Sends the training reminder to THIS easyfixer\'s registered device(s), whether or not they actually owe training today — so delivery can be proven without waiting for a real assignment. In a test environment with TEST_FCM_TOKEN set, every send is redirected to the operator token.',
@@ -892,7 +910,11 @@ Note: this task runs automatically as long as the property "rewards.earn.enabled
       return result;
     },
     tester: () => rewardsService.runEarnCycle(),
-    testSourceLabel: 'Not required',
+    // Sends nothing to a typed number — this runs the job's real work for one row.
+    testKind: 'action',
+    // No row id: the earn cycle scores everyone. The label used to read
+    // "Not required" purely to explain an input the modal forced on it.
+    testSourceLabel: null,
     testSourceHelp:
       'No input needed. Trigger Now runs exactly the awarding pass the schedule would, over the same short look-back window. It is safe to run repeatedly: every award is recorded once and once only, so a second run pays nobody twice and simply reports them as already paid.',
   });
@@ -945,6 +967,8 @@ Note: this task only runs automatically if the property "easyfixer.auto_reactiva
       return result;
     },
     tester: ({ sourceId }) => easyfixerReactivationCron.runTest({ sourceId }),
+    // Sends nothing to a typed number — this runs the job's real work for one row.
+    testKind: 'action',
     testSourceLabel: 'Easyfixer ID (efr_id)',
     testSourceHelp:
       'Required. Immediately reactivates THIS temporarily-inactive, verified technician (ignores the scheduled date) so you can verify the flow end-to-end.',
@@ -1008,6 +1032,8 @@ Note: this task only runs automatically if the property "easyfixer.status_drift_
       return result;
     },
     tester: ({ sourceId }) => easyfixerStatusDriftCron.runTest({ sourceId }),
+    // Sends nothing to a typed number — this runs the job's real work for one row.
+    testKind: 'action',
     testSourceLabel: 'Easyfixer ID (efr_id)',
     testSourceHelp:
       'Required. Immediately reconciles THIS technician\'s lifecycle status with the legacy CRM flag, so a reported mismatch can be fixed and verified without waiting for tonight\'s run.',
@@ -1338,6 +1364,8 @@ Note: this runs automatically unless the property "plivo.conference.reaper.enabl
       return r;
     },
     tester: ({ sourceId }) => conferenceReaper.runTest({ sourceId }),
+    // Sends nothing to a typed number — this runs the job's real work for one row.
+    testKind: 'action',
     testSourceLabel: 'Conference ID (tbl_job_conference.id) — optional',
     testSourceHelp:
       'Leave BLANK for a dry run (reports what would be ended, changes nothing). Enter a conference ID to force-end that conference immediately — this really does hang up a live call, and is the only way to verify the provider teardown works.',
@@ -1464,6 +1492,7 @@ function getJobs() {
     testable: !!j.tester,
     testSourceLabel: j.testSourceLabel,
     testSourceHelp: j.testSourceHelp,
+    testKind: j.testKind,
     lastTestAt: j.lastTestAt || null,
     lastTestDurationMs: j.lastTestDurationMs ?? null,
     lastTestResult: j.lastTestResult ?? null,
@@ -1516,6 +1545,24 @@ async function testJob(id, opts) {
   }
   if (typeof job.tester !== 'function') {
     const err = new Error(`Job "${id}" does not support test sends.`);
+    err.status = 400;
+    throw err;
+  }
+  /*
+   * Shape check lives HERE, not in the route's Joi body, because only the
+   * resolved job knows what its test needs. The body schema cannot: it is one
+   * schema for every job, which is exactly how `mobile` came to be required
+   * for six jobs that ignore it.
+   */
+  const input = opts || {};
+  if (job.testKind === 'message' && !String(input.mobile || '').trim()) {
+    const err = new Error('A mobile number is required — this test sends a message to it.');
+    err.status = 400;
+    throw err;
+  }
+  if (job.testKind === 'action' && job.testSourceLabel
+      && (input.sourceId == null || input.sourceId === '')) {
+    const err = new Error(`${job.testSourceLabel} is required — this test runs the job for that one row.`);
     err.status = 400;
     throw err;
   }
