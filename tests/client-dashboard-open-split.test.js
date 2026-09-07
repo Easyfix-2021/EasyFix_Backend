@@ -171,17 +171,31 @@ test('the count comes from the comment history, NOT the call_later flag', async 
 test('DISTINCT dates — three calls in ONE day must not qualify', async () => {
   await call('/dashboard-summary');
   const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
-  assert.match(q.sql, /DISTINCT[\s\S]*DATE\(c\.created_on\)/,
-    'collapsing several calls on one day to one date is what excludes the one-afternoon case');
-  assert.match(q.sql, /COUNT\(DISTINCT b\.d\) >= 3/,
+  // The invariant, not the spelling: several calls in one afternoon collapse to
+  // a single date. This assertion used to name the self-join's `b.d` alias and
+  // broke when the join went away, even though the guarantee never changed —
+  // so it now matches the COUNT DISTINCT over a DATE, however it is aliased.
+  assert.match(q.sql, /COUNT\(DISTINCT\s+(?:\w+\.)?(?:d\b|DATE\(c\.created_on\))\)\s*>=\s*3/,
     'three distinct DATES, not three rows');
 });
 
-test('the three-day SPAN is enforced, so three dates months apart do not qualify', async () => {
+test('THREE DISTINCT DAYS, with no rolling-window restriction', async () => {
+  /*
+   * CHANGED 2026-09-07, deliberately. This used to require the three dates to
+   * fall inside a rolling three-day span, which is stricter than the rule ops
+   * stated ("called on 3 days, at least once each day") and strictly so: a
+   * customer unreachable on Monday, Wednesday and the following Tuesday met the
+   * rule and failed the span. Measured on the open book the span version
+   * surfaced ONE job, which is why this tile looked broken.
+   *
+   * The assertion is the absence of the window, because that is the whole
+   * change; the DISTINCT-days guarantee is pinned by the test above.
+   */
   await call('/dashboard-summary');
   const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
-  assert.match(q.sql, /BETWEEN a\.d AND DATE_ADD\(a\.d, INTERVAL 2 DAY\)/,
-    'an anchor date plus two — three consecutive days, not any three dates ever');
+  assert.doesNotMatch(q.sql, /INTERVAL 2 DAY/,
+    'no rolling window — any three distinct days qualify');
+  assert.doesNotMatch(q.sql, /BETWEEN a\.d AND/, 'and the self-join it needed is gone');
 });
 
 test('only OPEN jobs count — a closed job is not still unreachable', async () => {

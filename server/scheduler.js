@@ -631,6 +631,53 @@ Note: this task only runs if BOTH properties "job.offer.loud_alert.enabled" AND 
     logger.info('Job-offer reminder cron registered (both loud-alert + reminder flags true, every 2 min IST).');
   }
 
+  // ─── Auto-unreachable sweep — hourly ─────────────────────────────────
+  // (Added 2026-09-07) Turns "we called on three separate days and never got
+  // through" into the same Unreachable outcome an operator writes by hand, so a
+  // job stops waiting on ops and starts waiting on the client. DEFAULT-OFF: it
+  // WRITES job history and surfaces a claim to the client about their own
+  // customer, so ops enables it deliberately.
+  const autoUnreachableCron = require('../services/auto-unreachable-cron');
+  const autoUnreachableJob = registerJob({
+    id: 'auto-unreachable',
+    name: 'Auto-Mark Unreachable After 3 Days',
+    description:
+`What this task does: When our team phones a customer and cannot get through, an operator can press "Unreachable" on the Confirm & Schedule screen. That marks the job as waiting on the client. But if nobody presses the button, a job can sit with ops for weeks while calls go unanswered. This task does it automatically. Step by step:
+  1. Once an hour, the task wakes up automatically.
+  2. It looks at the call log for every job that is still open.
+  3. It counts the SEPARATE DAYS on which we called the customer and the customer's phone rang without connecting — no answer, busy, or the call failed at their end.
+  4. Calls the customer ANSWERED do not count. Neither do calls whose outcome our phone system never recorded — if we cannot prove the call failed, it is not counted.
+  5. If a job reaches THREE separate such days, the task writes the same Unreachable note an operator would have written, and the job moves to "Pending Action from Client".
+  6. It never marks the same job twice, and it never overrides a note an operator wrote by hand.
+
+Why this matters: a job nobody can reach the customer for is not ops's problem to keep chasing — it needs the client to give a better number or a new slot. Today that only happens if someone remembers to press a button, and on the open book exactly one job has ever reached three operator-marked days.
+
+Note: this task only runs if the property "job.auto_unreachable.enabled" is "true" in easyfix_properties. It is checked at server start (so a restart is needed after changing it) AND again on every run — so while it is off, even Trigger Now does nothing.`,
+    cron: '15 * * * *',
+    runner: async () => {
+      const result = await autoUnreachableCron.runAutoUnreachable();
+      logger.info(
+        `Auto-unreachable sweep · eligible=${result.eligible} · marked=${result.marked}`
+        + (result.skipped ? ` (skipped: ${result.reason})` : ''),
+      );
+      return result;
+    },
+  });
+  if (cronDisabled) {
+    autoUnreachableJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!autoUnreachableCron.autoUnreachableEnabled()) {
+    autoUnreachableJob.skipReason = "property 'job.auto_unreachable.enabled' was not 'true' at server start — set it to 'true' and restart the server to enable";
+    logger.info("Auto-unreachable sweep SKIPPED — set job.auto_unreachable.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    autoUnreachableJob.task = cron.schedule(
+      autoUnreachableJob.cron,
+      () => invokeJob(autoUnreachableJob, 'cron'),
+      { timezone: TZ },
+    );
+    autoUnreachableJob.registered = true;
+    logger.info('Auto-unreachable sweep registered (job.auto_unreachable.enabled=true, hourly at :15 IST).');
+  }
+
   // ─── Call-recording backfill — every 15 min ──────────────────────────
   // (Added 2026-07-10) The Plivo PUSH recording callback (<Dial
   // recordingCallbackUrl>) has proven unreliable — tbl_plivo_call_log.recording_url
