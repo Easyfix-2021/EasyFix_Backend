@@ -166,14 +166,44 @@ router.get('/:id/selfie-url',
       );
       if (!doc) return modernOk(res, { selfieId, url: null });
 
-      // S3 key lives in `path`; presign on read. Fall back to a legacy stored url.
+      /*
+       * S3 key lives in `path`; presign on read. Fall back to a legacy url.
+       *
+       * The existence CHECK is the fix (2026-09-09). Presigning is a local
+       * signing operation — it never contacts S3 — so it succeeds for a key
+       * that does not exist, `url` came back non-null, and the documented
+       * "fall back to a legacy stored url" below could never run. The endpoint
+       * logged `has=true`, returned 200, and the browser got a URL that 404s.
+       * A success that cannot fail is not a resolution.
+       *
+       * One HEAD per selfie view, only when a key is present, and only on this
+       * endpoint — it is opened by a human looking at one job, not in a list.
+       * A HEAD that throws is treated as "unknown, keep the presign" rather
+       * than as absent, so an IAM or network fault degrades to today's
+       * behaviour instead of hiding a selfie that is really there.
+       */
       const key = String(doc.path || '').trim();
       let url = null;
       if (key && s3Storage.isEnabled()) {
-        try { url = await s3Storage.getPresignedUrl(key); }
-        catch (e) { logger.warn('Selfie presign failed · jobId=' + req.params.id + ' · ' + e.message); }
+        let present = true;
+        try { present = await s3Storage.exists(key); }
+        catch (e) {
+          logger.warn('Selfie existence check failed, assuming present · jobId=' + req.params.id + ' · ' + e.message);
+        }
+        if (present) {
+          try { url = await s3Storage.getPresignedUrl(key); }
+          catch (e) { logger.warn('Selfie presign failed · jobId=' + req.params.id + ' · ' + e.message); }
+        } else {
+          logger.info('Selfie key absent in S3, falling back to the stored url · jobId=' + req.params.id);
+        }
       }
-      if (!url && doc.url) url = doc.url;
+      // Legacy rows store an absolute URL on the old file host. Upgrade http →
+      // https: the CRM is served over https and a browser blocks an http image
+      // on an https page, so an un-upgraded fallback would swap one invisible
+      // image for another.
+      if (!url && doc.url) {
+        url = String(doc.url).replace(/^http:\/\//i, 'https://');
+      }
       logger.info('Resolved selfie url · jobId=' + req.params.id + ' · has=' + !!url);
       modernOk(res, { selfieId, url });
     } catch (e) {
@@ -3045,6 +3075,50 @@ router.get('/images/:imageId/file', async (req, res, next) => {
           return res.sendFile(candidate);
         }
       }
+    }
+
+    /*
+     * (2.5) The stored value is ITSELF an absolute URL on a host we own.
+     *
+     * Found 2026-09-09 from the Production log for job 538390: ten images and
+     * a feedback PDF, all uploaded that afternoon, all 404. Every row held
+     *   http://core.easyfix.in/easydoc/upload_jobs/538390_checkin_<stamp>.jpg
+     * — a full URL written by the legacy service, which this resolver had no
+     * branch for. S3 missed, local disk missed, and branch (3) below could
+     * never fire either: it PREPENDS FILE_BASE_URL to `stored`, so an already
+     * absolute value would have produced `https://base/http://core...`.
+     * Setting FILE_BASE_URL — the obvious ops fix — would not have worked.
+     *
+     * The file is there. Measured: GET https://core.easyfix.in/easydoc/... →
+     * 200, 66 kB, image/jpeg. Only the resolution was missing.
+     *
+     * HTTPS-UPGRADED. The rows store `http://`, the CRM is served over https,
+     * and a browser blocks an http image on an https page — the redirect would
+     * "work" and the image would still not appear. The host 301s http→https
+     * anyway, so upgrading costs nothing and removes a hop.
+     *
+     * HOST-ALLOWLISTED. This redirects the browser to a URL taken from a
+     * database column; without a check that is an open redirect. The column is
+     * written by our own services, but "trusted writer" is an assumption about
+     * today. LEGACY_FILE_HOSTS keeps it an assertion.
+     */
+    const LEGACY_FILE_HOSTS = (process.env.LEGACY_FILE_HOSTS || 'core.easyfix.in')
+      .split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+    if (/^https?:\/\//i.test(stored)) {
+      let parsed = null;
+      try { parsed = new URL(stored); } catch { parsed = null; }
+      if (parsed && LEGACY_FILE_HOSTS.includes(parsed.hostname.toLowerCase())) {
+        parsed.protocol = 'https:';
+        uploadLogger.info(
+          { imageId, jobId: row.job_id, host: parsed.hostname },
+          'job image served from the legacy file host',
+        );
+        return res.redirect(parsed.toString());
+      }
+      uploadLogger.warn(
+        { imageId, jobId: row.job_id, stored, host: parsed && parsed.hostname },
+        'job image stores an absolute URL on a host that is NOT allowlisted — refusing to redirect',
+      );
     }
 
     // (3) Absolute FILE_BASE_URL (prod Nginx) — only redirect when the
