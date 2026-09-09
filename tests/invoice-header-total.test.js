@@ -95,33 +95,52 @@ test('COALESCE around the SUM is WORSE than the bug — 225 short, not 75', () =
 });
 
 test('the query keeps its COALESCE per column, not around the SUM', () => {
-  const sql = code(FINANCE);
+  /*
+   * Now asserted against the MODULE that owns the expression. finance.js
+   * interpolates it, so pinning the literal here would pin the interpolation
+   * rather than the rule.
+   */
+  const mod = code(fs.readFileSync(path.join(__dirname, '..', 'services/job-line-total.js'), 'utf8'));
   assert.match(
-    sql,
-    /COALESCE\(js\.total_charge, 0\) \* COALESCE\(js\.quantity, 1\)\s*\+ COALESCE\(js\.material_charge, 0\)/,
+    mod,
+    /COALESCE\(\$\{a\}\.total_charge, 0\) \* COALESCE\(\$\{a\}\.quantity, 1\) \+ COALESCE\(\$\{a\}\.material_charge, 0\)/,
     'each column must be defaulted before the arithmetic',
   );
+  const sql = code(FINANCE);
   assert.ok(
     !/SUM\(js\.total_charge \* js\.quantity\)/.test(sql),
     'the original material-dropping sum must be gone',
   );
 });
 
-test('the printed line and the header still describe the same arithmetic', () => {
+test('the printed line and the header now share ONE definition', () => {
   /*
-   * The two live 70 lines apart in one file and are joined by nothing but
-   * intent. If either is edited alone they diverge again, silently — which is
-   * how this started.
+   * This guard fired on its own refactor, which is what it was for.
+   *
+   * It used to pin the literal `line_total: charge * qty + mat` beside the
+   * header's COALESCE — two hand-written formulas 70 lines apart, joined by
+   * nothing but intent. Both are now gone: the line build reads `s.line_total`
+   * straight from services/job-line-total.js, and the header sums that module's
+   * LINE_TOTAL_SQL. So the assertion moves UP a level — not "do the two copies
+   * still agree", but "is there still only one".
+   *
+   * Keeping the old assertion would have meant reintroducing the second copy to
+   * satisfy a test written to stop exactly that.
    */
   const sql = code(FINANCE);
   assert.match(
     sql,
-    /line_total: charge \* qty \+ mat,/,
-    'the line build must still be charge x qty + material',
+    /line_total: s\.line_total,/,
+    'the printed line must take its total from the shared helper, not recompute it',
+  );
+  assert.ok(
+    !/line_total: charge \* qty \+ mat/.test(sql),
+    'a second hand-written copy of the formula must not reappear here',
   );
   assert.match(
     sql,
-    /COALESCE\(js\.material_charge, 0\)/,
-    'and the header must still include material',
+    /estimateLinesForJobs/,
+    'and the lines must come from the shared reader, which also applies the '
+    + 'soft-deleted-services policy',
   );
 });

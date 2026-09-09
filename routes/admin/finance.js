@@ -133,21 +133,15 @@ async function loadInvoiceArtifactData(invoiceId) {
   const jobIds = jobs.map((j) => j.job_id);
   const servicesByJob = new Map();
   if (jobIds.length > 0) {
-    const placeholders = jobIds.map(() => '?').join(',');
-    const [svcRows] = await pool.query(
-      `SELECT js.job_id, js.quantity, js.total_charge, js.material_charge,
-              CR.crc_ratecard_name AS service_name
-         FROM tbl_job_services js
-         LEFT JOIN tbl_client_service   CS ON CS.client_service_id = js.service_id
-         LEFT JOIN tbl_client_rate_card CR ON CR.crc_id = CS.rate_card_id
-        WHERE js.job_id IN (${placeholders})
-        ORDER BY js.job_id, js.job_service_id`,
-      jobIds
-    );
-    for (const s of svcRows) {
-      if (!servicesByJob.has(s.job_id)) servicesByJob.set(s.job_id, []);
-      servicesByJob.get(s.job_id).push(s);
-    }
+    /*
+     * One query for every job on the invoice — see services/job-line-total.js.
+     * It also carries the soft-delete policy: this query used to have no
+     * job_service_status filter, so invoices billed for services ops had
+     * REMOVED. Every other reader in the backend already excluded them.
+     */
+    const { estimateLinesForJobs } = require('../../services/job-line-total');
+    const byJob = await estimateLinesForJobs(jobIds);
+    for (const [jobId, { lines: jobLines }] of byJob) servicesByJob.set(jobId, jobLines);
   }
 
   const lines = [];
@@ -162,6 +156,7 @@ async function loadInvoiceArtifactData(invoiceId) {
       });
     } else {
       for (const s of svcs) {
+        // Values come from the shared helper; nothing is recomputed here.
         const qty = Number(s.quantity || 1);
         const charge = Number(s.total_charge || 0);
         const mat = Number(s.material_charge || 0);
@@ -170,7 +165,7 @@ async function loadInvoiceArtifactData(invoiceId) {
           customer: j.customer_name, mobile: j.customer_mob_no, city: j.city_name,
           completed_on: j.checkout_date_time,
           service: s.service_name || '—', quantity: qty,
-          unit_charge: charge, material: mat, line_total: charge * qty + mat,
+          unit_charge: charge, material: mat, line_total: s.line_total,
         });
       }
     }
@@ -257,13 +252,24 @@ router.post('/invoices/generate', validate(Joi.object({
      * whole line rather than the missing term, converting an under-count into
      * a much larger one.
      */
+    const { LINE_TOTAL_SQL, ACTIVE_SERVICES_SQL } = require('../../services/job-line-total');
+    /*
+     * The expression is INTERPOLATED, not copied. This aggregates across a date
+     * range rather than a job-id list, so it has to stay SQL — which is exactly
+     * why job-line-total.js exports the expression as well as the JS function.
+     * A literal copy here is what the header/lines divergence was.
+     *
+     * The active-rows predicate comes from the same module, so the header counts
+     * precisely the rows estimateLinesForJobs() prints. Soft-deleted services
+     * are excluded from BOTH now; this query used to have no such filter at all,
+     * and billed clients for services ops had removed.
+     */
     const [[sum]] = await pool.query(
-      `SELECT COALESCE(SUM(
-                COALESCE(js.total_charge, 0) * COALESCE(js.quantity, 1)
-                + COALESCE(js.material_charge, 0)
-              ), 0) AS total,
+      `SELECT COALESCE(SUM(${LINE_TOTAL_SQL('js')}), 0) AS total,
               COUNT(DISTINCT j.job_id) AS jobCount
-         FROM tbl_job j LEFT JOIN tbl_job_services js ON js.job_id = j.job_id
+         FROM tbl_job j
+         LEFT JOIN tbl_job_services js
+                ON js.job_id = j.job_id AND ${ACTIVE_SERVICES_SQL('js')}
         WHERE j.fk_client_id = ? AND j.job_status IN (3,5)
           AND j.checkout_date_time BETWEEN ? AND ?`,
       [clientId, from, to]);

@@ -282,13 +282,28 @@ const jobsRouteSrc = fs.readFileSync(
   path.join(__dirname, '..', 'routes', 'admin', 'jobs.js'), 'utf8',
 );
 
-// Slice just the sendEstimateEmail SELECT (up to the services query that follows).
+/*
+ * Slice sendEstimateEmail's FIRST SQL literal — the customer SELECT this file
+ * is about.
+ *
+ * It used to slice "up to `const [services]`", the query that happened to come
+ * next. That is scaffolding, not subject: when the services query was replaced
+ * by a call to services/job-line-total.js on 2026-09-09, four tests in this
+ * file went red for a reason that had nothing to do with customer names.
+ *
+ * Anchored on the function's own first template literal instead, so it is
+ * bounded by the thing it returns rather than by whatever follows it.
+ */
 function estimateEmailSql() {
   const start = jobsRouteSrc.indexOf('async function sendEstimateEmail');
   assert.notEqual(start, -1, 'sendEstimateEmail must still exist in routes/admin/jobs.js');
-  const end = jobsRouteSrc.indexOf('const [services]', start);
-  assert.notEqual(end, -1, 'the services query must still follow it');
-  return jobsRouteSrc.slice(start, end);
+  const open = jobsRouteSrc.indexOf('`', start);
+  assert.notEqual(open, -1, 'sendEstimateEmail must still carry a SQL template literal');
+  const close = jobsRouteSrc.indexOf('`', open + 1);
+  assert.notEqual(close, -1, 'that literal must be closed');
+  const sql = jobsRouteSrc.slice(open + 1, close);
+  assert.match(sql, /SELECT/i, 'the first literal in sendEstimateEmail must be its SELECT');
+  return sql;
 }
 
 test('estimate email: the job customer name uses the NULLIF/TRIM form and behaves', () => {

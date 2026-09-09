@@ -1977,21 +1977,12 @@ router.get('/:id/estimate/preview', validate(idParam, 'params'), scopedJob, asyn
   try {
     const jobId = Number(req.params.id);
     logger.info('Preview estimate · jobId=' + jobId);
-    const [services] = await pool.query(
-      `SELECT js.job_service_id, js.quantity, js.total_charge, js.material_charge,
-              CR.crc_ratecard_name AS service_name
-         FROM tbl_job_services js
-         LEFT JOIN tbl_client_service   CS ON CS.client_service_id = js.service_id
-         LEFT JOIN tbl_client_rate_card CR ON CR.crc_id = CS.rate_card_id
-        WHERE js.job_id = ? AND js.job_service_status = 1
-        ORDER BY js.job_service_id`,
-      [jobId]
-    );
-    const lines = services.map((s) => ({
-      ...s,
-      line_total: Number(s.total_charge || 0) * Number(s.quantity || 1) + Number(s.material_charge || 0),
-    }));
-    const grand_total = lines.reduce((sum, l) => sum + l.line_total, 0);
+    // One definition of what a job's services are worth — see
+    // services/job-line-total.js. This formula used to be written out here and
+    // in six other places, in three variants that disagreed.
+    const { estimateLinesForJob } = require('../../services/job-line-total');
+    const { lines, totals } = await estimateLinesForJob(jobId);
+    const grand_total = totals.grand_total;
     logger.info('Returning estimate preview · jobId=' + jobId + ' services=' + lines.length + ' grandTotal=' + grand_total);
     modernOk(res, { job_id: jobId, services: lines, grand_total });
   } catch (e) { next(e); }
@@ -2349,19 +2340,17 @@ async function sendEstimateEmail(jobId, userId) {
     logger.warn('Estimate email skipped — job not found · jobId=' + jobId);
     return;
   }
-  const [services] = await pool.query(
-    `SELECT js.quantity, js.total_charge, js.material_charge,
-            CR.crc_ratecard_name AS service_name
-       FROM tbl_job_services js
-       LEFT JOIN tbl_client_service   CS ON CS.client_service_id = js.service_id
-       LEFT JOIN tbl_client_rate_card CR ON CR.crc_id = CS.rate_card_id
-      WHERE js.job_id = ? AND js.job_service_status = 1`,
-    [jobId]
-  );
+  /*
+   * Same helper the preview above uses, and deliberately so: the client
+   * compares the email against the portal, and until today they were two
+   * hand-written copies of one formula that nothing kept in step.
+   */
+  const { estimateLinesForJob } = require('../../services/job-line-total');
+  const { lines: services, totals } = await estimateLinesForJob(jobId);
 
-  const total = services.reduce((s, x) => s + Number(x.total_charge || 0) * Number(x.quantity || 1) + Number(x.material_charge || 0), 0);
+  const total = totals.grand_total;
   const lineBlock = services
-    .map((s) => `  ${s.service_name || '—'} × ${s.quantity}  =  ${(Number(s.total_charge || 0) * Number(s.quantity || 1) + Number(s.material_charge || 0)).toFixed(2)}`)
+    .map((s) => `  ${s.service_name || '—'} × ${s.quantity}  =  ${s.line_total.toFixed(2)}`)
     .join('\n');
 
   // Recipient resolution mirrors legacy `confirmApprovejob`:
@@ -2568,21 +2557,27 @@ router.post('/:id/resend-customer-pin',
         );
       }
 
-      // Reuse: the service owns the customer-mobile lookup, the DLT template
-      // (job_stage='CHECK_IN') with its inline-text fallback, and the 422s for
-      // "no mobile on file" / "no PIN minted". Its e.status flows through
-      // middleware/error-handler as a real 4xx with its own message.
-      await mobileLifecycle.sendCheckinSms(jobId, efrId);
+      // Reuse: the service owns the customer-mobile lookup, the WhatsApp
+      // template with its SMS fallback, and the 422s for "no mobile on file" /
+      // "no PIN minted". Its e.status flows through middleware/error-handler as
+      // a real 4xx with its own message.
+      const outcome = await mobileLifecycle.sendCheckinSms(jobId, efrId);
 
       /*
-       * "Triggered", not "delivered" — and the wording is deliberate.
-       * sendCheckinSms() awaits smsService.send() and DISCARDS its result, so
-       * it returns { sent: true } even when the provider rejected the message
-       * or NOTIFICATIONS_DISABLE short-circuited it. This route cannot see
-       * that from the outside and must not assert a delivery it never
-       * observed (the magic-link route learned the same lesson the loud way).
-       * Fixing it means threading `delivered` out of the service, which lives
-       * in a file this change does not own — reported, not patched.
+       * NOW IT REPORTS WHAT ACTUALLY HAPPENED.
+       *
+       * The note that stood here said this route could not tell delivery from
+       * dispatch, because sendCheckinSms() discarded smsService.send()'s
+       * result and returned { sent: true } either way — and it closed with
+       * "fixing it means threading `delivered` out of the service, which lives
+       * in a file this change does not own — reported, not patched".
+       *
+       * It is patched now. That service returns { sent, channel, delivered },
+       * so ops sees which channel carried the PIN and whether the provider
+       * accepted it. That matters more than it used to: every one of these was
+       * being REJECTED by DLT while this endpoint answered "triggered", which
+       * is precisely how a technician ended up unable to close a job with the
+       * CRM insisting the PIN had gone out.
        */
       /*
        * Into JOB HISTORY, not just the application log. The line above is
@@ -2601,8 +2596,17 @@ router.post('/:id/resend-customer-pin',
         logger.warn('PIN re-send history row failed (non-fatal) · jobId=' + jobId + ' · ' + le.message);
       }
 
-      logger.info('Customer PIN re-send dispatched · jobId=' + jobId);
-      return modernOk(res, { sent: true }, 'PIN re-send triggered');
+      logger.info(
+        'Customer PIN re-send dispatched · jobId=' + jobId
+        + ' · channel=' + outcome.channel + ' · delivered=' + Boolean(outcome.delivered),
+      );
+      return modernOk(
+        res,
+        { sent: Boolean(outcome.sent), channel: outcome.channel, delivered: Boolean(outcome.delivered) },
+        outcome.delivered
+          ? `PIN re-sent on ${outcome.channel === 'whatsapp' ? 'WhatsApp' : 'SMS'}`
+          : 'PIN re-send attempted, but the provider did not accept it — check the number and try again',
+      );
     } catch (e) {
       logger.warn('Re-send customer PIN failed · jobId=' + req.params.id + ' · ' + e.message);
       return next(e);
