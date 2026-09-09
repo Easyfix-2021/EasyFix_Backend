@@ -6,13 +6,35 @@ const logger = require('./logger');
  *
  * Why these knobs matter:
  *   connectionLimit  — hard ceiling on open sockets to MySQL. Too low = client queues;
- *                      too high = MySQL's own `max_connections` rejects. Bumped 20 → 30
- *                      because this one process serves BOTH the CRM and the EasyFixer app
- *                      off the same pool, and a single dashboard load fans out ~15 parallel
- *                      queries (Promise.all in mobile-dashboard.service.js); at 20, two
- *                      concurrent dashboard loads alone could saturate the pool and queue
- *                      everything else. 30 gives headroom without approaching MySQL's
- *                      `max_connections`. Scale horizontally before raising further.
+ *                      too high = MySQL's own `max_connections` rejects. 20 → 30 → 100.
+ *
+ *                      THIS DEFAULT IS A FALLBACK, NOT WHAT PRODUCTION RUNS. The host
+ *                      env (`/opt/easyfix/backend.env`) sets DB_CONNECTION_LIMIT and
+ *                      wins; on 2026-09-09 `GET /api/health/db` reported limit 50 /
+ *                      queueMax 100 there while this file said 30 and .env.example said
+ *                      20. All three disagreed and every reader quoted the wrong one.
+ *                      Ask the running process, never this line:
+ *                        curl -s https://backend.easyfix.in/api/health/db
+ *
+ *                      Raised to 100 so a NEW environment — QA, local, the next
+ *                      container — starts with headroom rather than silently running a
+ *                      smaller pool than production. The budget against the server's
+ *                      max_connections = 1000 (measured 2026-09-09):
+ *                        EasyFix_Backend (this, 1 container)      50 live
+ *                        EasyFix_API      (Dropwizard, default)  100
+ *                        API_AngularClientDashboard (Hikari)      50
+ *                        ACD_APIs         (Hikari default)        10
+ *                        Webhook_2023     (2 × Sequelize max 15)  30
+ *                        legacy CRM Tomcat JNDI                    ? (not in any repo)
+ *                      = 240 known of 1000. Even doubling every Java service reaches
+ *                      450, so headroom is not the constraint here.
+ *
+ *                      AND RAISING THIS DOES NOT BUY THROUGHPUT ON ITS OWN. Production
+ *                      has `enqueued: 0` over 10,377 lifetime acquires — no request has
+ *                      ever waited for a connection. The real ceiling is query fan-out:
+ *                      Schedule & Assign takes ~16 acquires per open, so 50/16 ≈ 3
+ *                      concurrent opens saturate regardless of the number. Fix the
+ *                      fan-out (see the ranking bulkhead) before buying connections.
  *   queueLimit       — how many pending acquires we hold in memory before failing fast.
  *                      Unbounded (0) lets a traffic spike pile up requests that will
  *                      eventually time-out anyway; we prefer quick "pool saturated".
@@ -31,6 +53,15 @@ const logger = require('./logger');
  *                      don't remove (otp_details.is_expired, tbl_user.is_*, efr_status…).
  */
 
+/*
+ * ONE definition per knob, in db-pool-config.js. These were repeated as inline
+ * `|| '30'` / `|| '50'` fallbacks at four call sites here plus a fifth in the
+ * bulkhead test; raising the pool without finding all of them left the
+ * saturation classifier judging a 150-deep queue against a limit of 50. A
+ * default written down more than once is a default that will drift.
+ */
+const { poolLimit, poolQueueMax } = require('./db-pool-config');
+
 const pool = mysql.createPool({
   host:     process.env.DB_HOST || 'localhost',
   port:     parseInt(process.env.DB_PORT || '3306', 10),
@@ -38,9 +69,12 @@ const pool = mysql.createPool({
   user:     process.env.DB_USER,
   password: process.env.DB_PASSWORD,
 
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10),
-  queueLimit:      parseInt(process.env.DB_QUEUE_LIMIT      || '50', 10),
-  maxIdle:         parseInt(process.env.DB_MAX_IDLE         || '10', 10),
+  connectionLimit: poolLimit(),
+  queueLimit:      poolQueueMax(),
+  // maxIdle stays well under connectionLimit: the limit is a CEILING for bursts,
+  // while this is how many sockets we hold open when quiet. Raising the ceiling
+  // should not raise the resting footprint.
+  maxIdle:         parseInt(process.env.DB_MAX_IDLE         || '20', 10),
   idleTimeout:     parseInt(process.env.DB_IDLE_TIMEOUT     || '60000', 10),
   connectTimeout:  parseInt(process.env.DB_CONNECT_TIMEOUT  || '30000', 10),
 
@@ -129,8 +163,8 @@ function classifySaturation(live, limit, queueMax) {
 function poolSaturation() {
   return classifySaturation(
     readLiveGauges(),
-    parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10),
-    parseInt(process.env.DB_QUEUE_LIMIT || '50', 10),
+    poolLimit(),
+    poolQueueMax(),
   );
 }
 
@@ -159,8 +193,8 @@ pool.on('enqueue',    () => {
   if (now - lastEnqueueLogAt < ENQUEUE_LOG_WINDOW_MS) return;
   lastEnqueueLogAt = now;
   const s = poolSaturation();
-  const limit = parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10);
-  const queueMax = parseInt(process.env.DB_QUEUE_LIMIT || '50', 10);
+  const limit = poolLimit();
+  const queueMax = poolQueueMax();
   const detail = s.status === 'unknown'
     ? '(live depth unavailable)'
     : `inUse=${s.inUse}/${limit} queued=${s.queued}/${queueMax}`;
@@ -172,8 +206,8 @@ pool.on('enqueue',    () => {
 });
 
 function getPoolStats() {
-  const limit    = parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10);
-  const queueMax = parseInt(process.env.DB_QUEUE_LIMIT      || '50', 10);
+  const limit    = poolLimit();
+  const queueMax = poolQueueMax();
   const live     = readLiveGauges();
   return {
     limit,
@@ -208,4 +242,4 @@ async function closePool() {
   logger.db('Database connection pool closed');
 }
 
-module.exports = { pool, testConnection, closePool, getPoolStats, poolSaturation, _readLiveGauges: readLiveGauges, _classifySaturation: classifySaturation };
+module.exports = { pool, testConnection, closePool, getPoolStats, poolSaturation, _readLiveGauges: readLiveGauges, _classifySaturation: classifySaturation, _poolLimit: poolLimit, _poolQueueMax: poolQueueMax };

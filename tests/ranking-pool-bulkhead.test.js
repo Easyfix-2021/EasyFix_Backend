@@ -83,7 +83,14 @@ async function burst(n) {
 }
 
 test('the cap sits BELOW connectionLimit, or it protects nothing', () => {
-  const poolLimit = parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10);
+  // Read the limit the POOL will actually use, not a second copy of the
+  // default. With its own `|| '30'` this assertion silently judged the cap
+  // against a number db.js had moved past — and it is stricter-than-reality in
+  // the safe direction, so it would never have complained.
+  // db-pool-config, NOT ../db: this file replaces ../db in require.cache with a
+  // fake pool, so anything db.js exports is invisible here. Reading the shared
+  // config module is what stops this assertion drifting away from the real one.
+  const poolLimit = require('../db-pool-config').poolLimit();
   assert.ok(CAP >= 1, 'a cap of 0 would deadlock every ranking request');
   assert.ok(
     CAP < poolLimit,
