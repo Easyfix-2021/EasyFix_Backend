@@ -102,8 +102,29 @@ function crudFactory(table, pk, nameCol, statusCol, allowedCols, fieldSchemas) {
   return r;
 }
 
-router.use('/cities',              crudFactory('tbl_city',          'city_id',         'city_name',         'city_status',         ['city_name', 'state_id', 'city_status', 'tier', 'district', 'reference_pincode', 'tat_days'],
-  { city_name: str.max(100), state_id: int, city_status: bit, tier: int.min(0), district: str, reference_pincode: Joi.string().trim().pattern(/^\d{6}$/), tat_days: int.min(0) }));
+/*
+ * tbl_city is NOT served by crudFactory. Removed 2026-09-09.
+ *
+ * It used to be, and that mount was a second, weaker way to write the city
+ * master. crudFactory is deliberately generic: no per-action permission (this
+ * file inherits only requireAuth + role(['admin']), so all ten admin-group
+ * roles reached it regardless of Manage Role), no duplicate-name check, and a
+ * blind `city_status` column write. Against tbl_city specifically that meant:
+ *
+ *   POST   created a city ACTIVE, skipping the approval queue entirely
+ *   PUT    could flip a PENDING city 2 → 1, bypassing approveCity, leaving
+ *          approved_by / approved_at / approval_decision NULL — an approved
+ *          city with no record of who approved it
+ *   DELETE retired a city to 0 with no merge and no merged_into_city_id, the
+ *          exact orphaned state the reject flow exists to prevent
+ *
+ * Every one of those operations already exists on /api/admin/cities, gated on
+ * isCityAddNew / isCityEdit / isCityApprove, with the dedup check and the
+ * approval semantics. Nothing in this repo or in CRM_UI called the settings
+ * variant. If some caller turns up, point it at /api/admin/cities rather than
+ * reinstating this — a generic CRUD factory cannot express "rejecting is a
+ * merge".
+ */
 router.use('/states',              crudFactory('tbl_state',         'state_id',        'state_name',         null,                  ['state_name', 'state_code', 'country_id'],
   { state_name: str.max(100), state_code: str.max(10), country_id: int }));
 router.use('/service-categories',  crudFactory('tbl_service_catg',  'service_catg_id', 'service_catg_name', 'service_catg_status', ['service_catg_name', 'service_catg_desc', 'service_catg_status'],

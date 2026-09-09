@@ -684,6 +684,73 @@ async function hasPincodeCreatorCol() {
 // city INHERITS a zonal manager (state_user) from the same district/state so
 // it isn't orphaned from zonal-scoped reporting. Creator audit: a new city
 // records created_by (efr_id when a technician minted it, else the CRM user_id)
+/*
+ * Are the approval-audit columns present? Ships in
+ * migrations/2026-09-09-city-approval-flow.sql, so every environment that has
+ * not run it must behave exactly as before.
+ *
+ * A THROW IS NOT AN ANSWER. Only a successful probe is cached: a transient
+ * fault (pool exhausted, connection reset) must not be remembered as "the
+ * column is absent", which would silently disable forwarding for the life of
+ * the process. Same rule as services/city.service.js — the repo has a test for
+ * it (tests/schema-probe-failure-not-cached.test.js).
+ */
+let _hasCityApprovalCols = null;
+async function hasCityApprovalCols() {
+  if (_hasCityApprovalCols !== null) return _hasCityApprovalCols;
+  try {
+    const [r] = await pool.query("SHOW COLUMNS FROM tbl_city LIKE 'merged_into_city_id'");
+    _hasCityApprovalCols = r.length > 0;
+    return _hasCityApprovalCols;
+  } catch (e) {
+    logger.warn('Approval-column probe failed, not caching · ' + ((e && e.message) || e));
+    return false;
+  }
+}
+
+/*
+ * Follow a rejected city to the city that absorbed its rows.
+ *
+ * Rejecting a city MERGES it: every referencing row is repointed onto an
+ * operator-chosen replacement and merged_into_city_id records where they went.
+ * Until now nothing read that column, so the decision only cleaned up the past
+ * — a later booking for the same town either re-attached to the dead row (the
+ * exact-name lookups below carry no status filter) or, on a near-miss name,
+ * minted a fresh pending duplicate that came back to the queue forever.
+ * Reading the pointer is what makes the rejection a standing decision: "this
+ * town is not its own city, it is part of X".
+ *
+ * The target is returned WHATEVER its status. The one reachable awkward case
+ * is a replacement that was later deactivated, and returning it is still
+ * right: it is the city that actually holds this town's history, so one more
+ * row belongs with them. Minting a same-named duplicate instead would re-split
+ * exactly what the merge just joined.
+ *
+ * `seen` is a cycle guard rather than decoration. No path today can build a
+ * loop (reject requires PENDING and an ACTIVE replacement, and a city is
+ * pending only once), but this walk is now in the hot path of every automatic
+ * city resolution, and an unguarded pointer walk over operator-writable data
+ * is one bad backfill away from spinning.
+ */
+async function resolveMergedCity(cityId) {
+  let id = Number(cityId);
+  if (!Number.isInteger(id) || id <= 0) return cityId;
+  if (!(await hasCityApprovalCols())) return id;
+  const seen = new Set([id]);
+  for (let hop = 0; hop < 8; hop += 1) {
+    const [[row]] = await pool.query(
+      'SELECT merged_into_city_id FROM tbl_city WHERE city_id = ? LIMIT 1', [id]
+    );
+    const next = row && row.merged_into_city_id != null ? Number(row.merged_into_city_id) : null;
+    if (!next || seen.has(next)) return id;
+    seen.add(next);
+    logger.info('City ' + id + ' was rejected and merged · forwarding to city ' + next);
+    id = next;
+  }
+  logger.warn('Merge-pointer walk hit the hop limit · stopping at city ' + id);
+  return id;
+}
+
 // + created_by_type ('technician'|'user') + created_date — see hasCityCreatorCol.
 // (NOTE: the legacy `stateId` camelCase column is intentionally left NULL — it
 // holds inconsistent legacy values and NO CRM/QuickSight filter reads it; every
@@ -696,7 +763,16 @@ async function findOrCreateCityByName(cityName, stateId, { district = null, crea
     'SELECT city_id FROM tbl_city WHERE state_id = ? AND LOWER(TRIM(city_name)) = LOWER(?) LIMIT 1',
     [Number(stateId), name]
   );
-  if (existing) return { city_id: Number(existing.city_id), created: false };
+  /*
+   * Forwarded, because this lookup has NO city_status filter and so happily
+   * returns a city that was rejected and merged away. The fuzzy pass below
+   * needs no forwarding: it restricts to (1, 2, NULL), so a rejected city (0)
+   * can never come back from it — adding a call there would be a branch that
+   * cannot run.
+   */
+  if (existing) {
+    return { city_id: await resolveMergedCity(existing.city_id), created: false };
+  }
   const fuzzy = await fuzzyMatchCity(name, stateId, district);
   if (fuzzy) {
     logger.info('Fuzzy-matched city "' + name + '" → existing city_id=' + fuzzy + ' · state_id=' + stateId);
@@ -1250,7 +1326,33 @@ async function geocodeAndMatch(pincodeRaw) {
       'SELECT city_id, city_name, state_id FROM tbl_city WHERE state_id = ? AND LOWER(TRIM(city_name)) = LOWER(?) LIMIT 1',
       [matchedState.state_id, detail.city.trim()]
     );
-    if (crow) matchedCity = { city_id: Number(crow.city_id), city_name: crow.city_name, state_id: Number(crow.state_id) };
+    if (crow) {
+      /*
+       * SECOND unfiltered exact-name resolver. This one fires BEFORE
+       * findOrCreateCityByName in the ensurePincode flow, so forwarding only
+       * there would leave this path still binding new pincodes to a city that
+       * was rejected and merged away.
+       *
+       * The row is re-read when the pointer moves us, for state_id. The
+       * returned `city.name` is the GEOCODER's string, not this row's — so the
+       * name is not what is at stake here; the state is. rejectCity does not
+       * require the replacement to be in the same state, so a forwarded city
+       * can legitimately sit in a different one, and carrying the rejected
+       * city's state_id forward would file the new pincode under the wrong
+       * state.
+       */
+      const forwardedId = await resolveMergedCity(crow.city_id);
+      let row = crow;
+      if (forwardedId !== Number(crow.city_id)) {
+        const [[target]] = await pool.query(
+          'SELECT city_id, city_name, state_id FROM tbl_city WHERE city_id = ? LIMIT 1', [forwardedId]
+        );
+        if (target) row = target;
+      }
+      matchedCity = {
+        city_id: Number(row.city_id), city_name: row.city_name, state_id: Number(row.state_id),
+      };
+    }
   }
 
   logger.info('Pincode geocode-match done · pincode=' + pin + ' geocoded=' + (!!detail?.geocoded) + ' duplicate=' + (!!dup) + ' stateMatched=' + (!!matchedState) + ' cityMatched=' + (!!matchedCity));
@@ -1414,6 +1516,10 @@ async function suggestZonesForLocation({ cityId = null, lat = null, lng = null, 
 
 module.exports = {
   STATUS,
+  // Exported for tests: forwarding is invisible in every return value (the
+  // caller gets the same { city_id, created } shape either way), so it has to
+  // be driven directly as well as through the resolvers.
+  resolveMergedCity,
   listPincodes,
   getPincodeById,
   getPincodeByValue,

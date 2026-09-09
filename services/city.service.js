@@ -269,7 +269,37 @@ async function updateCity(cityId, fields) {
   if (fields.district !== undefined)          { sets.push('district = ?');          params.push(fields.district || null); }
   if (fields.tier !== undefined)              { sets.push('tier = ?');              params.push(fields.tier || null); }
   if (fields.reference_pincode !== undefined) { sets.push('reference_pincode = ?'); params.push(fields.reference_pincode || null); }
-  if (fields.is_active !== undefined)         { sets.push('city_status = ?');       params.push(fields.is_active ? 1 : 0); }
+  if (fields.is_active !== undefined) {
+    /*
+     * The Active toggle cannot move a PENDING city. Sending is_active:false
+     * for one would retire it to 0 with no merge (see deactivateCity), and
+     * is_active:true would promote it to 1 behind approveCity's back, leaving
+     * approved_by / approved_at / approval_decision NULL — an approved city
+     * with no record of who approved it. Everything else on the row stays
+     * editable, so an operator can still fix a district or a typo before
+     * deciding.
+     */
+    const [[cur]] = await pool.query(
+      'SELECT city_status FROM tbl_city WHERE city_id = ? LIMIT 1', [cityId]
+    );
+    if (!cur) throw mkErr(404, 'City not found');
+    if (Number(cur.city_status) === STATUS_PENDING) {
+      logger.warn('Status change refused · city is pending approval · id=' + cityId);
+      throw mkErr(409,
+        'This city is awaiting approval — use Approve or Reject rather than the Active toggle.');
+    }
+    sets.push('city_status = ?'); params.push(fields.is_active ? 1 : 0);
+    /*
+     * Reviving a rejected city clears its decision. The row would otherwise be
+     * ACTIVE while still claiming it was merged away, and the forward pointer
+     * is load-bearing now — new rows resolving this city's name would be sent
+     * to the replacement instead of to the city an operator just revived.
+     * The merged rows themselves stay where they went; the merge is one-way.
+     */
+    if (fields.is_active && await hasCityApprovalCols()) {
+      sets.push('approval_decision = NULL', 'merged_into_city_id = NULL');
+    }
+  }
 
   if (!sets.length) throw mkErr(400, 'No mutable fields supplied');
 
@@ -289,6 +319,23 @@ async function updateCity(cityId, fields) {
  */
 async function deactivateCity(cityId) {
   logger.info('Deactivate city · id=' + cityId);
+  /*
+   * A PENDING city must not be retired this way. Deactivating it flips it to
+   * 0 with no merge and no merged_into_city_id, so it leaves listPendingCities
+   * for good — never approved, never rejected — while its pincodes and
+   * addresses keep pointing at it. That is precisely the orphaned state
+   * rejectCity exists to prevent, reached under the weaker isCityEdit grant.
+   * Rejection is the only route out of the queue that moves the rows.
+   */
+  const [[cur]] = await pool.query(
+    'SELECT city_status FROM tbl_city WHERE city_id = ? LIMIT 1', [cityId]
+  );
+  if (cur && Number(cur.city_status) === STATUS_PENDING) {
+    logger.warn('Deactivate refused · city is pending approval · id=' + cityId);
+    throw mkErr(409,
+      'This city is awaiting approval. Approve it, or reject it and choose a replacement '
+      + '— rejecting moves its rows, deactivating would strand them.');
+  }
   const [r] = await pool.query(
     'UPDATE tbl_city SET city_status = 0 WHERE city_id = ?',
     [cityId]
@@ -373,7 +420,16 @@ async function approveCity(cityId, userId) {
   const sets  = ['city_status = ?'];
   const params = [STATUS_ACTIVE];
   if (stamp) {
-    sets.push('approved_by = ?', 'approved_at = NOW()', "approval_decision = 'approved'");
+    /*
+     * merged_into_city_id = NULL is an INVARIANT, not tidying. Since the
+     * pointer became load-bearing (services/pincode.service.js forwards name
+     * resolution through it), an ACTIVE city carrying one would silently
+     * redirect new rows away from itself. The invariant is "a selectable city
+     * has no forward pointer", and it is enforced at both places a city
+     * becomes active — here and in updateCity's reactivation branch.
+     */
+    sets.push('approved_by = ?', 'approved_at = NOW()', "approval_decision = 'approved'",
+      'merged_into_city_id = NULL');
     params.push(userId || null);
   }
   params.push(cityId, STATUS_PENDING);
