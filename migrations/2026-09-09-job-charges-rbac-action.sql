@@ -37,13 +37,27 @@ SELECT menu_id, menu_name, url FROM tbl_menu WHERE url = 'finance' OR menu_name 
 
 SELECT id, menu_id, action_name, name, status FROM menu_action WHERE action_name = 'isJobChargesManage';
 
+-- The width of `name`, because the first version of this migration failed with
+-- "Data truncation: Data too long for column 'name'" on a 104-character label.
+-- The JPA entity (EasyFix_CRM MenuAction.java) declares no length, so it reads
+-- as the 255 default and is not the authority; information_schema is.
+SELECT CHARACTER_MAXIMUM_LENGTH AS name_max_chars FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'menu_action' AND COLUMN_NAME = 'name';
+
 SELECT property_key, property_value FROM easyfix_properties WHERE property_key = 'job.charges.emails';
 
 -- ─── 2. The action ───────────────────────────────────────────────────
+-- NAME IS SHORT ON PURPOSE. The first attempt used a 104-character label
+-- describing everything the action unlocks and was rejected: menu_action.name
+-- is narrower than that. The longest label in the live table is 70 characters
+-- ("Secrets Manager — Re-Key Encrypted Fields (Rotate / Recover / Re-Seal)"), so
+-- the limit sits between 71 and 103; step 1 above prints the exact figure. This
+-- one is 30 characters, which is the length siblings actually use — the detail
+-- belongs in this comment, not in a column that has to render in a role picker.
+--
 -- Attached to the Finance menu: charges, penalties, travel, incentives and
 -- advances are finance-shaped operations, and the sibling isInvoice*/isPayout*
 -- actions already live there (migrations/executed/2026-05-26-add-finance-quotation-write-actions.sql).
-INSERT INTO menu_action (menu_id, action_name, name, status, delete_status, created_on) SELECT (SELECT menu_id FROM tbl_menu WHERE url = 'finance' OR menu_name = 'Finance' ORDER BY menu_id ASC LIMIT 1), 'isJobChargesManage', 'Manage Job Charges (Billing & Charges tab, penalties/travel/incentives, job documents, Audit entry point)', 1, 0, NOW() FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM menu_action WHERE action_name = 'isJobChargesManage');
+INSERT INTO menu_action (menu_id, action_name, name, status, delete_status, created_on) SELECT (SELECT menu_id FROM tbl_menu WHERE url = 'finance' OR menu_name = 'Finance' ORDER BY menu_id ASC LIMIT 1), 'isJobChargesManage', 'Manage Job Charges & Documents', 1, 0, NOW() FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM menu_action WHERE action_name = 'isJobChargesManage');
 
 -- ─── 3. Grant it ─────────────────────────────────────────────────────
 -- Admin (2) and Finance (7). NOT granted broadly: this is the same capability
@@ -55,6 +69,7 @@ INSERT INTO role_menu_action (role_id, menu_action_id, isDeleted) SELECT 7, ma.i
 
 -- ─── 4. Verify ───────────────────────────────────────────────────────
 SELECT 'action exists' AS what, COUNT(*) AS ok FROM menu_action WHERE action_name = 'isJobChargesManage'
+UNION ALL SELECT 'name fits the column', COUNT(*) FROM menu_action ma JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA = DATABASE() AND c.TABLE_NAME = 'menu_action' AND c.COLUMN_NAME = 'name' WHERE ma.action_name = 'isJobChargesManage' AND CHAR_LENGTH(ma.name) <= c.CHARACTER_MAXIMUM_LENGTH
 UNION ALL SELECT 'attached to a real menu', COUNT(*) FROM menu_action ma JOIN tbl_menu m ON m.menu_id = ma.menu_id WHERE ma.action_name = 'isJobChargesManage'
 UNION ALL SELECT 'granted to Admin (2)', COUNT(*) FROM role_menu_action rma JOIN menu_action ma ON ma.id = rma.menu_action_id WHERE ma.action_name = 'isJobChargesManage' AND rma.role_id = 2 AND rma.isDeleted = 0
 UNION ALL SELECT 'granted to Finance (7)', COUNT(*) FROM role_menu_action rma JOIN menu_action ma ON ma.id = rma.menu_action_id WHERE ma.action_name = 'isJobChargesManage' AND rma.role_id = 7 AND rma.isDeleted = 0;
