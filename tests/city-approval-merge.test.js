@@ -64,10 +64,29 @@ function reset() {
 function respond(text, params) {
   if (/^\s*SHOW COLUMNS FROM tbl_city LIKE 'approval_decision'/i.test(text)) return plan.approvalCols ? [{ Field: 'approval_decision' }] : [];
   if (/^\s*SHOW COLUMNS FROM tbl_city LIKE 'created_by_type'/i.test(text))   return plan.creatorCols ? [{ Field: 'created_by_type' }] : [];
-  // The FOR UPDATE lock read and the replacement probe are the same shape
-  // apart from their tail; distinguish on that, not on the parameter.
-  if (/FOR UPDATE/i.test(text))                                    return plan.target ? [plan.target] : [];
-  if (/^\s*SELECT city_id, city_status FROM tbl_city/i.test(text)) return plan.replacement ? [plan.replacement] : [];
+  /*
+   * The subject lock and the replacement lock are now BYTE-IDENTICAL SQL:
+   * `SELECT city_id, city_status FROM tbl_city WHERE city_id = ? FOR UPDATE`.
+   * The replacement gained FOR UPDATE on 2026-09-09 so its status cannot be
+   * changed by a concurrent deactivate while the merge runs.
+   *
+   * This used to key on the tail (`FOR UPDATE` = subject, no tail =
+   * replacement). The moment both grew the tail, that discriminator answered
+   * BOTH reads with the subject row — every reject test failed at once, which
+   * is the good outcome; a discriminator that had degraded silently would have
+   * left the suite green while testing a merge into itself.
+   *
+   * Keying on the PARAMETER is not available either: one test deliberately
+   * calls rejectCity(500, 500) to prove self-merge is refused. So this keys on
+   * ORDER, which the code fixes — the subject is locked first, the replacement
+   * second. `L.conn` already holds the current query (it is pushed before
+   * respond runs), so the first such read sees a count of 1.
+   */
+  if (/^\s*SELECT city_id, city_status FROM tbl_city/i.test(text)) {
+    const nth = L.conn.filter((c) => /^\s*SELECT city_id, city_status FROM tbl_city/i.test(c.sql)).length;
+    if (nth <= 1) return plan.target ? [plan.target] : [];
+    return plan.replacement ? [plan.replacement] : [];
+  }
   if (/FROM tbl_opencity_servicetype/i.test(text)) {
     if (plan.unverifiedThrows) throw plan.unverifiedThrows();
     return [{ n: plan.unverifiedRows }];
@@ -496,4 +515,38 @@ test('routes · reject requires replacement_city_id', async () => {
   assert.equal(nexted, false, 'an empty body must not reach the handler');
   assert.equal(res.statusCode, 400);
   assert.match(JSON.stringify(res.body), /replacement_city_id/);
+});
+
+test('reject · the REPLACEMENT is locked, not merely read', async () => {
+  /*
+   * A plain read is a check without a hold. The replacement's status was
+   * verified and then relied on for the rest of the transaction, while nothing
+   * stopped a concurrent DELETE /admin/cities/:id from retiring it in the gap.
+   * The merge would then complete onto a city that was active when checked and
+   * inactive when written to — every moved row landing somewhere that appears
+   * in no picker, which is the exact orphaning this flow exists to prevent,
+   * and with no error raised.
+   *
+   * Asserted on the STATEMENT: a missing FOR UPDATE changes no return value,
+   * no row count and no status code. Nothing else can see it.
+   */
+  reset();
+  const city = loadService();
+  await city.rejectCity(500, 900, 42);
+
+  const locks = L.conn.filter((c) => /^\s*SELECT city_id, city_status FROM tbl_city/i.test(c.sql));
+  assert.equal(locks.length, 2, 'both the rejected city and its replacement must be read under lock');
+  for (const [i, label] of [[0, 'the rejected city'], [1, 'the replacement']]) {
+    assert.match(locks[i].sql, /FOR UPDATE/i, `${label} must be read FOR UPDATE`);
+  }
+  assert.equal(Number(locks[1].params[0]), 900, 'the second lock must be the replacement');
+
+  /*
+   * Lock ORDER is the deadlock argument, so it is pinned rather than left to
+   * inspection: subject first, replacement second. The two can never swap
+   * roles — a rejection needs a PENDING subject and an ACTIVE replacement, and
+   * no city is both — so no two transactions can take these in opposite order.
+   */
+  assert.equal(Number(locks[0].params[0]), 500, 'the rejected city must be locked FIRST');
+  assert.ok(L.conn.indexOf(locks[0]) < L.conn.indexOf(locks[1]));
 });

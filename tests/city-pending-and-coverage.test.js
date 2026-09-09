@@ -187,16 +187,40 @@ test('the coverage probe uses the SAME predicate as the bulk recompute', () => {
   }
 });
 
-test('the client city list hides PENDING but still shows INACTIVE', () => {
-  // Inactive is deliberate — a client may have historical orders in a city ops
-  // has switched off, and the dropdown must still name it. Pending is not a
-  // decision at all, so it must not be offerable.
+test('the client city list offers SELECTABLE cities only', () => {
+  /*
+   * REVERSED 2026-09-09. This test used to assert the opposite — that inactive
+   * cities stayed in the list, "because a client may have historical orders in
+   * a city ops has switched off and the dropdown must still name it".
+   *
+   * That reasoning conflated naming with selecting. `?scope=all` has exactly
+   * one consumer, Easyfix_client_UI's New Order form, whose own comment calls
+   * it the "full active-city catalog"; a saved order resolves its city name
+   * through that order's own JOIN, which is unfiltered and unaffected. So the
+   * inactive rows bought no naming at all — and cost real harm, because
+   * city_status = 0 is also where a REJECTED city lands. A rejected city has
+   * had its rows merged into a replacement, and offering one lets a client
+   * file a new order into a city that was explicitly decided against. The
+   * merge forwarding in pincode.service.js cannot save this path: the client
+   * submits a city_id, not a name.
+   */
   const src = require('fs').readFileSync(path.join(ROOT, 'routes/client/index.js'), 'utf8');
-  const q = src.match(/SELECT city_id AS id, city_name AS name[\s\S]{0,240}?ORDER BY city_name ASC`,?[\s\S]{0,60}?\)/);
+  const q = src.match(/SELECT c\.city_id AS id, c\.city_name AS name[\s\S]{0,240}?ORDER BY c\.city_name ASC`[\s\S]{0,40}?\)/);
   assert.ok(q, 'the client scope=all city list must still exist');
-  assert.match(q[0], /city_status IS NULL OR city_status <> \?/, 'pending must be excluded by parameter');
-  assert.doesNotMatch(q[0], /city_status = 1/,
-    'filtering to ACTIVE ONLY would drop inactive cities the client still needs to name');
+  assert.match(q[0], /selectableCitySql\('c'\)/,
+    'it must use the shared predicate rather than spelling the statuses out again — one '
+    + 'definition of "may be offered for selection", in lib/city-status.js');
+  assert.doesNotMatch(q[0], /city_status <> \?/,
+    'excluding PENDING alone is what left rejected (0) cities offerable');
+
+  // The helper is what the assertion above delegates to, so pin its meaning
+  // here too — otherwise this test passes against a selectableCitySql() that
+  // has been widened to include 0.
+  const { selectableCitySql } = require(path.join(ROOT, 'lib/city-status'));
+  const pred = selectableCitySql('c');
+  assert.match(pred, /c\.city_status = 1/);
+  assert.match(pred, /c\.city_status IS NULL/, 'legacy NULL-status rows are live and must stay offerable');
+  assert.doesNotMatch(pred, /= 0|= 2/, 'neither rejected/inactive nor pending may be selectable');
 });
 
 test('the CRM picker already excludes anything that is not ACTIVE', () => {

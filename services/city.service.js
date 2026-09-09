@@ -578,11 +578,28 @@ async function rejectCity(cityId, replacementCityId, userId) {
       throw mkErr(409, `City is not pending approval (city_status = ${target.city_status})`);
     }
 
-    // Merging into a pending or inactive city is the trap this guards: it
-    // would move live rows onto a city that is itself awaiting a decision,
-    // or onto one an operator has already retired.
+    /*
+     * Merging into a pending or inactive city is the trap this guards: it
+     * would move live rows onto a city that is itself awaiting a decision, or
+     * onto one an operator has already retired.
+     *
+     * FOR UPDATE, because a plain read is a check without a hold. The status
+     * was verified and then relied on for the rest of the transaction while
+     * nothing stopped a concurrent DELETE /admin/cities/:id from retiring the
+     * replacement in the gap — leaving the merge to complete onto a city that
+     * was active when it was checked and inactive by the time it was written
+     * to. Every row would land somewhere that appears in no picker, which is
+     * the exact orphaning this whole flow exists to prevent, and no error
+     * would be raised.
+     *
+     * Deadlock-free by shape rather than by luck: the rejected city is locked
+     * first and the replacement second, and the two can never swap roles — a
+     * rejection requires a PENDING subject and an ACTIVE replacement, and no
+     * city is both. So no two transactions can hold these locks in opposite
+     * order.
+     */
     const [[replacement]] = await conn.query(
-      'SELECT city_id, city_status FROM tbl_city WHERE city_id = ? LIMIT 1', [replacementCityId]
+      'SELECT city_id, city_status FROM tbl_city WHERE city_id = ? FOR UPDATE', [replacementCityId]
     );
     if (!replacement) { throw mkErr(400, `Unknown replacement_city_id ${replacementCityId}`); }
     if (replacement.city_status !== STATUS_ACTIVE) {

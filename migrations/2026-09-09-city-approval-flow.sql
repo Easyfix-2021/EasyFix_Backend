@@ -47,6 +47,17 @@
 -- POST-APPLY
 --   Affected users log out and back in so their permissions are re-read
 --   (services/role.service.js caches per user).
+--
+--   RESTART THE BACKEND PROCESS TOO. services/city.service.js and
+--   services/pincode.service.js memoise `SHOW COLUMNS` probes for these
+--   columns in module scope. A process that started BEFORE this migration has
+--   cached "absent" and will keep the approval audit and the merge-pointer
+--   forwarding switched off until it is restarted — silently, because absent
+--   is a legitimate answer that degrades rather than errors.
+--
+-- APPLIED
+--   QA (10.30.2.30 / easyfix): 2026-09-09. menu_action id 103 under menu_id 14
+--   (Manage Cities), granted to roles 2 / 13 / 15. Prod: not applied.
 -- ─────────────────────────────────────────────────────────────────────
 
 
@@ -85,10 +96,16 @@ INSERT INTO role_menu_action (role_id, menu_action_id, isDeleted) SELECT r.role_
 
 
 -- ─── 4. Verify (read-only) ───────────────────────────────────────────
--- granted_roles must be 3, and the four columns + index must exist.
+-- Expected: granted_roles = 3, approval_cols_present = 4,
+-- pending_index_present = 1.
+--
+-- ⚠ pending_index_present uses COUNT(DISTINCT INDEX_NAME). information_schema
+-- .STATISTICS holds ONE ROW PER COLUMN PER INDEX, and this index has two
+-- columns — so a plain COUNT(*) returns 2 and reads as "something is wrong"
+-- when everything is right. Caught applying this to QA on 2026-09-09.
 
 SELECT ma.id, ma.action_name, ma.name, ma.menu_id, (SELECT COUNT(*) FROM role_menu_action rma WHERE rma.menu_action_id = ma.id AND rma.role_id IN (2, 13, 15) AND rma.isDeleted = 0) AS granted_roles FROM menu_action ma WHERE ma.action_name = 'isCityApprove';
 
 SELECT COUNT(*) AS approval_cols_present FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_city' AND COLUMN_NAME IN ('approved_by', 'approved_at', 'approval_decision', 'merged_into_city_id');
 
-SELECT COUNT(*) AS pending_index_present FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_city' AND INDEX_NAME = 'idx_city_status_created';
+SELECT COUNT(DISTINCT INDEX_NAME) AS pending_index_present FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_city' AND INDEX_NAME = 'idx_city_status_created';

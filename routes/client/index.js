@@ -8,7 +8,7 @@ const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
 const clientRequest = require('../../services/client-request.service');
 const { modernOk, modernError } = require('../../utils/response');
-const { CITY_STATUS } = require('../../lib/city-status');
+const { selectableCitySql } = require('../../lib/city-status');
 const { sendXlsx } = require('../../utils/xlsx-export');
 const { STATUS_LABELS } = require('../../services/integration.service');
 const emailService = require('../../services/email.service');
@@ -2133,10 +2133,11 @@ router.get('/jobs/:id/estimate-preview', async (req, res, next) => {
       job_id: jobId,
       services: lines,
       /*
-       * services_subtotal deliberately EXCLUDES material — it is the breakdown
-       * row that sits above material_subtotal, and the two add to grand_total.
-       * That is a presentation split, not a second definition of the total; the
-       * helper computes all three so they cannot stop adding up.
+       * { service_charge_subtotal, material_subtotal, grand_total } — labour,
+       * parts, and what is owed. The first was called `services_subtotal` and
+       * excluded material, which is a column on the service rows themselves, so
+       * the name understated the thing it named. Renamed rather than redefined:
+       * the split is real on a quotation, only the label was wrong.
        */
       totals,
       already_approved: job.approved_on_date_time != null,
@@ -3815,24 +3816,30 @@ router.get('/lookup/cities', async (req, res, next) => {
     const scope = String(req.query.scope || '').toLowerCase();
     if (scope === 'all') {
       /*
-       * The client wants the full master list in the New Order form, so
-       * INACTIVE cities are still included — that is deliberate and unchanged:
-       * a client may have historical orders in a city ops has since switched
-       * off, and the dropdown must still be able to name it.
+       * SELECTABLE ONLY — active or legacy-NULL. This endpoint has exactly one
+       * consumer, Easyfix_client_UI's New Order form
+       * (app/(authed)/jobs/new/page.tsx), whose own comment calls it the "full
+       * active-city catalog". It is a selection surface in the sense
+       * lib/city-status.js defines: every row it returns is an offer to file a
+       * NEW order there.
        *
-       * PENDING (city_status = 2) is excluded, and only pending. Those rows are
-       * minted automatically by a pincode add — including from unauthenticated
-       * public paths — and have never been approved by anyone. Offering one here
-       * would let a client raise an order into a city that does not officially
-       * exist yet and that no technician covers. Inactive was a decision;
-       * pending is an absence of one.
+       * It briefly excluded PENDING only, on the reasoning that a client might
+       * have historical orders in a city ops had since switched off and the
+       * dropdown must still name it. That conflated two different jobs. Naming
+       * a saved order's city happens through that order's own JOIN, which is
+       * correctly unfiltered; nothing resolves a historical name through this
+       * list. So the inactive rows bought no naming and cost real harm:
+       * city_status = 0 is also where a REJECTED city lands, and a rejected
+       * city has had its rows merged into a replacement. Offering one lets a
+       * client raise an order into a city that was explicitly decided against
+       * — and the resolver-level merge forwarding cannot help, because the
+       * client hands over a city_id, not a name.
        */
       const [rows] = await pool.query(
-        `SELECT city_id AS id, city_name AS name
-           FROM tbl_city
-          WHERE city_status IS NULL OR city_status <> ?
-          ORDER BY city_name ASC`,
-        [CITY_STATUS.PENDING]
+        `SELECT c.city_id AS id, c.city_name AS name
+           FROM tbl_city c
+          WHERE ${selectableCitySql('c')}
+          ORDER BY c.city_name ASC`
       );
       return modernOk(res, { items: rows });
     }
