@@ -2,8 +2,7 @@ const router = require('express').Router();
 const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
-const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
-const { FEATURES } = require('../../services/feature-access.service');
+const requireAction = require('../../middleware/require-action');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 const charges = require('../../services/job-charges.service');
@@ -16,7 +15,7 @@ const { scopedJob } = require('./jobs');
  * inside their manage_* RBAC scope (404 on out-of-scope, no existence leak).
  *
  * Gating: all MUTATING endpoints are further gated by the property allowlist
- * `job.charges.emails` (FEATURES.canManageJobCharges) — the same fail-closed,
+ * the `isJobChargesManage` RBAC action — the same fail-closed,
  * NOT-RBAC model as Build Skill Matrix. The READ endpoint is scope-only so the
  * tab can render for any in-scope operator; the FE hides the write controls via
  * the `canManageJobCharges` flag on /auth/me.
@@ -97,7 +96,11 @@ router.get('/:id/charges', validate(idParam, 'params'), scopedJob, async (req, r
 
 // Property gate for every MUTATING endpoint below. Stacks UNDER the admin
 // group's requireAuth + role(['admin']) already applied in routes/admin/index.js.
-const gate = requirePropertyAllowlist(FEATURES.canManageJobCharges, { label: 'Manage Job Charges' });
+// RBAC gate (2026-09-09). Was requirePropertyAllowlist on
+// easyfix_properties['job.charges.emails'], which nothing seeded — so every
+// one of these routes 403'd for every user, and no screen could grant access.
+// isJobChargesManage is a real menu_action, so Manage Role can.
+const gate = requireAction('isJobChargesManage');
 
 // ─── CREATE charges (job_material typed rows) ────────────────────────
 router.post('/:id/penalty', gate, validate(idParam, 'params'), validate(penaltyBody), scopedJob, async (req, res, next) => {

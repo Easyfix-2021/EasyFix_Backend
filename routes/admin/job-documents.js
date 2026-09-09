@@ -3,8 +3,7 @@ const Joi = require('joi');
 const multer = require('multer');
 
 const validate = require('../../middleware/validate');
-const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
-const { FEATURES } = require('../../services/feature-access.service');
+const requireAction = require('../../middleware/require-action');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 const { uploadJobImage, deleteJobImage } = require('../../services/job-image.service');
@@ -36,7 +35,11 @@ const docUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024, files: 1 },
 });
 
-const gate = requirePropertyAllowlist(FEATURES.canManageJobCharges, { label: 'Manage Job Charges' });
+// RBAC gate (2026-09-09). Was requirePropertyAllowlist on
+// easyfix_properties['job.charges.emails'], which nothing seeded — so every
+// one of these routes 403'd for every user, and no screen could grant access.
+// isJobChargesManage is a real menu_action, so Manage Role can.
+const gate = requireAction('isJobChargesManage');
 
 // Canonical category matcher — accepts the exact labels case-insensitively and
 // returns the canonical form ('JobSheet' | 'PurchaseOrder'), else null.

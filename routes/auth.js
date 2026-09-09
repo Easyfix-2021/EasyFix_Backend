@@ -246,12 +246,32 @@ router.get('/me', requireAuth, async (req, res, next) => {
     const sj = require('../services/scheduled-jobs.service');
     const scheduledJobsAccess = sj.isAllowedUser(req.user);
 
-    // canManageJobCharges (2026-07-28): property-allowlist gate for the
-    // Billing & Charges job-workspace tab. Same fail-closed model as
-    // canBuildSkillMatrix — the FE reads this to show/hide the tab; every
-    // mutating charges/documents route independently enforces the same
-    // allowlist, so a forged flag buys nothing.
-    const canManageJobCharges = emailAllowed(FEATURES.canManageJobCharges, req.user.official_email);
+    /*
+     * canManageJobCharges — RBAC, not an email allowlist (changed 2026-09-09).
+     *
+     * It used to read easyfix_properties['job.charges.emails'], a CSV of
+     * addresses held deliberately OUTSIDE the menu_action system: "these
+     * features carry no menu_action row, they can NEVER appear in (or be
+     * granted from) the Manage Role screen — the easyfix_properties value is
+     * the SOLE gate."
+     *
+     * Nothing ever seeded that property, and emailAllowed() returns false for
+     * an unset key. So the Billing & Charges tab was invisible to EVERY user
+     * from the day it shipped, and the Audit entry point added on 2026-09-08 —
+     * correctly hidden rather than opening a workspace whose billing tab is
+     * absent — inherited the same invisibility. The feature was not broken; it
+     * was gated on a door nobody had a key to, and no screen could grant one.
+     *
+     * The FIELD NAME is unchanged on purpose: three frontend files and the
+     * profile screen read `me.canManageJobCharges`, and only its resolution
+     * moves. A rename would have been a five-file change for no user-visible
+     * gain.
+     *
+     * Still fail-closed, and the routes still enforce independently — a forged
+     * flag buys nothing.
+     */
+    const canManageJobCharges = Array.isArray(permissions && permissions.actionPermissions)
+      && permissions.actionPermissions.includes('isJobChargesManage');
 
     /*
      * Job Stage Access — the FE gates its stage tabs + row actions off this.

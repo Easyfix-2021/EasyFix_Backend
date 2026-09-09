@@ -23,7 +23,11 @@ const FEATURES = {
   canBuildSkillMatrix: 'skill.matrix.emails',
   canRunTeleprompter: 'teleprompter.emails',
   canSwitchOtpChannel: 'access.otpchannel.emails',
-  canManageJobCharges: 'job.charges.emails',
+  // canManageJobCharges RETIRED 2026-09-09 — moved to the RBAC action
+  // `isJobChargesManage` so it can be granted from Manage Role. It lived here
+  // as an email allowlist that no migration ever seeded, which denied every
+  // user and gave no screen a way to fix it. The flag of the same name is
+  // still on /auth/me; only its resolution changed.
   // Generate festival ornament art for Settings → Theme & Branding. Outside
   // RBAC because it spends model credits and publishes an image to the
   // UNAUTHENTICATED login page — a blast radius that should follow a person,
