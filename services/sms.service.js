@@ -83,7 +83,18 @@ async function send({ to, message }) {
       body,
     });
     const text = await res.text();
-    const delivered = res.ok && !/error|fail/i.test(text);
+    /*
+     * "Rejected" contains neither "error" nor "fail", so the previous
+     * `!/error|fail/i` scored a DLT rejection as a successful send — which is
+     * how five rejected messages a day went unnoticed until a technician could
+     * not close a job. The SMS Country console showed "Rejected / 0 INR" the
+     * whole time; nothing in this process did.
+     *
+     * This still cannot be authoritative: DR is 'N' (delivery receipts off), so
+     * an accepted-then-rejected message looks identical to a delivered one from
+     * here. It only stops the obvious lie.
+     */
+    const delivered = res.ok && !/error|fail|reject|invalid|denied|unauthor/i.test(text);
     const who = redirected ? `${mobile} (was ${originalMobile})` : mobile;
     // Log the provider body on both paths. A 200 OK with a silent-drop message
     // (e.g. DLT mismatch) is how operator-side rejection surfaces; without this

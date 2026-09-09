@@ -3,7 +3,18 @@ const logger = require('../logger');
 const jobService = require('./job.service');
 const jobLocation = require('./job-location.service');
 const smsService = require('./sms.service');
-const smsTemplate = require('./sms-template.service');
+const gallabox = require('./gallabox.whatsapp.service');
+
+/*
+ * The approved Gallabox template that carries the job-closing PIN.
+ *
+ * Deliberately NOT defaulted to a guess. Gallabox answers 200 for a template
+ * name it does not recognise and the handset simply never receives anything —
+ * so a wrong name here is a SILENT non-delivery that no delivery check can
+ * catch. Unset means "fall back to SMS and say so in the log", which is visibly
+ * broken rather than invisibly broken.
+ */
+const CLOSING_PIN_TEMPLATE = String(process.env.GALLABOX_CLOSING_PIN_TEMPLATE || '').trim();
 
 /*
  * Mobile Job Lifecycle — the technician-app order flow that sits on top
@@ -192,11 +203,17 @@ async function sendCheckinSms(jobId, efrId) {
   logger.info('Send check-in PIN SMS · jobId=' + jobId);
   await getOwnedJob(jobId, efrId);
 
-  // Pull the customer's mobile + the PIN in one indexed join.
+  // Pull the customer's mobile + the PIN in one indexed join, plus the two
+  // names the WhatsApp template addresses the customer and the technician by.
   const [[row]] = await pool.query(
-    `SELECT cu.customer_mob_no, j.otp, j.fk_client_id
+    `SELECT cu.customer_mob_no,
+            cu.customer_name,
+            COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS display_name,
+            ef.efr_name AS technician_name,
+            j.otp, j.fk_client_id
        FROM tbl_job j
        LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
+       LEFT JOIN tbl_easyfixer ef ON ef.efr_id = j.fk_easyfixter_id
       WHERE j.job_id = ? LIMIT 1`,
     [jobId],
   );
@@ -211,25 +228,85 @@ async function sendCheckinSms(jobId, efrId) {
     e.status = 422; throw e;
   }
 
-  // Prefer a DLT-approved template; fall back to inline text so dev /
-  // un-seeded deploys still deliver something (DLT may drop it in prod).
-  // VERIFY: confirm the live tbl_sms_transational_meta row uses
-  // job_stage='CHECK_IN' for the check-in PIN template.
-  let message = null;
-  try {
-    const tpl = await smsTemplate.getTemplate('CHECK_IN', { clientId: row.fk_client_id || 1 });
-    if (tpl) message = smsTemplate.fill(tpl, [pin]);
-  } catch (tplErr) {
-    logger.warn('Check-in SMS template lookup failed, using inline text · jobId=' + jobId + ' · ' + tplErr.message);
-    logger.warn({ err: tplErr.message, jobId }, 'checkin-sms: template lookup failed, using inline text');
-  }
-  if (!message) {
-    message = `EasyFix: Your technician check-in PIN is ${pin}. Share it only with the technician at your door.`;
+  /*
+   * ── WHY THIS IS WHATSAPP NOW, AND WHY THE SMS PATH STAYS ──────────────────
+   *
+   * This used to ask sms-template.service for job_stage 'CHECK_IN'. That row
+   * does not exist — measured against the live table, `job_stage = 'CHECK_IN'`
+   * returns ZERO rows (the registered keys are lowerCamelCase: 'checkin',
+   * 'checkInBeforeTime', 'checkInAfterTime'). So the lookup always returned
+   * null, the inline fallback below it always won, and an UNREGISTERED body
+   * went on the wire. Indian DLT scrubs an unregistered body at the aggregator:
+   * every one of these was "Rejected, 0 INR" in the SMS Country console.
+   *
+   * It went unnoticed for months because nothing here could see it — the send
+   * result was discarded and this function returned { sent: true } regardless,
+   * so the app and the CRM's Resend button both reported success on a message
+   * the provider had thrown away. That is fixed below too: the channel and the
+   * delivery outcome are returned.
+   *
+   * And there is no correct SMS template to switch to. Every registered PIN
+   * template says "to START the service" (resendJobPin, resendJobPinNew,
+   * mobileCustomerOtp) because the PIN used to start the job; commit 1d69ff0
+   * (2026-09-07) made it CLOSE the job instead. Rather than send words that
+   * contradict the action, the closing PIN moves to WhatsApp, where the
+   * template is ours to word correctly.
+   *
+   * SMS remains the fallback for a customer WhatsApp cannot reach.
+   */
+  const customerName = String(row.display_name || '').trim() || 'there';
+  const technicianName = String(row.technician_name || '').trim() || 'our technician';
+
+  let channel = 'sms';
+  let delivered = false;
+
+  if (CLOSING_PIN_TEMPLATE) {
+    /*
+     * Positional binding, matching the registered body:
+     *   Hi {{1}}, your EasyFix *Job #{{2}}* is ready to be closed. Our
+     *   technician {{3}} will ask you for this PIN to complete the visit: {{4}}
+     * The shape must match how the template was registered — this repo already
+     * carries the scar that positional keys against a NAMED template bind to
+     * nothing and deliver "Hello []".
+     */
+    const wa = await gallabox.sendTemplate({
+      to: row.customer_mob_no,
+      recipientName: String(row.customer_name || '').trim(),
+      templateName: CLOSING_PIN_TEMPLATE,
+      bodyValues: { 1: customerName, 2: String(jobId), 3: technicianName, 4: pin },
+    });
+    if (wa.delivered) {
+      logger.info('Closing PIN sent on WhatsApp · jobId=' + jobId);
+      return { sent: true, channel: 'whatsapp', delivered: true };
+    }
+    if (wa.disabled) return { sent: false, channel: 'whatsapp', delivered: false, disabled: true };
+    logger.warn(
+      'Closing-PIN WhatsApp not delivered, falling back to SMS · jobId=' + jobId
+      + ' · ' + (wa.error || 'httpStatus=' + wa.httpStatus),
+    );
+  } else {
+    logger.warn(
+      'GALLABOX_CLOSING_PIN_TEMPLATE is not set — the closing PIN is going out over '
+      + 'SMS, which DLT currently rejects. Set it to the approved Gallabox template '
+      + 'name. jobId=' + jobId,
+    );
   }
 
-  await smsService.send({ to: row.customer_mob_no, message });
-  logger.info('Check-in PIN SMS sent · jobId=' + jobId);
-  return { sent: true };
+  /*
+   * The SMS fallback is deliberately the shortest sentence that still says what
+   * the PIN is FOR. It remains unregistered with DLT and will very likely be
+   * rejected — but a rejected fallback that is logged honestly is better than a
+   * silent one, and the WhatsApp path above is the route that works.
+   */
+  const smsResult = await smsService.send({
+    to: row.customer_mob_no,
+    message: `EasyFix: Your job closing PIN is ${pin}. Share it only with the technician at your door.`,
+  });
+  delivered = Boolean(smsResult && smsResult.delivered);
+  if (!delivered) {
+    logger.warn('Closing-PIN SMS not delivered either · jobId=' + jobId);
+  }
+  return { sent: delivered, channel, delivered };
 }
 
 // ─── Reached-location geofence ───────────────────────────────────────
