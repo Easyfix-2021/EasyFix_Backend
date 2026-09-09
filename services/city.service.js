@@ -447,6 +447,62 @@ async function approveCity(cityId, userId) {
   return getCityById(cityId);
 }
 
+/*
+ * Chunk size for the merge UPDATEs. 5,000 rows is comfortably one short
+ * statement on the biggest target: tbl_address is ~421k rows, and its city_id
+ * IS indexed (FK_tbl_address_tbl_city), so each chunk is an index range scan
+ * rather than a table scan. The largest single city on QA holds ~60k
+ * addresses — twelve chunks — and a pending city, being freshly minted, holds
+ * far fewer.
+ */
+const MERGE_CHUNK_ROWS = 5000;
+/* Pure runaway guard: 5,000 x 4,000 is 20M rows, ~50x the whole table. */
+const MERGE_MAX_CHUNKS = 4000;
+
+/**
+ * Repoint every row of `table`.`col` from one city to another, in bounded
+ * statements, and return how many moved.
+ *
+ * WHAT THIS DOES AND DOES NOT BUY. It is still ONE transaction and one commit
+ * — deliberately. InnoDB holds every row lock until COMMIT, so chunking does
+ * NOT shorten how long the locks are held or how many are taken; anyone
+ * expecting that from "batching" will be disappointed. Committing per chunk
+ * WOULD release them, and would also destroy the property that makes this
+ * merge safe: an interrupted merge would leave a city's rows split across two
+ * cities, with no record of how far it got. Atomicity is worth more than lock
+ * duration here.
+ *
+ * What it does buy: no single statement long enough to trip
+ * innodb_lock_wait_timeout or a proxy's statement timeout, a bounded undo
+ * segment per statement, and — the practical one — progress in the log, so a
+ * merge that is slow is distinguishable from one that is stuck.
+ *
+ * Terminates without OFFSET because the UPDATE removes its own matches: once a
+ * row's city_id is the replacement it no longer satisfies `col = ?`, so the
+ * next pass sees the next batch. A short pass means the table is done.
+ */
+async function repointInChunks(conn, table, col, fromCityId, toCityId) {
+  let moved = 0;
+  for (let pass = 0; pass < MERGE_MAX_CHUNKS; pass += 1) {
+    const [r] = await conn.query(
+      `UPDATE ${table} SET ${col} = ? WHERE ${col} = ? LIMIT ${MERGE_CHUNK_ROWS}`,
+      [toCityId, fromCityId]
+    );
+    moved += r.affectedRows;
+    if (r.affectedRows < MERGE_CHUNK_ROWS) return moved;
+    logger.info('Merge chunk · ' + table + '.' + col + ' · ' + moved + ' rows so far · city '
+      + fromCityId + ' → ' + toCityId);
+  }
+  /*
+   * Only reachable if the UPDATE stops removing its own matches — which would
+   * mean fromCityId === toCityId. rejectCity rejects that with a 400 before
+   * reaching here, so this is a guard against a future caller, not a live
+   * case. Throwing rolls the whole merge back, which is the right answer: a
+   * loop that will not terminate must not be committed halfway.
+   */
+  throw mkErr(500, `Merge of ${table}.${col} did not converge after ${MERGE_MAX_CHUNKS} passes`);
+}
+
 // ─── Reject (= MERGE) ────────────────────────────────────────────────
 /*
  * Rejecting is not deactivating. By the time an operator sees a pending
@@ -631,11 +687,9 @@ async function rejectCity(cityId, replacementCityId, userId) {
     const moved = {};
     let total = 0;
     for (const [table, col] of MERGE_TARGETS) {
-      const [r] = await conn.query(
-        `UPDATE ${table} SET ${col} = ? WHERE ${col} = ?`, [replacementCityId, cityId]
-      );
-      moved[`${table}.${col}`] = r.affectedRows;
-      total += r.affectedRows;
+      const n = await repointInChunks(conn, table, col, cityId, replacementCityId);
+      moved[`${table}.${col}`] = n;
+      total += n;
     }
 
     const sets  = ['city_status = ?'];

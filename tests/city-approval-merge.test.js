@@ -56,7 +56,8 @@ function reset() {
     unverifiedThrows: null,
     cityUpdateAffected: 1,
     cityRow: { city_id: 500, city_name: 'Nowhere', city_status: 1 },
-    rowsFor: {},                 // table -> affectedRows
+    rowsFor: {},                 // table -> total rows referencing the rejected city
+    remaining: {},               // table -> rows still to drain (chunked UPDATEs)
     failOn: null,
   };
 }
@@ -95,7 +96,20 @@ function respond(text, params) {
   if (/^\s*UPDATE tbl_city\b/i.test(text))                          return { affectedRows: plan.cityUpdateAffected };
   if (/^\s*UPDATE\s+(\w+)\s+SET/i.test(text)) {
     const t = text.match(/^\s*UPDATE\s+(\w+)\s+SET/i)[1];
-    return { affectedRows: t in plan.rowsFor ? plan.rowsFor[t] : 1 };
+    const want = t in plan.rowsFor ? plan.rowsFor[t] : 1;
+    /*
+     * The merge UPDATEs carry LIMIT and are re-issued until one comes back
+     * short, so the double has to DRAIN like a real table. Returning the full
+     * count on every pass — which is what it used to do — makes the loop
+     * immortal: each pass reports a full chunk, so the caller keeps asking.
+     * That is a fake modelling a table that refills itself.
+     */
+    const limit = (text.match(/LIMIT\s+(\d+)/i) || [])[1];
+    if (!limit) return { affectedRows: want };
+    if (plan.remaining[t] === undefined) plan.remaining[t] = want;
+    const n = Math.min(plan.remaining[t], Number(limit));
+    plan.remaining[t] -= n;
+    return { affectedRows: n };
   }
   if (/^\s*SELECT\s+c\.city_id/i.test(text))                        return plan.cityRow ? [plan.cityRow] : [];
   if (/^\s*SELECT\s*\n?\s*c\.city_id/i.test(text))                  return [{ city_id: 1 }];
@@ -549,4 +563,64 @@ test('reject · the REPLACEMENT is locked, not merely read', async () => {
    */
   assert.equal(Number(locks[0].params[0]), 500, 'the rejected city must be locked FIRST');
   assert.ok(L.conn.indexOf(locks[0]) < L.conn.indexOf(locks[1]));
+});
+
+test('reject · the merge is CHUNKED, and still one transaction', async () => {
+  /*
+   * tbl_address is ~421k rows and the largest single city on QA holds ~60k of
+   * them, so the repoint is issued in bounded statements rather than as one
+   * unbounded UPDATE. Its city_id is indexed (FK_tbl_address_tbl_city), so
+   * each chunk is an index range scan — without that index chunking would be
+   * O(n^2) and strictly worse than the single statement it replaced.
+   *
+   * What is asserted, and why: that no single statement is unbounded, that the
+   * chunks sum to the true total (a loop that stops early loses rows silently
+   * — same 200, fewer rows moved), and that it is STILL one commit. That last
+   * one is the point people get wrong about batching: committing per chunk
+   * would release locks sooner but would let an interrupted merge leave a
+   * city's rows split across two cities.
+   */
+  reset();
+  plan.rowsFor = { tbl_address: 41000, tbl_pincode: 3 };
+  const city = loadService();
+  const out = await city.rejectCity(500, 900, 42);
+
+  const addr = L.conn.filter((c) => /^\s*UPDATE tbl_address SET/i.test(c.sql));
+  assert.equal(addr.length, 9, '41000 rows at 5000 per chunk is 8 full passes plus a short one');
+  for (const c of addr) {
+    assert.match(c.sql, /LIMIT 5000/, 'every merge statement must be bounded');
+  }
+  assert.equal(out.moved['tbl_address.city_id'], 41000, 'the chunks must sum to the real total');
+
+  // Small tables must not pay for this: 3 rows is one short pass, not nine.
+  assert.equal(L.conn.filter((c) => /^\s*UPDATE tbl_pincode SET/i.test(c.sql)).length, 1);
+
+  assert.equal(L.begins, 1, 'still ONE transaction');
+  assert.equal(L.commits, 1, 'still ONE commit — chunking must not commit per batch');
+  assert.equal(L.rollbacks, 0);
+});
+
+test('reject · a merge that cannot converge rolls back rather than committing half', async () => {
+  /*
+   * The runaway guard. Reachable only if an UPDATE stops removing its own
+   * matches (from === to), which rejectCity refuses with a 400 before getting
+   * here — so this proves the guard's BEHAVIOUR, not a live path. The
+   * behaviour that matters is that it rolls back: a loop that will not
+   * terminate must not leave a half-merged city behind.
+   */
+  reset();
+  const drainless = { ...plan };
+  plan.rowsFor = { tbl_address: 41000 };
+  const city = loadService();
+  // Refill the table on every pass, so no pass ever comes back short.
+  const realRemaining = plan.remaining;
+  Object.defineProperty(plan, 'remaining', {
+    get() { return new Proxy(realRemaining, { get: () => 41000, set: () => true }); },
+    configurable: true,
+  });
+  await assert.rejects(() => city.rejectCity(500, 900, 42), /did not converge/);
+  assert.equal(L.commits, 0, 'nothing may be committed');
+  assert.equal(L.rollbacks, 1, 'the whole merge must roll back');
+  assert.equal(L.releases, L.acquires, 'and the connection must still be released');
+  void drainless;
 });
