@@ -351,19 +351,24 @@ const GPS_BOUNDS = Object.freeze({ minLat: 6, maxLat: 38, minLng: 68, maxLng: 98
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 /*
- * The caller's IP as seen past the proxy. Honours the FIRST hop of
- * x-forwarded-for (the original client; later hops are the proxies) and falls
- * back to req.ip. Used ONLY as a rate-limit bucket key — never as an
- * authorisation input — so a spoofed header costs the spoofer their own
- * bucket and nothing more.
+ * The caller's IP — the rate-limit bucket key for every endpoint on this router.
+ *
+ * ⚠ NEVER READ x-forwarded-for (OR ANY OTHER REQUEST HEADER) HERE. Headers are
+ * client-supplied, so a key derived from them lets a caller mint a fresh bucket
+ * per request and defeat every cap below. These endpoints are UNAUTHENTICATED
+ * and the POST creates tbl_state / tbl_city / tbl_pincode rows and spends Google
+ * Geocoding budget via ensurePincode() — the caps are the only thing bounding
+ * that, so their key must be something the caller cannot choose.
+ *
+ * req.ip is already that value: server.js sets `trust proxy` to 1 for the single
+ * nginx hop in front of us, and that nginx sets X-Forwarded-For with
+ * `$proxy_add_x_forwarded_for` (append, not overwrite), so Express resolves
+ * req.ip to the address nginx itself saw — not to anything the client wrote.
+ * Parsing the header by hand was therefore both unsafe and redundant.
  */
 function clientIp(req) {
-  const xff = req.headers['x-forwarded-for'];
-  if (typeof xff === 'string' && xff.trim() !== '') {
-    const first = xff.split(',')[0].trim();
-    if (first) return first;
-  }
-  return req.ip || 'unknown';
+  // Collapse ::ffff:1.2.3.4 → 1.2.3.4 so one client is one bucket, not two.
+  return String(req.ip || '').replace(/^::ffff:/i, '') || 'unknown';
 }
 
 /*

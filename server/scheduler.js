@@ -1408,6 +1408,65 @@ Note: this runs automatically unless the property "plivo.conference.reaper.enabl
     logger.info('Conference-reaper cron registered (every 5 min IST, cost backstop).');
   }
 
+  // ─── Serviceable-pincode recompute — nightly 03:45 IST ───────────────
+  const pincodeSvcForCron = require('../services/pincode.service');
+  const serviceableRecomputeJob = registerJob({
+    id: 'pincode-serviceable-recompute',
+    name: 'Serviceable Pincode Recompute',
+    description:
+`What this task does: Each pincode carries a "Serviceable" flag, and that flag is supposed to mean one specific thing — at least one ACTIVE, VERIFIED technician covers this pincode. This task recomputes that flag for every pincode from the technicians who actually serve them today.
+
+Step by step:
+  1. Every night at 3:45 AM IST, the task wakes up automatically.
+  2. It sets every pincode to Non-Serviceable.
+  3. It then marks Serviceable again every pincode that at least one active, verified technician covers — either because it is in their serviceable-pincodes list, or because it is their own home pincode.
+  4. It logs how many pincodes ended up Serviceable out of the total.
+
+Why this matters: nothing else keeps this flag honest. Until 2026-09-09 every automatically created pincode was stamped Serviceable on the spot — with no coverage at all — and the public website's "do you serve my area?" answer reads this same flag, so customers were told we serve areas nobody covers. Creation now computes the flag honestly, but coverage CHANGES afterwards: a technician joins, is verified, edits their work area, or is deactivated, and nothing repoints the flag. This task is what closes that gap in both directions.
+
+Timing: 3:45 AM IST is deliberate. The recompute rewrites the whole pincode table inside one transaction, so it briefly locks that table — harmless overnight, disruptive at midday. Nothing else is scheduled at that hour.
+
+You can also run it on demand from Manage Pincodes ("Refresh Status") or with Trigger Now below; this task is the same code on a timer.`,
+    cron: '45 3 * * *',
+    runner: async () => {
+      const r = await pincodeSvcForCron.recomputeServiceableStatus({ userId: null });
+      logger.info(`Serviceable-pincode recompute cron · serviceable=${r.serviceableCount} of ${r.total}`);
+      return r;
+    },
+  });
+  /*
+   * DEFAULT-OFF, unlike the always-on infra crons above, and that is a
+   * deliberate choice rather than an oversight.
+   *
+   * The recompute UPDATEs the entire tbl_pincode table twice inside one
+   * transaction, so it takes a table-wide lock for its duration. Introducing a
+   * new nightly lock into a running production system is exactly the kind of
+   * change an operator should switch on knowingly, having picked the window —
+   * the same reasoning the RBAC seeds use ("the conservative start is easier to
+   * widen than to claw back"). The manual Refresh Status button is unchanged
+   * and remains available meanwhile.
+   *
+   * ⚠ WHILE THIS IS OFF, the flag does not self-heal: pincodes created since
+   * 2026-09-09 are honestly Non-Serviceable and STAY that way even after a
+   * technician starts covering them. Turning it on is one property + a restart.
+   */
+  const serviceableRecomputeEnabled =
+    String(getProperty('pincode.serviceable_recompute.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    serviceableRecomputeJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!serviceableRecomputeEnabled) {
+    serviceableRecomputeJob.skipReason = "property 'pincode.serviceable_recompute.enabled' was not 'true' at server start — set it to 'true' and restart to enable. While off, the Serviceable flag never self-heals: a pincode a technician starts covering stays Non-Serviceable until someone presses Refresh Status.";
+    logger.info("Serviceable-pincode recompute cron SKIPPED — set pincode.serviceable_recompute.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    serviceableRecomputeJob.task = cron.schedule(
+      serviceableRecomputeJob.cron,
+      () => invokeJob(serviceableRecomputeJob, 'cron'),
+      { timezone: TZ },
+    );
+    serviceableRecomputeJob.registered = true;
+    logger.info('Serviceable-pincode recompute cron registered (03:45 IST nightly).');
+  }
+
   // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
   // Standalone cron (NOT registered via registerJob()). Deliberately
   // absent from the Scheduled Jobs admin page — this is infrastructure

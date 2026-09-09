@@ -36,8 +36,12 @@
  *   · the rate limiter — the POST is capped at 8 per 10 min PER IP, and this
  *     file sends far more than 8. Every request carries its own synthetic
  *     x-forwarded-for so each lands in its own bucket. That is not a workaround
- *     for the limiter; it is how the limiter is meant to partition callers, and
- *     `clientIp()` reads the first XFF hop exactly as it does in prod.
+ *     for the limiter; it is how the limiter is meant to partition callers. It
+ *     works only because the app below sets `trust proxy` exactly as server.js
+ *     does — `clientIp()` keys on req.ip and never reads a header itself, so
+ *     an app WITHOUT that setting would put every request in one bucket. The
+ *     bucket key is characterised on its own in
+ *     tests/website-booking-ip-bucket.test.js.
  *
  * Runner: `node --test` (see npm test).
  */
@@ -184,6 +188,14 @@ before(async () => {
 
   const app = express();
   /*
+   * MIRRORS server.js:63. `clientIp()` keys the rate limiters on req.ip and
+   * deliberately reads no header (a client-chosen bucket key is no cap at all),
+   * so req.ip has to be derived the same way it is in prod — one trusted proxy
+   * hop — or every synthetic IP below collapses into a single bucket and the
+   * POST tests 429 from the 9th request onwards.
+   */
+  app.set('trust proxy', 1);
+  /*
    * MIRRORS server.js DELIBERATELY. The 25 MB limit is the thing several tests
    * below depend on: a ~16 MB maximal-but-legal photo batch must reach our own
    * validation rather than dying at body-parser with a 413. If server.js's
@@ -217,8 +229,12 @@ beforeEach(() => {
 
 /*
  * A fresh synthetic client IP per request. The POST limiter is 8 / 10 min keyed
- * on `wb-post:<clientIp>`, and clientIp() honours the FIRST x-forwarded-for hop
- * — so this is the limiter's own partitioning, used as intended, not a bypass.
+ * on `wb-post:<clientIp>`, and clientIp() returns req.ip — which, under the
+ * `trust proxy` setting above, resolves to this single-entry x-forwarded-for.
+ * That is the limiter's own partitioning, used as intended, not a bypass: a
+ * REAL client cannot reach the router this way, because the prod nginx APPENDS
+ * the address it saw to whatever the caller sent, and req.ip takes that last
+ * entry. Nothing here is a way to choose your own bucket.
  */
 let ipSeq = 0;
 function nextIp() {

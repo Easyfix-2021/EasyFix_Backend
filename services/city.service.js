@@ -17,7 +17,21 @@ const logger = require('../logger');
  * deactivating downstream entities reflects on the next page load.
  */
 
-const STATUS_ACTIVE = 1;
+const STATUS_INACTIVE = 0;
+const STATUS_ACTIVE   = 1;
+/*
+ * PENDING is a SENTINEL on the existing tinyint, not a new column — same
+ * shape as DELETED_STATUS = 3 in services/entity-deletion.service.js.
+ * Six code paths (three of them unauthenticated) create cities on the fly;
+ * they now write 2 so the city exists for the booking that needed it but is
+ * not offered anywhere until an operator approves it.
+ *
+ * ⚠ Do NOT propagate a `city_status = 1` filter into name-resolution JOINs.
+ * ~160 places read tbl_city and most correctly do not filter, because a
+ * saved job must keep rendering its city after that city is deactivated.
+ * Only SELECTION surfaces filter.
+ */
+const STATUS_PENDING  = 2;
 
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
 
@@ -47,9 +61,52 @@ const SORTABLE_COLUMNS = Object.freeze({
 let _hasCityCreatorCol = null;
 async function hasCityCreatorCol() {
   if (_hasCityCreatorCol !== null) return _hasCityCreatorCol;
-  try { const [r] = await pool.query("SHOW COLUMNS FROM tbl_city LIKE 'created_by_type'"); _hasCityCreatorCol = r.length > 0; }
-  catch { _hasCityCreatorCol = false; }
+  try {
+    const [r] = await pool.query("SHOW COLUMNS FROM tbl_city LIKE 'created_by_type'");
+    _hasCityCreatorCol = r.length > 0;
+  } catch {
+    /*
+     * A METADATA probe: absence comes back as ZERO ROWS, so any error here is a
+     * genuine fault — a pool blip, a lock timeout — and never the answer. The
+     * memo is deliberately LEFT NULL so the next call re-probes; caching false
+     * would disable the feature until the container restarts, which is the
+     * defect tests/schema-probe-failure-not-cached.test.js exists to catch.
+     * (utils/schema-absent-error.js documents the two probe styles; only the
+     * try-the-query style may cache its error.)
+     */
+    return false;
+  }
   return _hasCityCreatorCol;
+}
+
+/*
+ * Approval-audit columns (approved_by / approved_at / approval_decision /
+ * merged_into_city_id) ship in migrations/2026-09-09-city-approval-flow.sql
+ * and are NOT on QA. Same probe-once-and-guard shape as hasCityCreatorCol()
+ * above: approve/reject must work on a database where the migration has not
+ * run — minus the audit stamp — rather than throwing ER_BAD_FIELD_ERROR.
+ * One column stands for all four: they land in a single ALTER block, so a
+ * database with one has all of them.
+ */
+let _hasCityApprovalCols = null;
+async function hasCityApprovalCols() {
+  if (_hasCityApprovalCols !== null) return _hasCityApprovalCols;
+  try {
+    const [r] = await pool.query("SHOW COLUMNS FROM tbl_city LIKE 'approval_decision'");
+    _hasCityApprovalCols = r.length > 0;
+  } catch {
+    /*
+     * A METADATA probe: absence comes back as ZERO ROWS, so any error here is a
+     * genuine fault — a pool blip, a lock timeout — and never the answer. The
+     * memo is deliberately LEFT NULL so the next call re-probes; caching false
+     * would disable the feature until the container restarts, which is the
+     * defect tests/schema-probe-failure-not-cached.test.js exists to catch.
+     * (utils/schema-absent-error.js documents the two probe styles; only the
+     * try-the-query style may cache its error.)
+     */
+    return false;
+  }
+  return _hasCityApprovalCols;
 }
 
 async function listCities({
@@ -240,11 +297,306 @@ async function deactivateCity(cityId) {
   return r.affectedRows > 0;
 }
 
+// ─── Approval queue ──────────────────────────────────────────────────
+/*
+ * Cities the automatic paths created (city_status = 2), newest first, with
+ * enough context for an operator to decide without opening each row: who
+ * created it and how, its district / reference pincode, and how many
+ * pincodes have already attached themselves to it.
+ *
+ * The pincode count is UNFILTERED, unlike listCities()' `pincode_count`
+ * which counts only pincode_status = 1. Here the question is "how much has
+ * already accreted onto this city", and a not-yet-serviceable pincode
+ * counts towards that just as much as a serviceable one.
+ */
+async function listPendingCities({ limit = 200, offset = 0 } = {}) {
+  limit  = Math.min(Math.max(Number(limit)  || 200, 1), 1000);
+  offset = Math.max(Number(offset) || 0, 0);
+  logger.info('List pending cities · limit=' + limit + ' offset=' + offset);
+
+  const hasCreator = await hasCityCreatorCol();
+  const creatorSelect = hasCreator
+    ? "c.created_by, c.created_by_type, c.created_date, COALESCE(cbe.efr_name, cbu.user_name) AS created_by_name"
+    : 'NULL AS created_by, NULL AS created_by_type, NULL AS created_date, NULL AS created_by_name';
+  const creatorJoin = hasCreator
+    ? `LEFT JOIN tbl_easyfixer cbe ON (c.created_by_type = 'technician' AND cbe.efr_id = c.created_by)
+       LEFT JOIN tbl_user      cbu ON (c.created_by_type = 'user'       AND cbu.user_id = c.created_by)`
+    : '';
+  // "Newest first" is created_date where the audit column exists. It is
+  // NULLable (rows predating the migration), and MySQL sorts NULLs LAST in
+  // DESC — which is what we want: undated rows sink below dated ones, and
+  // city_id DESC keeps them in insert order among themselves.
+  const orderBy = hasCreator ? 'c.created_date DESC, c.city_id DESC' : 'c.city_id DESC';
+
+  const [rows] = await pool.query(
+    `SELECT
+        c.city_id,
+        c.city_name,
+        c.state_id,
+        s.state_name,
+        c.district,
+        c.tier,
+        c.reference_pincode,
+        c.city_status,
+        ${creatorSelect},
+        (SELECT COUNT(*) FROM tbl_pincode p WHERE p.city_id = c.city_id) AS pincode_count
+       FROM tbl_city  c
+       LEFT JOIN tbl_state s ON s.state_id = c.state_id
+       ${creatorJoin}
+      WHERE c.city_status = ?
+      ORDER BY ${orderBy}
+      LIMIT ? OFFSET ?`,
+    [STATUS_PENDING, limit, offset]
+  );
+
+  // Full count, not rows.length — the tab badge must show the backlog, not
+  // the page.
+  const [[{ total }]] = await pool.query(
+    'SELECT COUNT(*) AS total FROM tbl_city WHERE city_status = ?', [STATUS_PENDING]
+  );
+
+  logger.info('Returning ' + rows.length + ' pending cities · total=' + total);
+  return { items: rows, total };
+}
+
+// ─── Approve ─────────────────────────────────────────────────────────
+/*
+ * 2 → 1. The status guard lives in the WHERE clause, so the check and the
+ * write are one statement and two operators clicking Approve at the same
+ * moment cannot both win. affectedRows = 0 then means either "no such city"
+ * or "not pending" — one follow-up read tells them apart, and it only runs
+ * on the failure path.
+ */
+async function approveCity(cityId, userId) {
+  logger.info('Approve city · id=' + cityId + ' by=' + (userId || '-'));
+  const stamp = await hasCityApprovalCols();
+  const sets  = ['city_status = ?'];
+  const params = [STATUS_ACTIVE];
+  if (stamp) {
+    sets.push('approved_by = ?', 'approved_at = NOW()', "approval_decision = 'approved'");
+    params.push(userId || null);
+  }
+  params.push(cityId, STATUS_PENDING);
+
+  const [r] = await pool.query(
+    `UPDATE tbl_city SET ${sets.join(', ')} WHERE city_id = ? AND city_status = ?`, params
+  );
+  if (!r.affectedRows) {
+    const current = await getCityById(cityId);
+    if (!current) throw mkErr(404, 'City not found');
+    logger.warn('Approve rejected · not pending · id=' + cityId + ' status=' + current.city_status);
+    throw mkErr(409, `City is not pending approval (city_status = ${current.city_status})`);
+  }
+  logger.info('City approved · id=' + cityId + ' audit=' + stamp);
+  return getCityById(cityId);
+}
+
+// ─── Reject (= MERGE) ────────────────────────────────────────────────
+/*
+ * Rejecting is not deactivating. By the time an operator sees a pending
+ * city, rows already point at it — that is WHY it exists. Flipping it to 0
+ * and walking away strands them: the address keeps a city_id nobody lists,
+ * so the job it belongs to loses its city on every selection surface.
+ *
+ * So a rejection REPOINTS every reference at the replacement city and only
+ * then retires the row.
+ *
+ * ─── THE SCOPE IS MEASURED, NOT GUESSED ────────────────────────────────
+ * Per-row correspondence test against tbl_city over every column in the
+ * schema whose name looks like a city id (rows on QA / share resolving):
+ *
+ *   tbl_address.city_id             354,900   99.8%   ← how JOBS reach a city
+ *   tbl_zone_city_mapping.city_id    57,750   98.7%
+ *   tbl_pincode.city_id              11,052    100%
+ *   tbl_easyfixer.efr_cityId          7,929    100%
+ *   tbl_client.client_city_id            398    100%
+ *   tbl_client_billing.c_bill_city_id    293    100%
+ *   tbl_client_store.city_id               3    100%
+ *   tbl_user.city_id                       3    100%
+ *   firefox_city_mapping.city_id          20    100%
+ *
+ * Two more carry NO data on QA but their WRITERS in this repo settle them,
+ * which is a stronger proof than a correspondence rate:
+ *
+ *   tbl_zone_master.city_id       — services/zone.service.js:361 inserts it
+ *                                   straight after assertCityExists(), and
+ *                                   listCities() above already joins it as a
+ *                                   tbl_city FK for `zone_count`. Included:
+ *                                   leaving it out would orphan zones, and
+ *                                   refusing instead would make every city
+ *                                   with a zone un-rejectable.
+ *   lms_chase_assignment.city_id  — routes/admin/lms-action.js:505 inserts
+ *                                   `Number(t.efr_cityId)`, i.e. a value
+ *                                   copied from a column already on this
+ *                                   list. Included.
+ *
+ * ─── WHAT IS DELIBERATELY NOT TOUCHED ──────────────────────────────────
+ *   tbl_zone_city_mapping.city_zone_id  — 15.9% resolve. A DIFFERENT ID
+ *     SPACE (it is that table's own PK). Repointing it corrupts zone
+ *     mappings.
+ *   tbl_easyfixer.efr_zone_city_id      — 78.8% resolve, which is
+ *     coincidental id-range overlap, not a relationship. It FKs to
+ *     tbl_zone_city_mapping.city_zone_id — stated in zone.service.js:57,
+ *     joined that way in job.service.js:2107,
+ *     candidate-ranking.service.js:1033 and pincode.service.js:142. Same
+ *     forbidden id space as city_zone_id. NOT a tbl_city id.
+ *
+ * ─── UNIQUE-CONSTRAINT HAZARD: CHECKED, information_schema ─────────────
+ * No unique index on any of the eleven tables includes its city column, so
+ * a repoint cannot violate one:
+ *   tbl_address / tbl_easyfixer / tbl_client / tbl_client_billing /
+ *   tbl_user / tbl_zone_master / firefox_city_mapping → PRIMARY only
+ *   tbl_pincode          → uniq_pincode(pincode)
+ *   tbl_client_store     → uq_client_store_code(fk_client_id, store_code)
+ *   lms_chase_assignment → uq(efr_id, course_id, batch_id)
+ *   tbl_zone_city_mapping→ PRIMARY(city_zone_id) only — no (zone_id,
+ *     city_id) unique, so the merge cannot violate one. It CAN create a
+ *     duplicate (zone_id, city_id) pair; QA already holds 3,425 such
+ *     duplicate groups (the documented legacy cross-join in
+ *     job.service.js:2095), and no reader of that table dedupes on the
+ *     pair, so this is pre-existing shape rather than new damage.
+ */
+const MERGE_TARGETS = Object.freeze([
+  ['tbl_address',           'city_id'],
+  ['tbl_zone_city_mapping', 'city_id'],
+  ['tbl_pincode',           'city_id'],
+  ['tbl_easyfixer',         'efr_cityId'],
+  ['tbl_client',            'client_city_id'],
+  ['tbl_client_billing',    'c_bill_city_id'],
+  ['tbl_client_store',      'city_id'],
+  ['tbl_user',              'city_id'],
+  ['firefox_city_mapping',  'city_id'],
+  ['tbl_zone_master',       'city_id'],
+  ['lms_chase_assignment',  'city_id'],
+]);
+
+/*
+ * The one column that could not be established either way.
+ *
+ * tbl_opencity_servicetype.open_city_id is empty on QA AND has zero
+ * references anywhere in this repo, so neither data nor code says what it
+ * points at — and it does not even follow the `city_id` naming convention,
+ * so "it looks like a city id" is the whole of the evidence. It also
+ * carries UNIQUE(open_city_id, service_type_id), which a blind repoint
+ * could violate outright.
+ *
+ * Guessing has two failure modes and they are not symmetric: repointing a
+ * foreign id space corrupts rows silently, while refusing a merge is a
+ * message an operator can read. So: COUNT the rows that reference the
+ * rejected city and REFUSE the whole merge if any exist. Empty — the
+ * expected case, and the only one QA can produce — costs one cheap COUNT
+ * and changes nothing.
+ *
+ * To retire this guard: establish what open_city_id points at, then either
+ * move it into MERGE_TARGETS or delete this block.
+ */
+const UNVERIFIED_TARGETS = Object.freeze([
+  ['tbl_opencity_servicetype', 'open_city_id'],
+]);
+
+async function rejectCity(cityId, replacementCityId, userId) {
+  logger.info('Reject city · id=' + cityId + ' → replacement=' + replacementCityId + ' by=' + (userId || '-'));
+  cityId            = Number(cityId);
+  replacementCityId = Number(replacementCityId);
+  // Cheap enough to answer before taking a connection off the pool.
+  if (cityId === replacementCityId) throw mkErr(400, 'replacement_city_id must be a different city');
+
+  // Probed BEFORE the connection is taken. It runs on the shared pool, and
+  // asking the pool for a second connection while already holding one is
+  // how a saturated pool deadlocks against itself.
+  const stamp = await hasCityApprovalCols();
+
+  let conn;                                  // acquired inside the try; finally releases only if we got one
+  try {
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+
+    // FOR UPDATE, so two operators rejecting the same city serialise here
+    // rather than both passing the status check and merging twice.
+    const [[target]] = await conn.query(
+      'SELECT city_id, city_status FROM tbl_city WHERE city_id = ? FOR UPDATE', [cityId]
+    );
+    if (!target) { throw mkErr(404, 'City not found'); }
+    if (target.city_status !== STATUS_PENDING) {
+      logger.warn('Reject refused · not pending · id=' + cityId + ' status=' + target.city_status);
+      throw mkErr(409, `City is not pending approval (city_status = ${target.city_status})`);
+    }
+
+    // Merging into a pending or inactive city is the trap this guards: it
+    // would move live rows onto a city that is itself awaiting a decision,
+    // or onto one an operator has already retired.
+    const [[replacement]] = await conn.query(
+      'SELECT city_id, city_status FROM tbl_city WHERE city_id = ? LIMIT 1', [replacementCityId]
+    );
+    if (!replacement) { throw mkErr(400, `Unknown replacement_city_id ${replacementCityId}`); }
+    if (replacement.city_status !== STATUS_ACTIVE) {
+      throw mkErr(400, `replacement_city_id ${replacementCityId} is not an active city (city_status = ${replacement.city_status})`);
+    }
+
+    for (const [table, col] of UNVERIFIED_TARGETS) {
+      // A missing table is the same answer as an empty one: nothing can be
+      // orphaned there. Anything else propagates and rolls the merge back.
+      let n = 0;
+      try {
+        const [[row]] = await conn.query(`SELECT COUNT(*) AS n FROM ${table} WHERE ${col} = ?`, [cityId]);
+        n = Number(row.n) || 0;
+      } catch (e) {
+        if (e && e.code === 'ER_NO_SUCH_TABLE') n = 0;
+        else throw e;
+      }
+      if (n > 0) {
+        logger.warn('Reject refused · unverified reference · ' + table + '.' + col + ' rows=' + n + ' city=' + cityId);
+        throw mkErr(409,
+          `${n} row(s) in ${table}.${col} reference this city, and that column's id space is unverified — ` +
+          'merging could corrupt it. Resolve those rows manually, or verify the column and add it to MERGE_TARGETS.');
+      }
+    }
+
+    // Table and column names come only from the frozen constant above —
+    // never from a request — so interpolating them is not an injection
+    // surface, and identifiers cannot be bound as parameters anyway.
+    const moved = {};
+    let total = 0;
+    for (const [table, col] of MERGE_TARGETS) {
+      const [r] = await conn.query(
+        `UPDATE ${table} SET ${col} = ? WHERE ${col} = ?`, [replacementCityId, cityId]
+      );
+      moved[`${table}.${col}`] = r.affectedRows;
+      total += r.affectedRows;
+    }
+
+    const sets  = ['city_status = ?'];
+    const params = [STATUS_INACTIVE];
+    if (stamp) {
+      sets.push('approved_by = ?', 'approved_at = NOW()', "approval_decision = 'rejected'", 'merged_into_city_id = ?');
+      params.push(userId || null, replacementCityId);
+    }
+    params.push(cityId);
+    await conn.query(`UPDATE tbl_city SET ${sets.join(', ')} WHERE city_id = ?`, params);
+
+    await conn.commit();
+    logger.info('City rejected + merged · id=' + cityId + ' → ' + replacementCityId + ' rows=' + total + ' audit=' + stamp);
+    return { city_id: cityId, merged_into_city_id: replacementCityId, rows_moved: total, moved, audit_recorded: stamp };
+  } catch (e) {
+    try { if (conn) await conn.rollback(); } catch { /* connection already gone */ }
+    if (!e || !e.status) logger.error('Reject city failed · id=' + cityId + ' · ' + ((e && e.message) || e));
+    throw e;
+  } finally {
+    if (conn) conn.release();
+  }
+}
+
 module.exports = {
   listCities,
+  listPendingCities,
   getCityById,
   createCity,
   updateCity,
   deactivateCity,
+  approveCity,
+  rejectCity,
+  MERGE_TARGETS,
+  UNVERIFIED_TARGETS,
+  STATUS_PENDING,
   SORTABLE_COLUMNS,
 };

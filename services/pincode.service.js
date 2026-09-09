@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const { CITY_STATUS } = require('../lib/city-status');
 const geocode = require('./pincode-geocode.service');
 const coverage = require('./pincode-coverage.service');
 
@@ -621,7 +622,10 @@ async function fuzzyMatchCity(name, stateId, district = null) {
   // Input qualifier = the name's parenthetical, else the geocoded district.
   const inQual = parenQualifier(name) || normToken(district);
   const [cities] = await pool.query(
-    'SELECT city_id, city_name FROM tbl_city WHERE state_id = ? AND (city_status = 1 OR city_status IS NULL)',
+    // PENDING included deliberately: a second pincode for the same town must
+  // fuzzy-match the city already awaiting approval, not mint a duplicate
+  // pending row beside it. Inactive (0) stays excluded.
+  'SELECT city_id, city_name FROM tbl_city WHERE state_id = ? AND (city_status = 1 OR city_status = 2 OR city_status IS NULL)',
     [Number(stateId)]
   );
   let best = null;
@@ -699,8 +703,26 @@ async function findOrCreateCityByName(cityName, stateId, { district = null, crea
     return { city_id: fuzzy, created: false, matched: 'fuzzy' };
   }
   const inheritedStateUser = await resolveInheritedStateUser(stateId, district);
+  /*
+   * PENDING (city_status = 2), not live.
+   *
+   * Six paths reach here and three need no CRM login at all — the public
+   * website booking, the technician magic-link profile form, and AI transcript
+   * extraction. Until 2026-09-09 every one of them inserted city_status = 1,
+   * so a city became selectable the instant an unauthenticated caller typed an
+   * unknown pincode, with nobody deciding it should exist and no technician
+   * covering it. Operators found several in production and could only react
+   * afterwards.
+   *
+   * The caller is deliberately NOT blocked — the booking or profile update
+   * still succeeds and the pincode still attaches to this city. The city simply
+   * does not appear on any SELECTION surface until Manage Cities approves it.
+   * See migrations/2026-09-09-city-approval-flow.sql for the sentinel and for
+   * which reads do and do not filter on it.
+   */
   const [r] = await pool.query(
-    'INSERT INTO tbl_city (city_name, state_id, district, city_status, state_user) VALUES (?, ?, ?, 1, ?)',
+    `INSERT INTO tbl_city (city_name, state_id, district, city_status, state_user)
+     VALUES (?, ?, ?, ${CITY_STATUS.PENDING}, ?)`,
     [name, Number(stateId), district || null, inheritedStateUser]
   );
   const cityId = r.insertId;
@@ -815,6 +837,42 @@ async function createPincode(
  * Return shape (both branches):
  *   { pincode_id, pincode, city_id, city_name, state_name, lat, lng, created }
  */
+/*
+ * Is this pincode actually covered by anyone right now?
+ *
+ * `tbl_pincode.pincode_status = 1` means "Serviceable", and the flag's own
+ * definition — stated in services/pincode-coverage.service.js and again in the
+ * recomputeServiceableStatus doc block — is "covered by at least one ACTIVE and
+ * VERIFIED technician". Until 2026-09-09 ensurePincode hard-coded `true`, so
+ * every automatically-created pincode asserted coverage it did not have; the
+ * public serviceability endpoint then repeated that assertion to customers for
+ * a row the site itself had just minted.
+ *
+ * The predicate below is deliberately IDENTICAL to the one in
+ * recomputeServiceableStatus (the CSV FIND_IN_SET union with efr_pin_no), so
+ * the value written at creation is the value the bulk recompute would compute.
+ * Two different definitions of "serviceable" would be worse than the bug.
+ *
+ * At creation the honest answer is almost always false — nobody has mapped the
+ * pincode yet — but it is COMPUTED, not assumed, so a pincode that a technician
+ * already lists in their work area is correctly born Serviceable.
+ */
+async function isPincodeCovered(pincode) {
+  const [[row]] = await pool.query(
+    `SELECT EXISTS (
+       SELECT 1
+         FROM tbl_easyfixer e
+         LEFT JOIN tbl_efr_serviceable_pincodes sp ON sp.easyfixer_id = e.efr_id
+        WHERE e.efr_status = 1
+          AND e.is_technician_verified = 1
+          AND ( (sp.pincodes IS NOT NULL AND FIND_IN_SET(?, sp.pincodes) > 0)
+                OR (e.efr_pin_no IS NOT NULL AND e.efr_pin_no = ?) )
+     ) AS covered`,
+    [String(pincode), String(pincode)],
+  );
+  return Number(row && row.covered) === 1;
+}
+
 async function ensurePincode(pincodeRaw, { userId = null, createdByEfrId = null } = {}) {
   const pin = String(pincodeRaw || '').trim();
   logger.info('Ensuring pincode · pincode=' + pin);
@@ -889,7 +947,10 @@ async function ensurePincode(pincodeRaw, { userId = null, createdByEfrId = null 
         district: match.district,
         lat:      match.lat,
         lng:      match.lng,
-        is_active: true,
+        // Computed, never assumed — see isPincodeCovered above. This path has
+        // no operator and no Status toggle, so hard-coding true made the row
+        // claim coverage nobody had.
+        is_active: await isPincodeCovered(pin),
       },
       { userId, createdByEfrId },
     );

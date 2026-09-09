@@ -8,6 +8,7 @@ const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
 const clientRequest = require('../../services/client-request.service');
 const { modernOk, modernError } = require('../../utils/response');
+const { CITY_STATUS } = require('../../lib/city-status');
 const { sendXlsx } = require('../../utils/xlsx-export');
 const { STATUS_LABELS } = require('../../services/integration.service');
 const emailService = require('../../services/email.service');
@@ -2117,39 +2118,27 @@ router.get('/jobs/:id/estimate-preview', async (req, res, next) => {
     const job = await loadJobInScope(req, res, 'Estimate-preview');
     if (!job) return;
 
-    const [services] = await pool.query(
-      `SELECT js.job_service_id, js.job_id, js.service_id,
-              js.quantity, js.total_charge, js.material_charge,
-              js.easyfix_charge, js.easyfixer_charge, js.client_charge,
-              js.job_charge_type, js.service_charge_description,
-              js.job_service_status,
-              CR.crc_ratecard_name AS service_name
-         FROM tbl_job_services js
-         LEFT JOIN tbl_client_service   CS ON CS.client_service_id = js.service_id
-         LEFT JOIN tbl_client_rate_card CR ON CR.crc_id = CS.rate_card_id
-        WHERE js.job_id = ? AND js.job_service_status = 1
-        ORDER BY js.job_service_id ASC`,
-      [jobId]
-    );
-    logger.info('Found ' + services.length + ' approval-pending services');
-
-    // Legacy formula: per-row total = (total_charge × quantity) + material_charge
-    const lines = services.map((s) => {
-      const totalCharge = Number(s.total_charge || 0);
-      const qty = Number(s.quantity || 1);
-      const material = Number(s.material_charge || 0);
-      return { ...s, line_total: totalCharge * qty + material };
-    });
-    const grandTotal = lines.reduce((sum, l) => sum + l.line_total, 0);
+    /*
+     * The legacy formula ((total_charge × quantity) + material_charge) now
+     * lives in services/job-line-total.js, shared with the operator preview and
+     * the estimate email. The client compares this screen against that email;
+     * they were two hand-written copies until 2026-09-09.
+     */
+    const { estimateLinesForJob } = require('../../services/job-line-total');
+    const { lines, totals } = await estimateLinesForJob(jobId);
+    logger.info('Found ' + lines.length + ' approval-pending services');
+    const grandTotal = totals.grand_total;
 
     modernOk(res, {
       job_id: jobId,
       services: lines,
-      totals: {
-        services_subtotal: lines.reduce((s, l) => s + Number(l.total_charge || 0) * Number(l.quantity || 1), 0),
-        material_subtotal: lines.reduce((s, l) => s + Number(l.material_charge || 0), 0),
-        grand_total: grandTotal,
-      },
+      /*
+       * services_subtotal deliberately EXCLUDES material — it is the breakdown
+       * row that sits above material_subtotal, and the two add to grand_total.
+       * That is a presentation split, not a second definition of the total; the
+       * helper computes all three so they cannot stop adding up.
+       */
+      totals,
       already_approved: job.approved_on_date_time != null,
       already_rejected: job.approval_reject_date_time != null,
     });
@@ -3825,13 +3814,25 @@ router.get('/lookup/cities', async (req, res, next) => {
   try {
     const scope = String(req.query.scope || '').toLowerCase();
     if (scope === 'all') {
-      // Every city in tbl_city (no status filter) — the client wants the
-      // full master list available in the New Order form. Columns are still
-      // aliased to { id, name } for the FE dropdown contract.
+      /*
+       * The client wants the full master list in the New Order form, so
+       * INACTIVE cities are still included — that is deliberate and unchanged:
+       * a client may have historical orders in a city ops has since switched
+       * off, and the dropdown must still be able to name it.
+       *
+       * PENDING (city_status = 2) is excluded, and only pending. Those rows are
+       * minted automatically by a pincode add — including from unauthenticated
+       * public paths — and have never been approved by anyone. Offering one here
+       * would let a client raise an order into a city that does not officially
+       * exist yet and that no technician covers. Inactive was a decision;
+       * pending is an absence of one.
+       */
       const [rows] = await pool.query(
         `SELECT city_id AS id, city_name AS name
            FROM tbl_city
-          ORDER BY city_name ASC`
+          WHERE city_status IS NULL OR city_status <> ?
+          ORDER BY city_name ASC`,
+        [CITY_STATUS.PENDING]
       );
       return modernOk(res, { items: rows });
     }
