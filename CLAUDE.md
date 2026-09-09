@@ -154,6 +154,33 @@ curl 'http://localhost:5100/api/shared/lookup/service-types?categoryId=21' -H 'a
 curl 'http://localhost:5100/api/shared/lookup/clients?limit=10' -H 'authorization: Bearer <admin-token>'
 ```
 
+## Container logs (Dozzle) — read them yourself, don't ask
+
+**Prod `http://10.30.2.40:8888/` · QA `http://10.30.2.30:8888/`** — no auth,
+but RFC1918 so the VPN/tunnel must be up.
+
+There is an HTTP API, so a log question does not need a browser or the user:
+
+```bash
+B=http://10.30.2.40:8888                                  # QA: 10.30.2.30:8888
+curl -sN -m 10 "$B/api/events/stream" | head -c 60000      # SSE — sample it; ids + host UUID
+curl -s "$B/api/hosts/<HOST_UUID>/containers/<ID>/logs?stdout=1&stderr=1&everything=true"
+```
+
+`stdout`/`stderr` are required (a 400 "stdout or stderr is required" looks like
+a bad URL). Output is NDJSON — `grep -a` it; `m` holds the message. Discover the
+host UUID each time; it differs per environment. Bare `/api/containers` and
+`/api/hosts` are 404.
+
+Deploys archive the retiring container's logs for 7 days as
+`easyfix-<svc>-logs-<stamp>-<env>-<commit>` — to read a specific release, find
+the archive ending in that sha. In the browser UI those need Settings → "Show
+Stopped Containers" (off by default, per-browser); the API lists them anyway.
+
+Good for boot-only output: `grep -a "Property keys"` (the property-key audit),
+`grep -a "cron registered"` vs `SKIPPED`, and confirming a deploy actually
+restarted the process and on which commit.
+
 ## Important Rules
 - Never modify code outside the scope of the current task. Do not touch files, functions, or flows unrelated to what the user has explicitly asked for.
 - Always build/compile the project after making changes to catch errors before sharing the final summary.
