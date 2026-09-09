@@ -46,6 +46,7 @@
  */
 
 const path = require('path');
+const logger = require('../logger');
 
 const BUCKET = process.env.S3_BUCKET_NAME || '';
 const REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'ap-south-1';
@@ -338,8 +339,7 @@ async function resolveImageUrl(storedValue) {
       // S3 outage / permission error — don't fail the whole image
       // listing; log and fall through to local URL so the user still
       // sees what was previously stored on disk.
-      // eslint-disable-next-line no-console
-      console.warn('s3-storage.resolveImageUrl: S3 lookup failed, falling back to local', { key, err: e?.message });
+      logger.warn('s3-storage.resolveImageUrl: S3 lookup failed, falling back to local', { key, err: e?.message });
       break;
     }
   }
@@ -435,8 +435,7 @@ async function migrateLegacyToS3({ storedValue, jobId, seq }) {
       jobId, seq, buffer, contentType, originalName: stored, category: 'Booking',
     });
   } catch (e) {
-    // eslint-disable-next-line no-console
-    console.warn('s3-storage.migrateLegacyToS3: PutObject failed', { stored, jobId, seq, err: e?.message });
+    logger.warn('s3-storage.migrateLegacyToS3: PutObject failed', { stored, jobId, seq, err: e?.message });
     return null;
   }
 
@@ -450,8 +449,7 @@ async function migrateLegacyToS3({ storedValue, jobId, seq }) {
     // the same row from another request). Logging keeps the audit
     // trail honest without surfacing a user-visible error.
     if (e?.code !== 'ENOENT') {
-      // eslint-disable-next-line no-console
-      console.warn('s3-storage.migrateLegacyToS3: local unlink failed (S3 copy is canonical, leaving local stub)', {
+      logger.warn('s3-storage.migrateLegacyToS3: local unlink failed (S3 copy is canonical, leaving local stub)', {
         localPath, err: e?.message,
       });
     }
@@ -567,8 +565,7 @@ async function resolveNoticeImageUrl(storedValue) {
       // outlive a reading session, not just a click.
       return await getPresignedUrl(stored, NOTICE_PRESIGN_TTL_SEC);
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn('s3-storage.resolveNoticeImageUrl: presign failed', { stored, err: e?.message });
+      logger.warn('s3-storage.resolveNoticeImageUrl: presign failed', { stored, err: e?.message });
       return null;
     }
   }
@@ -636,8 +633,7 @@ async function resolveClientDocumentUrl(storedValue) {
     try {
       return await getPresignedUrl(stored);
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn('s3-storage.resolveClientDocumentUrl: presign failed', { stored, err: e?.message });
+      logger.warn('s3-storage.resolveClientDocumentUrl: presign failed', { stored, err: e?.message });
       return null;
     }
   }
@@ -668,8 +664,7 @@ async function deleteObject(key) {
     await client().send(new DeleteObjectCommand({ Bucket: BUCKET, Key: stored }));
     return { deleted: true };
   } catch (e) {
-    // eslint-disable-next-line no-console
-    console.warn('s3-storage.deleteObject: failed', { key: stored, err: e?.message });
+    logger.warn('s3-storage.deleteObject: failed', { key: stored, err: e?.message });
     return { deleted: false, reason: 'error', error: e?.message };
   }
 }

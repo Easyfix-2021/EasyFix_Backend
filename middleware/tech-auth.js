@@ -1,6 +1,8 @@
 const jwt = require('jsonwebtoken');
 const { findById } = require('../services/tech-auth.service');
 const { modernError } = require('../utils/response');
+const { asyncMiddleware } = require('../utils/async-middleware');
+
 
 async function requireTechAuth(req, res, next) {
   const token = req.cookies?.techToken ||
@@ -25,4 +27,7 @@ async function requireTechAuth(req, res, next) {
 // scheme to any route guarded by this middleware.
 requireTechAuth._openapi = { security: 'bearerTech' };
 
-module.exports = requireTechAuth;
+// Wrapped: the DB lookup above is awaited outside any try. Without this,
+// a pool/DB fault here EXITS THE PROCESS rather than returning a 500.
+// See utils/async-middleware.js (2026-09-08 incident).
+module.exports = asyncMiddleware(requireTechAuth);

@@ -697,113 +697,122 @@ router.get('/web-credentials', requireClickToCallAction, async (req, res) => {
  * configuration, not credentials, and the auth token is never echoed.
  */
 router.get('/web-diagnostics', requireClickToCallAction, async (req, res) => {
-  logger.info('Plivo web diagnostics requested · by=' + req.user.user_id);
+  // "Never throws" (header) taken literally: the one endpoint you open when
+  // calling is already broken must answer even if a probe itself misbehaves.
+  // `checks` is declared outside the try so the catch can still report whatever
+  // was gathered before the failure.
   const checks = [];
-  const add = (name, ok, detail) => checks.push({ name, ok, detail });
+  try {
+    logger.info('Plivo web diagnostics requested · by=' + req.user.user_id);
+    const add = (name, ok, detail) => checks.push({ name, ok, detail });
 
-  const authId = (process.env.PLIVO_AUTH_ID || '').trim();
-  const authToken = (process.env.PLIVO_AUTH_TOKEN || '').trim();
-  const appId = (process.env.PLIVO_WEB_APP_ID || '').trim();
-  const endpointUser = (process.env.PLIVO_ENDPOINT_USERNAME || '').trim();
-  const base = (process.env.PLIVO_CALLBACK_BASE_URL || process.env.PUBLIC_API_BASE_URL || '').replace(/\/+$/, '');
-  const expectedAnswerUrl = base ? `${base}/api/public/plivo/web-answer` : null;
+    const authId = (process.env.PLIVO_AUTH_ID || '').trim();
+    const authToken = (process.env.PLIVO_AUTH_TOKEN || '').trim();
+    const appId = (process.env.PLIVO_WEB_APP_ID || '').trim();
+    const endpointUser = (process.env.PLIVO_ENDPOINT_USERNAME || '').trim();
+    const base = (process.env.PLIVO_CALLBACK_BASE_URL || process.env.PUBLIC_API_BASE_URL || '').replace(/\/+$/, '');
+    const expectedAnswerUrl = base ? `${base}/api/public/plivo/web-answer` : null;
 
-  if (!authId || !authToken) {
-    add('Plivo credentials', false, 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN are not set — nothing else can be checked.');
-    return modernOk(res, { checks, expectedAnswerUrl });
-  }
-
-  const auth = 'Basic ' + Buffer.from(`${authId}:${authToken}`).toString('base64');
-  const get = async (path) => {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 8000);
-    try {
-      const r = await fetch(`https://api.plivo.com/v1/Account/${encodeURIComponent(authId)}${path}`,
-        { method: 'GET', headers: { Authorization: auth }, signal: ctrl.signal });
-      const text = await r.text();
-      let json = null;
-      try { json = JSON.parse(text); } catch { /* non-JSON body */ }
-      return { httpStatus: r.status, ok: r.status >= 200 && r.status < 300, json, text };
-    } catch (e) {
-      return { httpStatus: 0, ok: false, json: null, text: String(e && e.message) };
-    } finally { clearTimeout(t); }
-  };
-
-  // ── The application the browser token pins the call to.
-  let appAnswerUrl = null;
-  if (!appId) {
-    add('PLIVO_WEB_APP_ID', false,
-      'Not set. The access token carries no `app` claim, so Plivo has no Voice Application '
-      + 'to route the browser leg to and never calls our answer URL.');
-  } else {
-    const r = await get(`/Application/${encodeURIComponent(appId)}/`);
-    if (r.httpStatus === 404) {
-      add('Voice Application', false, `Plivo has no application with id ${appId}. PLIVO_WEB_APP_ID points at something that does not exist.`);
-    } else if (!r.ok) {
-      add('Voice Application', false, `Could not read application ${appId} from Plivo (http=${r.httpStatus}).`);
-    } else {
-      const a = r.json || {};
-      appAnswerUrl = a.answer_url || null;
-      add('Voice Application', true, `"${a.app_name || '(unnamed)'}" (${appId})`);
-      // `enabled` is a real field and a disabled app routes nothing.
-      if (a.enabled === false) add('Application enabled', false, 'This application is DISABLED in Plivo.');
-      if (!appAnswerUrl) {
-        add('Answer URL', false, 'This application has NO answer URL, so Plivo has nothing to fetch when the browser leg connects.');
-      } else if (expectedAnswerUrl && appAnswerUrl.replace(/\/+$/, '') !== expectedAnswerUrl) {
-        add('Answer URL', false,
-          `Plivo will fetch ${appAnswerUrl} — this server expects ${expectedAnswerUrl}. `
-          + 'A call routed to a different host will never reach our conference code.');
-      } else {
-        add('Answer URL', true, appAnswerUrl + (a.answer_method ? ` (${a.answer_method})` : ''));
-      }
-      if (!a.hangup_url) {
-        add('Hangup URL', false, 'Not set — a leg that dies at Plivo is never reported back, so its row stays open until the reaper.');
-      }
+    if (!authId || !authToken) {
+      add('Plivo credentials', false, 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN are not set — nothing else can be checked.');
+      return modernOk(res, { checks, expectedAnswerUrl });
     }
-  }
 
-  // ── The endpoint the browser logs in as, and which application it carries.
-  if (!endpointUser) {
-    add('PLIVO_ENDPOINT_USERNAME', false, 'Not set — no browser endpoint to log in as.');
-  } else {
-    const r = await get('/Endpoint/');
-    const list = (r.json && (Array.isArray(r.json.objects) ? r.json.objects : [])) || [];
-    if (!r.ok) {
-      add('Browser endpoint', false, `Could not list endpoints from Plivo (http=${r.httpStatus}).`);
+    const auth = 'Basic ' + Buffer.from(`${authId}:${authToken}`).toString('base64');
+    const get = async (path) => {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      try {
+        const r = await fetch(`https://api.plivo.com/v1/Account/${encodeURIComponent(authId)}${path}`,
+          { method: 'GET', headers: { Authorization: auth }, signal: ctrl.signal });
+        const text = await r.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch { /* non-JSON body */ }
+        return { httpStatus: r.status, ok: r.status >= 200 && r.status < 300, json, text };
+      } catch (e) {
+        return { httpStatus: 0, ok: false, json: null, text: String(e && e.message) };
+      } finally { clearTimeout(t); }
+    };
+
+    // ── The application the browser token pins the call to.
+    let appAnswerUrl = null;
+    if (!appId) {
+      add('PLIVO_WEB_APP_ID', false,
+        'Not set. The access token carries no `app` claim, so Plivo has no Voice Application '
+        + 'to route the browser leg to and never calls our answer URL.');
     } else {
-      const mine = list.find((e) => String(e.username || '') === endpointUser);
-      if (!mine) {
-        add('Browser endpoint', false,
-          `No endpoint named "${endpointUser}" on this account (${list.length} exist). Note Plivo APPENDS a `
-          + '12-digit suffix at creation — PLIVO_ENDPOINT_USERNAME must be the full generated username.');
+      const r = await get(`/Application/${encodeURIComponent(appId)}/`);
+      if (r.httpStatus === 404) {
+        add('Voice Application', false, `Plivo has no application with id ${appId}. PLIVO_WEB_APP_ID points at something that does not exist.`);
+      } else if (!r.ok) {
+        add('Voice Application', false, `Could not read application ${appId} from Plivo (http=${r.httpStatus}).`);
       } else {
-        add('Browser endpoint', true, `"${endpointUser}" exists.`);
-        /*
-         * An endpoint carries its OWN application, and it is the fallback when
-         * the token pins none. Reporting a disagreement matters: an endpoint
-         * pointing at a different app than PLIVO_WEB_APP_ID is a setup that
-         * works until someone edits the app they think is in use.
-         */
-        const attached = String(mine.application || '');
-        if (!attached) {
-          add('Endpoint application', false, 'No application attached to this endpoint — routing depends entirely on the token\'s `app` claim.');
-        } else if (appId && !attached.includes(appId)) {
-          add('Endpoint application', false, `The endpoint is attached to ${attached}, which is NOT PLIVO_WEB_APP_ID (${appId}).`);
+        const a = r.json || {};
+        appAnswerUrl = a.answer_url || null;
+        add('Voice Application', true, `"${a.app_name || '(unnamed)'}" (${appId})`);
+        // `enabled` is a real field and a disabled app routes nothing.
+        if (a.enabled === false) add('Application enabled', false, 'This application is DISABLED in Plivo.');
+        if (!appAnswerUrl) {
+          add('Answer URL', false, 'This application has NO answer URL, so Plivo has nothing to fetch when the browser leg connects.');
+        } else if (expectedAnswerUrl && appAnswerUrl.replace(/\/+$/, '') !== expectedAnswerUrl) {
+          add('Answer URL', false,
+            `Plivo will fetch ${appAnswerUrl} — this server expects ${expectedAnswerUrl}. `
+            + 'A call routed to a different host will never reach our conference code.');
         } else {
-          add('Endpoint application', true, attached);
+          add('Answer URL', true, appAnswerUrl + (a.answer_method ? ` (${a.answer_method})` : ''));
+        }
+        if (!a.hangup_url) {
+          add('Hangup URL', false, 'Not set — a leg that dies at Plivo is never reported back, so its row stays open until the reaper.');
         }
       }
     }
-  }
 
-  if (!base) {
-    add('Callback base', false, 'PLIVO_CALLBACK_BASE_URL / PUBLIC_API_BASE_URL is not set — conference status callbacks are disabled.');
-  }
+    // ── The endpoint the browser logs in as, and which application it carries.
+    if (!endpointUser) {
+      add('PLIVO_ENDPOINT_USERNAME', false, 'Not set — no browser endpoint to log in as.');
+    } else {
+      const r = await get('/Endpoint/');
+      const list = (r.json && (Array.isArray(r.json.objects) ? r.json.objects : [])) || [];
+      if (!r.ok) {
+        add('Browser endpoint', false, `Could not list endpoints from Plivo (http=${r.httpStatus}).`);
+      } else {
+        const mine = list.find((e) => String(e.username || '') === endpointUser);
+        if (!mine) {
+          add('Browser endpoint', false,
+            `No endpoint named "${endpointUser}" on this account (${list.length} exist). Note Plivo APPENDS a `
+            + '12-digit suffix at creation — PLIVO_ENDPOINT_USERNAME must be the full generated username.');
+        } else {
+          add('Browser endpoint', true, `"${endpointUser}" exists.`);
+          /*
+           * An endpoint carries its OWN application, and it is the fallback when
+           * the token pins none. Reporting a disagreement matters: an endpoint
+           * pointing at a different app than PLIVO_WEB_APP_ID is a setup that
+           * works until someone edits the app they think is in use.
+           */
+          const attached = String(mine.application || '');
+          if (!attached) {
+            add('Endpoint application', false, 'No application attached to this endpoint — routing depends entirely on the token\'s `app` claim.');
+          } else if (appId && !attached.includes(appId)) {
+            add('Endpoint application', false, `The endpoint is attached to ${attached}, which is NOT PLIVO_WEB_APP_ID (${appId}).`);
+          } else {
+            add('Endpoint application', true, attached);
+          }
+        }
+      }
+    }
 
-  const failing = checks.filter((c) => !c.ok);
-  for (const c of failing) logger.error(`Plivo web diagnostics · ${c.name} · ${c.detail}`);
-  logger.info(`Plivo web diagnostics · ${checks.length - failing.length}/${checks.length} checks passed`);
-  return modernOk(res, { checks, expectedAnswerUrl, healthy: failing.length === 0 });
+    if (!base) {
+      add('Callback base', false, 'PLIVO_CALLBACK_BASE_URL / PUBLIC_API_BASE_URL is not set — conference status callbacks are disabled.');
+    }
+
+    const failing = checks.filter((c) => !c.ok);
+    for (const c of failing) logger.error(`Plivo web diagnostics · ${c.name} · ${c.detail}`);
+    logger.info(`Plivo web diagnostics · ${checks.length - failing.length}/${checks.length} checks passed`);
+    return modernOk(res, { checks, expectedAnswerUrl, healthy: failing.length === 0 });
+  } catch (e) {
+    logger.error({ err: e && e.message }, 'Plivo web diagnostics failed');
+    return modernOk(res, { checks, expectedAnswerUrl: null, healthy: false, error: 'diagnostics failed' });
+  }
 });
 
 // ─── POST /web-start — begin a Web (browser WebRTC) call ───────────────

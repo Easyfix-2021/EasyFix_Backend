@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const ttlCache = require('../utils/ttl-cache');
 const { resolveLoginOtp, staticLoginOtpFor, otpExpiryDate } = require('../utils/otp');
 const { signUserToken } = require('../utils/jwt');
 const { istIsPast } = require('../utils/ist-calendar');
@@ -56,7 +57,116 @@ async function findActiveUserByIdentifier(identifier) {
   return user || null;
 }
 
-async function findUserById(userId) {
+/*
+ * ─── requireAuth's principal cache (added 2026-09-08) ─────────────────────
+ *
+ * WHY. findUserById is the single highest-frequency query in the process:
+ * middleware/auth.js runs it before ANY work on /api/admin, /api/client,
+ * /api/mobile and /api/shared. On 2026-09-08 the pool (connectionLimit 30,
+ * queueLimit 50 — db.js) hit "Queue limit reached" with this frame on the
+ * stack. Every authed request paying a pool acquire just to re-read one
+ * unchanged row is the largest per-request saving available.
+ *
+ * WHY utils/ttl-cache DESPITE its "never for per-user data" header. That
+ * header states a rule and its reason: "a value cached for user A would be
+ * served to user B". The reason only bites when the key fails to
+ * discriminate. Its actual CONTRACT is narrower than its prose summary:
+ *   - "the cache KEY must be derivable purely from non-user inputs (the
+ *     lookup name + its query args)" — the parenthetical DEFINES the
+ *     permitted material, and `auth:user:<id>` is exactly the lookup name
+ *     plus findUserById's one and only query arg;
+ *   - "if the result varies by CALLER, the data is personalized" —
+ *     findUserById(7) returns row 7 for every caller. It varies by
+ *     ARGUMENT, and the argument is in the key. Cross-user bleed is
+ *     structurally impossible here, and tests/auth-user-cache.test.js pins
+ *     that (two ids → two rows) as its most important assertion.
+ * The clause this call site genuinely does NOT satisfy is the staleness
+ * one: "acceptable ONLY for data ... tolerant of a few minutes of
+ * staleness (static master lists)". An auth principal is not. That is
+ * answered below by the TTL — seconds, not the "few minutes" the header
+ * contemplates — not by pretending the clause doesn't apply.
+ * (The header of utils/ttl-cache.js deserves a sentence recording this
+ * carve-out; that file is outside this change's scope.)
+ *
+ * WHAT A STALE ROW ACTUALLY PERMITS, column by column. Every one of these
+ * is read straight off req.user by the gate stack, so a stale value is a
+ * stale authorization decision, not a stale label:
+ *   user_status   — the SELECT filters `user_status = 1`, so a cached hit
+ *                   IS the authentication decision. Stale ⇒ a DEACTIVATED
+ *                   or admin-DELETED (tombstoned, status 3) user keeps a
+ *                   working session for up to the TTL. The worst of the
+ *                   six, and the reason the TTL is seconds.
+ *   user_type_id  — filtered `= 5` (internal). Stale ⇒ a user demoted out
+ *                   of internal staff keeps CRM access.
+ *   user_role     — feeds ROLE_ID_TO_GROUP (role.service) and every
+ *                   role()/roleByName() guard. Stale ⇒ a demoted user
+ *                   keeps the old group; a user moved out of Finance can
+ *                   still reach finance-only reports.
+ *   manage_clients / manage_cities / manage_states / manage_verticals
+ *                 — the req.scope geo/client allowlists (lib/scope.js).
+ *                   Stale ⇒ a re-scoped user still reads jobs, clients and
+ *                   reports for territory they were just removed from.
+ *   city_id, user_name, official_email, mobile_no, alternate_no, user_code
+ *                 — display/identity only; a stale value here misleads,
+ *                   it does not permit anything.
+ *
+ * TTL = 15s, from ONE knob shared with role.service's per-user permissions
+ * cache (reconciled 2026-09-08 — see that file for the matching note).
+ *
+ *   - THE TTL IS A BACKSTOP, NOT THE STALENESS BOUND. Production runs a
+ *     SINGLE backend process: deploy/docker-compose.prod-backend.yml sets
+ *     container_name (which blocks `compose --scale`), nothing sets
+ *     deploy.replicas, and ecosystem.config.js is instances:1 /
+ *     exec_mode:'fork'. So in-process invalidation is COMPLETE — every
+ *     writer that calls invalidateUserCaches() is visible on the very next
+ *     request, with no window at all. What the TTL actually bounds is the
+ *     UNINSTRUMENTED write: a direct SQL edit, or a writer nobody wired.
+ *
+ *     ⚠ An earlier version of this note reasoned from "ACA runs several
+ *     replicas". That is the wrong deployment for this service, and it is
+ *     the premise the whole number rests on — so if this ever moves to
+ *     cluster mode or a second container, re-derive the TTL rather than
+ *     keeping it: the cross-process world is the one where the TTL becomes
+ *     the ONLY bound.
+ *
+ *   - WHY BOTH CACHES SHARE THE NUMBER. A request passes through both, so
+ *     the staleness anyone experiences is the MAX of the two. A 15s cache
+ *     beside a 60s one is a 60s system, and the 15s is decoration. The
+ *     permissions cache was 60s until this was reconciled; lowering it is
+ *     what actually improved the perceived propagation delay, not this one.
+ *
+ *   - WHY NOT LONGER. ttl-cache joins concurrent callers into ONE query
+ *     regardless of TTL, which already collapses the FE's parallel widget
+ *     loads; the TTL only has to span an operator's sequential
+ *     click-through burst (measured at 3-8 requests per click). 15s → 60s
+ *     buys a few points of hit rate for 4x the exposure window on a write
+ *     nobody instrumented.
+ *
+ * Set AUTH_USER_CACHE_TTL_MS=0 to disable BOTH caches — one knob that tunes
+ * and kills, rather than a second boolean for a value already able to
+ * express "off". Default ON: this ships against a live incident, and a
+ * cache that needs a var set before it does anything fails by re-running
+ * the outage. Garbage or empty values parse to 0 and therefore disable —
+ * the fail-safe direction. Guarded by tests/auth-cache-reconciliation.test.js,
+ * which asserts the 0 actually reaches both.
+ */
+const AUTH_CACHE_TTL_MS = Number(process.env.AUTH_USER_CACHE_TTL_MS ?? 15_000);
+const AUTH_CACHE_PREFIX = 'auth:user:';
+/*
+ * Sentinel for "no such active internal user". ttl-cache never stores a
+ * rejection, so throwing this is how a NULL stays uncached — a user created
+ * or reactivated one second ago must not be locked out for the TTL by a
+ * negative we cached a moment before. The tension with "a miss must not be
+ * a free pass to hammer the DB" is resolved by ttl-cache's in-flight join
+ * rather than by caching the negative: a burst of 200 concurrent requests
+ * carrying a dead token still issues exactly ONE query, and sequential
+ * misses cost precisely what they cost today, so nothing regresses. The
+ * request 401s immediately afterwards either way.
+ * One shared instance: identity-compared, never surfaced, no per-miss stack.
+ */
+const USER_MISS = new Error('user not found');
+
+async function _loadUserById(userId) {
   const [[user]] = await pool.query(
     `SELECT user_id, user_code, user_name, official_email, user_role, user_type_id,
             city_id, mobile_no, alternate_no,
@@ -70,6 +180,62 @@ async function findUserById(userId) {
     [userId]
   );
   return user || null;
+}
+
+async function findUserById(userId) {
+  if (!(AUTH_CACHE_TTL_MS > 0)) return _loadUserById(userId);
+  try {
+    return await ttlCache.cached(AUTH_CACHE_PREFIX + Number(userId), AUTH_CACHE_TTL_MS, async () => {
+      const user = await _loadUserById(userId);
+      if (!user) throw USER_MISS;
+      return user;
+    });
+  } catch (err) {
+    if (err === USER_MISS) return null;
+    throw err;
+  }
+}
+
+/*
+ * Drop a user's cached auth principal. Call from EVERY writer that changes
+ * user_status, user_type_id, user_role or a manage_* scope column on an
+ * internal (user_type_id = 5) row — see services/user.service.js for the
+ * covered ones. Without it the TTL still self-corrects; this just shortens
+ * that to zero on the replica that served the write (and only that one —
+ * see the multi-replica note above, which is why this is a shortcut, never
+ * the safety mechanism).
+ *
+ * No argument clears every cached principal — via clearPrefix, NEVER
+ * ttlCache.clear(), which takes no key and would wipe the whole shared
+ * store (lookups, deep-skill image probes, the Plivo balance) along with it.
+ */
+/*
+ * Bust EVERY per-user cache on the auth path, in one call.
+ *
+ * There are two of them — the user row here and the effective-permissions map
+ * in role.service — and a writer that remembers one and forgets the other
+ * leaves the system half-updated in a way nothing detects. That already
+ * happened: the tombstone-delete path invalidated the user row and left the
+ * deleted user's permissions cached. Callers should use THIS, not either
+ * single-cache function, so the set can grow without auditing every writer.
+ *
+ * Lazily required: auth.service and role.service do not import each other at
+ * module scope today, and a top-level require here would create the cycle.
+ */
+function invalidateUserCaches(userId) {
+  invalidateUserCache(userId);
+  try {
+    require('./role.service').invalidatePermissionsCache(userId);
+  } catch (err) {
+    // Never let a cache eviction fail the write that triggered it — the DB
+    // change has already committed, and the TTL is the backstop.
+    logger.warn('Permissions cache invalidation failed · userId=' + userId + ' · ' + err.message);
+  }
+}
+
+function invalidateUserCache(userId) {
+  if (userId == null) ttlCache.clearPrefix(AUTH_CACHE_PREFIX);
+  else ttlCache.clear(AUTH_CACHE_PREFIX + Number(userId));
 }
 
 async function createLoginOtp(identifier) {
@@ -247,6 +413,8 @@ async function verifyLoginOtp(identifier, otp) {
 module.exports = {
   findActiveUserByIdentifier,
   findUserById,
+  invalidateUserCache,
+  invalidateUserCaches,
   createLoginOtp,
   verifyLoginOtp,
 };

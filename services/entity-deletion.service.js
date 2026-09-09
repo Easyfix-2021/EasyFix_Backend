@@ -342,6 +342,37 @@ async function tombstoneDelete(entityType, id, reason, admin) {
     );
 
     await conn.commit();
+
+    /*
+     * Drop the deleted principal from the auth cache.
+     *
+     * Both per-user auth caches are busted here (the user row AND the
+     * effective-permissions map) — a deleted user whose permissions stayed
+     * cached would keep acting on them for the TTL. The TTL bounds staleness, but
+     * for a DELETE the bound is the wrong tool: this row's status column has
+     * just been set to the deleted sentinel and its PII scrubbed, and until the
+     * entry expires that admin-deleted user keeps a working session.
+     *
+     * Only tbl_user is cached — every other parentTable this generic deleter
+     * handles is a no-op here, so the guard is the condition, not an
+     * optimisation. Deliberately AFTER commit: invalidating before it would
+     * re-populate the cache from the pre-delete row if the transaction then
+     * rolled back.
+     *
+     * This only clears the CURRENT replica. Several run in production, so the
+     * TTL remains the real bound elsewhere — that is a reason to keep the TTL
+     * short, not a reason to skip this.
+     */
+    if (g.parentTable === 'tbl_user') {
+      try {
+        require('./auth.service').invalidateUserCaches(id);
+      } catch (err) {
+        // Never fail a completed deletion over a cache eviction — the row IS
+        // deleted; the worst case is the TTL bound we already accept.
+        logger.warn('Auth cache invalidation failed after tombstone · id=' + id + ' · ' + err.message);
+      }
+    }
+
     logger.info(entityType + ' tombstoned · id=' + id + ' · archiveId=' + ins.insertId);
     logger.event('🗑️', 'yellow',
       `admin-delete: tombstoned ${entityType} ${id} (archive #${ins.insertId}) by ${admin.user_name || admin.user_id}`);

@@ -15,6 +15,15 @@
  *     (the lookup name + its query args). If the result varies by caller,
  *     the data is personalized and MUST NOT be cached here.
  *
+ *     CARVE-OUT (added 2026-09-08, so the auth call site does not read as a
+ *     violation): the rule above is about the KEY, and a value that varies by
+ *     ARGUMENT rather than by CALLER is fine when that argument IS the key —
+ *     `findUserById(7)` returns row 7 for everyone, and `auth:user:7` cannot
+ *     serve user 8. The prohibition that still binds such a call site is the
+ *     STALENESS one: "tolerant of a few minutes" does not describe an auth
+ *     principal, so a per-entity key here obliges a TTL of SECONDS plus
+ *     explicit invalidation on every writer. See services/auth.service.js.
+ *
  * Concurrency: the in-flight promise is stored so a stampede of concurrent
  * callers for the same cold key share a single asyncFn() execution. If that
  * promise rejects, the key is evicted so the next caller retries (we never

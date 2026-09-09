@@ -873,15 +873,13 @@ async function hasClientVerticalIdColumn() {
     _hasClientVerticalIdColumn = rows.length > 0;
   } catch (e) {
     // SHOW COLUMNS itself failed — be conservative and treat as missing.
-    // eslint-disable-next-line no-console
-    console.warn('[job.service] could not probe tbl_client.vertical_id:', e?.message);
+    logger.warn('[job.service] could not probe tbl_client.vertical_id', { err: e?.message });
     // A failure is NOT cached. This asks the SCHEMA, so absence is zero rows and
     // any error is a genuine fault — freezing it would disable this until restart.
     return false;
   }
   if (!_hasClientVerticalIdColumn) {
-    // eslint-disable-next-line no-console
-    console.warn('[job.service] tbl_client.vertical_id not present — verticals scope filter will be skipped on jobs list/count queries. Client→vertical mapping may live in tbl_vertical_mapping; wire that JOIN if vertical-based RBAC matters.');
+    logger.warn('[job.service] tbl_client.vertical_id not present — verticals scope filter will be skipped on jobs list/count queries. Client→vertical mapping may live in tbl_vertical_mapping; wire that JOIN if vertical-based RBAC matters.');
   }
   return _hasClientVerticalIdColumn;
 }

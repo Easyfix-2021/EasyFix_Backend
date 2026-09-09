@@ -64,19 +64,26 @@ router.post('/ring', async (req, res) => {
 
   logger.info('Plivo ring webhook · jci=' + claims.jci);
   try {
-    await pool.query(
-      `UPDATE tbl_job_caller_info
-          SET caller_status = 'ringing',
-              unique_id = COALESCE(?, unique_id)
-        WHERE job_caller_info = ?`,
-      [req.body.CallUUID || null, claims.jci]
-    );
-  } catch (err) {
-    logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo ring webhook: update failed');
+    try {
+      await pool.query(
+        `UPDATE tbl_job_caller_info
+            SET caller_status = 'ringing',
+                unique_id = COALESCE(?, unique_id)
+          WHERE job_caller_info = ?`,
+        [req.body.CallUUID || null, claims.jci]
+      );
+    } catch (err) {
+      logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo ring webhook: update failed');
+    }
+    await plivoLog.markRinging(claims.jci, req.body.CallUUID || null);
+    logger.info('Plivo ring recorded · jci=' + claims.jci);
+    return res.json({ ok: true });
+  } catch (e) {
+    // Header: always 200, errors logged server-side only — a 500 here makes
+    // Plivo retry-storm a callback whose work has already partly happened.
+    logger.error({ jci: claims.jci, err: e && e.message }, 'plivo ring webhook: failed · acking 200 anyway');
+    if (!res.headersSent) res.json({ ok: true });
   }
-  await plivoLog.markRinging(claims.jci, req.body.CallUUID || null);
-  logger.info('Plivo ring recorded · jci=' + claims.jci);
-  return res.json({ ok: true });
 });
 
 // ─── POST /hangup — call ended (final status) ──────────────────────────
@@ -92,24 +99,30 @@ router.post('/hangup', async (req, res) => {
 
   logger.info('Plivo hangup webhook · jci=' + claims.jci + ' status=' + status + ' duration=' + (duration != null ? duration : 'n/a'));
   try {
-    await pool.query(
-      `UPDATE tbl_job_caller_info
-          SET caller_status = ?,
-              end_time = NOW(),
-              duration = ?,
-              is_updated = 1,
-              unique_id = COALESCE(?, unique_id)
-        WHERE job_caller_info = ?`,
-      [status, duration, req.body.CallUUID || null, claims.jci]
-    );
-  } catch (err) {
-    logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo hangup webhook: update failed');
+    try {
+      await pool.query(
+        `UPDATE tbl_job_caller_info
+            SET caller_status = ?,
+                end_time = NOW(),
+                duration = ?,
+                is_updated = 1,
+                unique_id = COALESCE(?, unique_id)
+          WHERE job_caller_info = ?`,
+        [status, duration, req.body.CallUUID || null, claims.jci]
+      );
+    } catch (err) {
+      logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo hangup webhook: update failed');
+    }
+    await plivoLog.markTerminalByJci(claims.jci, {
+      status, duration, hangupCause: req.body.HangupCause || null, callUuid: req.body.CallUUID || null,
+    });
+    logger.info('Plivo call finalized · jci=' + claims.jci + ' status=' + status);
+    return res.json({ ok: true });
+  } catch (e) {
+    // Always 200 (file header) — a retried hangup would re-run the finalize.
+    logger.error({ jci: claims.jci, err: e && e.message }, 'plivo hangup webhook: failed · acking 200 anyway');
+    if (!res.headersSent) res.json({ ok: true });
   }
-  await plivoLog.markTerminalByJci(claims.jci, {
-    status, duration, hangupCause: req.body.HangupCause || null, callUuid: req.body.CallUUID || null,
-  });
-  logger.info('Plivo call finalized · jci=' + claims.jci + ' status=' + status);
-  return res.json({ ok: true });
 });
 
 // ─── POST /web-hangup — Web (browser WebRTC) call ended (audit) ────────
@@ -129,21 +142,28 @@ router.post('/web-hangup', async (req, res) => {
 
   logger.info('Plivo web-hangup webhook · callUuid=' + callUuid + ' status=' + status + ' duration=' + (duration != null ? duration : 'n/a'));
   try {
-    await pool.query(
-      `UPDATE tbl_job_caller_info
-          SET caller_status = ?, end_time = NOW(), duration = ?, is_updated = 1
-        WHERE unique_id = ?
-          AND caller_status NOT IN ('completed','busy','no_answer','failed','hungup')`,
-      [status, duration, callUuid]
-    );
-  } catch (err) {
-    logger.warn({ callUuid, err: err && err.message }, 'plivo web-hangup webhook: update failed');
+    try {
+      await pool.query(
+        `UPDATE tbl_job_caller_info
+            SET caller_status = ?, end_time = NOW(), duration = ?, is_updated = 1
+          WHERE unique_id = ?
+            AND caller_status NOT IN ('completed','busy','no_answer','failed','hungup')`,
+        [status, duration, callUuid]
+      );
+    } catch (err) {
+      logger.warn({ callUuid, err: err && err.message }, 'plivo web-hangup webhook: update failed');
+    }
+    await plivoLog.markTerminalByCallUuid(callUuid, {
+      status, duration, hangupCause: req.body.HangupCause || null,
+    });
+    logger.info('Plivo web call finalized · callUuid=' + callUuid + ' status=' + status);
+    return res.json({ ok: true });
+  } catch (e) {
+    // Always 200 (file header) — the UPDATE above is already terminal-guarded,
+    // but a retry storm on a failing callback helps nobody.
+    logger.error({ callUuid, err: e && e.message }, 'plivo web-hangup webhook: failed · acking 200 anyway');
+    if (!res.headersSent) res.json({ ok: true });
   }
-  await plivoLog.markTerminalByCallUuid(callUuid, {
-    status, duration, hangupCause: req.body.HangupCause || null,
-  });
-  logger.info('Plivo web call finalized · callUuid=' + callUuid + ' status=' + status);
-  return res.json({ ok: true });
 });
 
 module.exports = router;

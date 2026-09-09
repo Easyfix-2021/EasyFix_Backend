@@ -65,8 +65,17 @@ router.post('/', async (req, res) => {
   // force a DB refresh — recipients added after boot propagate within the
   // easyfix_properties TTL (~1h) or on the next restart. Enabling alerting requires
   // setting STT_OOM_WEBHOOK_KEY (a redeploy), which reloads the cache fresh anyway.
-  await properties.getAllProperties();
-  const recipients = [...properties.parseEmailAllowlist('teleprompter.stt.alert.emails')];
+  // A DB outage here must not 500: the watcher would retry-storm, and this is
+  // the alert path for an outage in the first place. No properties → no
+  // recipients, which is already a documented no-op reason below.
+  let recipients;
+  try {
+    await properties.getAllProperties();
+    recipients = [...properties.parseEmailAllowlist('teleprompter.stt.alert.emails')];
+  } catch (err) {
+    logger.error(`STT OOM alert: properties lookup failed · ${err.message}`);
+    return modernOk(res, { received: true, alerted: false, reason: 'properties-unavailable' });
+  }
   if (!recipients.length) {
     logger.warn(`STT OOM detected but no recipients set (teleprompter.stt.alert.emails) · container=${container}`);
     return modernOk(res, { received: true, alerted: false, reason: 'no-recipients' });

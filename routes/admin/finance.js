@@ -11,6 +11,17 @@ const { PassThrough } = require('stream');
 const { buildRequestScope, cityScopeSql, assertEntityInScope } = require('../../lib/scope');
 
 /*
+ * Bulk ops-approve width limits. Each item costs TWO pool acquires
+ * (assertEfrInScope + the SP), against db.js's connectionLimit 30 / queueLimit 50
+ * shared with ALL live request and cron traffic. CHUNK is the load-bearing one —
+ * it makes this endpoint's peak demand a constant instead of a function of
+ * caller-supplied array length. MAX is the sanity bound on total request
+ * duration; raise it if a legitimate operator batch is ever refused.
+ */
+const BULK_OPS_APPROVE_MAX = 200;
+const BULK_OPS_APPROVE_CHUNK = 5;
+
+/*
  * Row-level scope guard for every invoice `/invoices/:id*` endpoint.
  * Fetches the invoice's client, asserts the caller's manage_clients
  * scope covers it, and attaches the row at `req.scopedInvoice` so
@@ -636,7 +647,16 @@ router.post('/transactions', validate(Joi.object({
       logger.info('Client transaction created · id=' + ins.insertId + ' clientId=' + req.body.clientId + ' newBalance=' + newBalance);
       modernOk(res, { transactionId: ins.insertId, newBalance });
     } catch (e) { await conn.rollback(); throw e; } finally {
-      await conn.query("SELECT RELEASE_LOCK(CONCAT('client_ledger_', ?))", [req.body.clientId]);
+      // Guarded like the other named-lock sites (services/mysql-named-lock.service.js):
+      // an unguarded throw here would (a) skip conn.release() below it and
+      // (b) REPLACE the in-flight error, hiding why the transaction actually
+      // failed. The advisory lock auto-frees when the session ends, so a failed
+      // release is never worth either of those.
+      try {
+        await conn.query("SELECT RELEASE_LOCK(CONCAT('client_ledger_', ?))", [req.body.clientId]);
+      } catch (err) {
+        logger.warn('client_ledger lock release failed · clientId=' + req.body.clientId + ' · ' + err.message);
+      }
       conn.release();
     }
   } catch (e) { next(e); }
@@ -842,11 +862,16 @@ router.post('/payouts/bulk-ops-approve', validate(Joi.object({
     payoutId: Joi.number().integer().positive().required(),
     efrId: Joi.number().integer().positive().required(),
     opsApprovedAmount: Joi.number().min(0).required(),
-  })).min(1).required(),
+  // .max() is load-bearing, not tidiness: each item costs TWO pool acquires
+  // (assertEfrInScope + the SP), and the pool is 30 connections / 50 queued.
+  // Unbounded, a single caller could issue 81+ simultaneous acquires and hand
+  // every other request in the process "Queue limit reached." The schema is the
+  // only place the width becomes knowable before any query runs.
+  })).min(1).max(BULK_OPS_APPROVE_MAX).required(),
 })), async (req, res, next) => {
   try {
     logger.info('Bulk ops-approve payouts · items=' + req.body.items.length);
-    const results = await Promise.all(req.body.items.map(async (it) => {
+    const approveOne = async (it) => {
       try {
         const guard = await assertEfrInScope(req, it.efrId);
         if (!guard.ok) return { payoutId: it.payoutId, ok: false, error: 'payout not found' };
@@ -858,7 +883,21 @@ router.post('/payouts/bulk-ops-approve', validate(Joi.object({
       } catch (err) {
         return { payoutId: it.payoutId, ok: false, error: err.message };
       }
-    }));
+    };
+    /*
+     * Chunked, NOT one flat Promise.all. The original fanned out the whole
+     * array in a single tick, so this endpoint's peak pool demand was a
+     * function of request size — which is caller-controlled. Chunking makes the
+     * peak a constant the pool was actually sized for, while keeping the
+     * "a slow row doesn't block the others" property within each chunk.
+     * BULK_OPS_APPROVE_CHUNK stays well under connectionLimit (db.js) because
+     * this endpoint shares the pool with all live request + cron traffic.
+     */
+    const results = [];
+    for (let i = 0; i < req.body.items.length; i += BULK_OPS_APPROVE_CHUNK) {
+      const chunk = req.body.items.slice(i, i + BULK_OPS_APPROVE_CHUNK);
+      results.push(...await Promise.all(chunk.map(approveOne)));
+    }
     const okCount = results.filter((r) => r.ok).length;
     logger.info('Bulk ops-approve done · approved=' + okCount + ' failed=' + (results.length - okCount));
     modernOk(res, { results, approvedCount: okCount, failedCount: results.length - okCount });

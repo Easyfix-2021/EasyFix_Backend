@@ -19,6 +19,7 @@
 
 const { getRoleById } = require('../services/role.service');
 const { modernError } = require('../utils/response');
+const { asyncMiddleware } = require('../utils/async-middleware');
 
 const VALID_GROUPS = new Set(['admin', 'client', 'mobile', 'default']);
 
@@ -33,7 +34,11 @@ function role(allowedGroups) {
   }
   const allowed = new Set(allowedGroups);
 
-  return async function roleGuard(req, res, next) {
+  // asyncMiddleware: getRoleById below is awaited outside any try. Its cache is
+  // single-flighted (services/role.service.js), so ONE failed load rejects the
+  // shared promise for every concurrent waiter at once — N unhandled rejections
+  // from one fault. Unwrapped, that exits the process. See utils/async-middleware.js.
+  return asyncMiddleware(async function roleGuard(req, res, next) {
     if (!req.user) return modernError(res, 401, 'authentication required');
 
     const roleRow = await getRoleById(req.user.user_role);
@@ -53,7 +58,7 @@ function role(allowedGroups) {
 
     req.userRole = roleRow;
     return next();
-  };
+  });
 }
 
 function roleByName(allowedNames) {
@@ -62,7 +67,7 @@ function roleByName(allowedNames) {
   }
   const allowed = new Set(allowedNames.map((n) => n.toLowerCase()));
 
-  return async function roleByNameGuard(req, res, next) {
+  return asyncMiddleware(async function roleByNameGuard(req, res, next) {
     if (!req.user) return modernError(res, 401, 'authentication required');
 
     const roleRow = await getRoleById(req.user.user_role);
@@ -78,7 +83,7 @@ function roleByName(allowedNames) {
 
     req.userRole = roleRow;
     return next();
-  };
+  });
 }
 
 module.exports = { role, roleByName };

@@ -74,11 +74,17 @@ export default [
 
   // ── The whole backend ────────────────────────────────────────────────────
   {
-    files: ['**/*.js'],
+    files: ['**/*.js', '**/*.mjs'],
     languageOptions: {
-      // CommonJS. Every file in this repo is `require`/`module.exports`; there
-      // is not a single .mjs or ESM source file (verified). Getting this wrong
-      // is how you get a flood of false `no-undef` on `require`/`module`.
+      // CommonJS is the DEFAULT because every .js file in this repo is
+      // `require`/`module.exports`. Getting this wrong is how you get a flood of
+      // false `no-undef` on `require`/`module`.
+      //
+      // The five .mjs files (scripts/*.mjs + this config) are ESM and are
+      // re-pointed at sourceType 'module' by the block below. They match here so
+      // they inherit this rule set — until 2026-09-09 the glob was '**/*.js'
+      // only, so `eslint .` walked them, applied NO rules, and reported them
+      // clean. Two of them are CI gates.
       sourceType: 'commonjs',
       ecmaVersion: 2022,
       globals: {
@@ -202,6 +208,79 @@ export default [
       'no-async-promise-executor': 'error', // new Promise(async …) swallows throws
 
       /*
+       * ── console, and why this could only be turned on today ──────────────
+       *
+       * CLAUDE.md coding rule 6 has always said "No `console.log` — use
+       * `logger`". It was enforced by review only: `no-console` was deliberately
+       * NOT enabled, and the header below explains the cost of enabling a rule
+       * the tree does not already satisfy — a gate that is red on arrival gets
+       * `--no-verify`'d and then deleted.
+       *
+       * On 2026-09-08 the last nine `console.warn` calls in routes/, services/,
+       * middleware/, utils/ and lib/ were migrated to `logger.warn`, so the
+       * production tree satisfies the rule and it costs nothing to turn on.
+       *
+       * WHY THE RULE IS WORTH HAVING, beyond tidiness — `console` bypasses
+       * everything logger.js does: the AsyncLocalStorage request context
+       * (utils/request-context) that stamps a line with its request identity,
+       * and `redactUrl` (utils/log-format), which scrubs magic-link tokens and
+       * customer mobile numbers out of logged URLs. A console line in a request
+       * path is therefore both unattributable and un-redacted.
+       *
+       * TWO of those nine calls also proved that the migration is not
+       * mechanical: logger.js's splitArgs only lifts an OBJECT into the
+       * structured field, so `logger.warn(msg, someString)` and a three-argument
+       * call SILENTLY DROP the error text. See CLAUDE.md rule 6.
+       *
+       * No `allow: ['warn','error']` escape hatch: every one of the nine was a
+       * console.warn, so allowing warn would have exempted the entire real
+       * population. Sanctioned surfaces get an explicit override block below.
+       */
+      'no-console': 'error',
+
+      /*
+       * ── The one rule that keeps ~1300 catch blocks safe ──────────────────
+       *
+       * `catch (e)` binds whatever was thrown, and this codebase dereferences
+       * it (`e.message`) and forwards it (`next(e)`) in ~1300 places without
+       * checking the shape first. Every one of those is harmless TODAY, and
+       * scripts/scan-catch-shape.js exists to keep measuring that. The reason
+       * they are harmless is a property of the THROW side, not the catch side:
+       *
+       *   nothing in this repo, or in its 290-package production dependency
+       *   tree, ever rejects with a FALSY value.
+       *
+       * That was verified on 2026-09-08 — 886 throw statements classified by
+       * AST (zero falsy literals; all 31 object literals carry `.message`;
+       * every mkErr/httpError/badReq-style factory returns `new Error`), plus a
+       * positive-controlled sweep of the production tree (the four syntactic
+       * candidates are all inert: a Flow type-comment in xlsx, a
+       * `typeof util.inherits !== 'function'` branch that is dead on Node, and
+       * a bare-stream file that is never loaded outside the Bare runtime).
+       *
+       * It matters because a falsy rejection is the SEVERE half of the defect:
+       * `next(null)` is read by Express 4 as "no error, continue", so the
+       * request falls through to the 404 handler with no 500 and nothing
+       * logged. The failure is indistinguishable from success — no log line, no
+       * error-rate blip, nothing to alert on.
+       *
+       * `Promise.reject()` with no argument rejects with `undefined`, and is
+       * the only remaining way to produce that without writing a literal
+       * `throw null`. This rule forbids it. Measured at ZERO violations
+       * repo-wide before enabling, so it goes on at no cleanup cost and the
+       * gate stays green — the bar the header of this file sets.
+       *
+       * ⚠ Its sibling `no-throw-literal` is deliberately NOT enabled. It would
+       * guard the other half of the same invariant, but it has 37 violations
+       * (measured), every one the deliberate `throw { status, code, message }`
+       * idiom in utils/jwt.js and the magic-link/maps services. Those are
+       * truthy and carry `.message`, so they are cosmetic at worst — turning
+       * the rule on would fail CI on day one over 37 non-bugs, which by this
+       * file's own history is how a linter gets --no-verify'd and then deleted.
+       */
+      'prefer-promise-reject-errors': 'error',
+
+      /*
        * ── Dead code ───────────────────────────────────────────────────────
        * `no-unreachable` is how you find a `return` accidentally left above a
        * block (the exact shape of the copy-paste accident this config exists
@@ -273,6 +352,40 @@ export default [
       //   ignoreRestSiblings: true,  // `const { password, ...safe } = row`
       // }],
     },
+  },
+
+  // ── ESM scripts (.mjs) ───────────────────────────────────────────────────
+  // Same rule set as everything else; only the module system differs. This block
+  // carries no `rules` of its own on purpose — flat config merges, so the rules
+  // above apply and cannot drift apart from the .js set.
+  {
+    files: ['**/*.mjs'],
+    languageOptions: {
+      sourceType: 'module',
+      globals: {
+        // CommonJS globals genuinely do NOT exist in ESM. Switching them off
+        // here means `require(...)` or `__dirname` in a .mjs is caught by
+        // no-undef at lint time instead of throwing at runtime — which is the
+        // whole point of pointing no-undef at these files.
+        require: 'off',
+        module: 'off',
+        exports: 'off',
+        __dirname: 'off',
+        __filename: 'off',
+      },
+    },
+  },
+
+  // ── Where console IS the output, not a mistake ───────────────────────────
+  // logger.js is the sanctioned exit: the rule above exists precisely to force
+  // every other file through it, so the implementation cannot be subject to it.
+  // scripts/ are CLI tools whose stdout is their interface (231 calls), tests/
+  // print harness detail, and docs/ holds generators. Listed explicitly rather
+  // than as a broad ignore, so a NEW directory does not inherit the exemption
+  // by accident — that is how a ban erodes.
+  {
+    files: ['logger.js', 'scripts/**/*.{js,mjs}', 'tests/**/*.js', 'docs/**/*.js', 'eslint.config.mjs'],
+    rules: { 'no-console': 'off' },
   },
 
   // ── Tests ────────────────────────────────────────────────────────────────

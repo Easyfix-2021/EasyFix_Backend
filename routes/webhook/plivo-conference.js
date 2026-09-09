@@ -377,33 +377,35 @@ router.post('/status', async (req, res) => {
     return res.json({ ok: true, handled: false, ignored: true });
   }
 
-  // Load the row the TOKEN authorised. Never the row the payload names.
-  const loaded = await conf.getConferenceByFriendlyName(String(claims.conf || ''), pool);
-  let conference = loaded.ok ? loaded.conference : null;
-  if (conference && Number(conference.id) !== confId) conference = null;
-  if (!conference) {
-    const g = await conf.getConference(confId, pool);
-    conference = g.ok ? g.conference : null;
-  }
-  if (!conference) {
-    logger.warn(`Plivo conference webhook · conf=${confId} not found (event="${rawEvent}"), no-op`);
-    return res.json({ ok: true, handled: false });
-  }
-
-  const payloadName = pick(body, FIELD_PROBES.mpcName);
-  if (!sameConference(payloadName, conference.friendly_name)) {
-    // Fail LOUD rather than stamp the wrong row. If this line is common, the
-    // name round-trip is wrong — UNVERIFIED checklist item 4.
-    logger.warn(`⚠ Plivo conference webhook · conference NAME MISMATCH · conf=${confId} `
-      + `· token name="${conference.friendly_name}" · payload name="${String(payloadName).slice(0, 64)}" `
-      + `· event="${rawEvent}" — nothing written`);
-    return res.json({ ok: true, handled: false });
-  }
-
-  const now = new Date();   // pool TZ +05:30 stores the IST wall clock verbatim
-  const mpcUuid = pick(body, FIELD_PROBES.mpcUuid);
-
+  // Everything from the conference load down runs inside the try: the catch
+  // below is what holds this endpoint to its "never a non-200" contract.
   try {
+    // Load the row the TOKEN authorised. Never the row the payload names.
+    const loaded = await conf.getConferenceByFriendlyName(String(claims.conf || ''), pool);
+    let conference = loaded.ok ? loaded.conference : null;
+    if (conference && Number(conference.id) !== confId) conference = null;
+    if (!conference) {
+      const g = await conf.getConference(confId, pool);
+      conference = g.ok ? g.conference : null;
+    }
+    if (!conference) {
+      logger.warn(`Plivo conference webhook · conf=${confId} not found (event="${rawEvent}"), no-op`);
+      return res.json({ ok: true, handled: false });
+    }
+
+    const payloadName = pick(body, FIELD_PROBES.mpcName);
+    if (!sameConference(payloadName, conference.friendly_name)) {
+      // Fail LOUD rather than stamp the wrong row. If this line is common, the
+      // name round-trip is wrong — UNVERIFIED checklist item 4.
+      logger.warn(`⚠ Plivo conference webhook · conference NAME MISMATCH · conf=${confId} `
+        + `· token name="${conference.friendly_name}" · payload name="${String(payloadName).slice(0, 64)}" `
+        + `· event="${rawEvent}" — nothing written`);
+      return res.json({ ok: true, handled: false });
+    }
+
+    const now = new Date();   // pool TZ +05:30 stores the IST wall clock verbatim
+    const mpcUuid = pick(body, FIELD_PROBES.mpcUuid);
+
     if (kind === EVENTS.MPC_START) {
       /*
        * The MPC materialised. 'creating' was an assertion; this is the

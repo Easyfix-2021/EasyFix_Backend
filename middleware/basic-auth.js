@@ -2,13 +2,18 @@ const crypto = require('crypto');
 const { pool } = require('../db');
 const logger = require('../logger');
 const { legacyError } = require('../utils/response');
+const { asyncMiddleware } = require('../utils/async-middleware');
 
 /*
  * HTTP Basic Auth against tbl_client_website for /api/integration/v1/*.
  * Legacy Dropwizard used @RolesAllowed per method — here we only authenticate;
  * role-style checks (who can POST jobs vs. just read) can layer on later.
  */
-module.exports = async function basicAuth(req, res, next) {
+// asyncMiddleware: findCredential/resolveLegacyRole below are awaited outside any
+// try, and findCredential rethrows anything that is not ER_NO_SUCH_TABLE — so a
+// pool fault on partner-integration traffic would EXIT THE PROCESS, not 500.
+// See utils/async-middleware.js (2026-09-08 incident).
+module.exports = asyncMiddleware(async function basicAuth(req, res, next) {
   const header = req.headers.authorization || '';
   if (!header.startsWith('Basic ')) {
     res.setHeader('WWW-Authenticate', 'Basic realm="EasyFix API"');
@@ -60,7 +65,7 @@ module.exports = async function basicAuth(req, res, next) {
   logger.info('Integration auth OK · login=' + row.login_name + ' · client=' + row.client_id
     + ' · via=' + row.source + ' · role=' + (row.role_name || 'unresolved'));
   next();
-};
+});
 
 /*
  * Find an integration credential, preferring the store BOTH legacy services

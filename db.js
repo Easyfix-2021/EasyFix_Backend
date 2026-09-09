@@ -72,28 +72,123 @@ const pool = mysql.createPool({
 // a growing "enqueued" with flat "released" means requests are piling up.
 const stats = { connected: 0, acquired: 0, released: 0, enqueued: 0 };
 
+/*
+ * LIVE GAUGES vs LIFETIME COUNTERS — the distinction this whole block turns on.
+ *
+ * The counters below (`acquired`, `released`, `enqueued`) only ever grow. They
+ * answer "how much has this process ever done", which is useless for "is the
+ * pool in trouble RIGHT NOW" — the question that matters during an incident.
+ *
+ * `inUse` was previously derived as acquired - released, and that derivation is
+ * WRONG in exactly the situation you need it: mysql2 evicts a connection that
+ * hits a fatal/network fault (pool_connection.js `once('error')` →
+ * _removeFromPool), and an evicted connection emits no 'release'. So every such
+ * fault permanently inflates the derived gauge, and after a rough hour the
+ * number reads "saturated" forever regardless of the truth.
+ *
+ * So the gauges are read from the pool itself. These are mysql2 internals
+ * (`PromisePool.pool` → BasePool) and therefore an upgrade hazard — which is
+ * why readLiveGauges() returns null rather than zeros when the shape is absent,
+ * and why tests/pool-saturation.test.js asserts the shape exists. A probe that
+ * silently reports 0 for "queued" is worse than no probe: it reads as healthy.
+ */
+function readLiveGauges() {
+  const core = pool && pool.pool;
+  // NOT Array.isArray — mysql2 v3 holds these in Denque instances, which expose
+  // a numeric `length` but fail an array check. Guarding on Array.isArray made
+  // this probe return null on every real pool while passing every reading of
+  // the code; caught only by running it against a live pool. Duck-type on the
+  // one property actually read, so a future container swap keeps working and a
+  // genuine shape change still degrades to null rather than to a silent 0.
+  const len = (d) => (d && typeof d.length === 'number' ? d.length : null);
+  if (!core) return null;
+  const open = len(core._allConnections);
+  const free = len(core._freeConnections);
+  const queued = len(core._connectionQueue);
+  if (open === null || queued === null) return null;
+  return { open, free: free ?? 0, inUse: Math.max(0, open - (free ?? 0)), queued };
+}
+
+/*
+ * Saturation thresholds, as a FRACTION of the configured limits so they track
+ * DB_CONNECTION_LIMIT / DB_QUEUE_LIMIT instead of needing to be re-tuned
+ * whenever those move.
+ *   busy      — every connection is checked out; requests are now waiting.
+ *   saturated — the wait queue is deep enough that the NEXT burst hits
+ *               "Queue limit reached.", i.e. this is the last warning.
+ */
+const SATURATION_QUEUE_FRACTION = 0.5;
+
+function classifySaturation(live, limit, queueMax) {
+  if (!live) return { status: 'unknown', reason: 'mysql2 pool internals not readable — see readLiveGauges()' };
+  if (live.queued >= queueMax * SATURATION_QUEUE_FRACTION) return { status: 'saturated', ...live };
+  if (live.queued > 0 || live.inUse >= limit) return { status: 'busy', ...live };
+  return { status: 'ok', ...live };
+}
+
+function poolSaturation() {
+  return classifySaturation(
+    readLiveGauges(),
+    parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10),
+    parseInt(process.env.DB_QUEUE_LIMIT || '50', 10),
+  );
+}
+
+/*
+ * Burst-scoped log throttle.
+ *
+ * The previous rule was `enqueued === 1 || enqueued % 25 === 0` against the
+ * LIFETIME counter. That logs the first-ever queue event loudly and then, for
+ * the rest of the process's life, at most every 25th — so the SECOND incident
+ * of the day is quieter than the first and a long saturation reports a number
+ * ("queued so far: 4113") that describes history rather than the present.
+ *
+ * Scoping the throttle to a time window instead means every distinct burst gets
+ * its own loud line carrying the LIVE depth, which is the number an operator
+ * (or an alert rule reading the logs) actually needs.
+ */
+const ENQUEUE_LOG_WINDOW_MS = 60_000;
+let lastEnqueueLogAt = 0;
+
 pool.on('connection', () => { stats.connected += 1; });
 pool.on('acquire',    () => { stats.acquired  += 1; });
 pool.on('release',    () => { stats.released  += 1; });
 pool.on('enqueue',    () => {
   stats.enqueued += 1;
-  // Only warn once per burst — every queued request would flood the log.
-  if (stats.enqueued === 1 || stats.enqueued % 25 === 0) {
-    logger.warn(`Database pool saturated — waiting for a free connection (queued so far: ${stats.enqueued})`);
-  }
+  const now = Date.now();
+  if (now - lastEnqueueLogAt < ENQUEUE_LOG_WINDOW_MS) return;
+  lastEnqueueLogAt = now;
+  const s = poolSaturation();
+  const limit = parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10);
+  const queueMax = parseInt(process.env.DB_QUEUE_LIMIT || '50', 10);
+  const detail = s.status === 'unknown'
+    ? '(live depth unavailable)'
+    : `inUse=${s.inUse}/${limit} queued=${s.queued}/${queueMax}`;
+  const msg = `Database pool ${s.status.toUpperCase()} — requests are waiting for a connection · ${detail}`;
+  // `saturated` is the last warning before mysql2 throws "Queue limit reached."
+  // and every in-flight request starts failing, so it goes out at ERROR level:
+  // that is the line an alert rule should key on.
+  if (s.status === 'saturated') logger.error(msg); else logger.warn(msg);
 });
 
 function getPoolStats() {
   const limit    = parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10);
   const queueMax = parseInt(process.env.DB_QUEUE_LIMIT      || '50', 10);
+  const live     = readLiveGauges();
   return {
     limit,
     queueMax,
+    // Lifetime — trend/among-restarts context only. NEVER alert on these.
     connected: stats.connected,
     acquired:  stats.acquired,
     released:  stats.released,
     enqueued:  stats.enqueued,
-    inUse:     Math.max(0, stats.acquired - stats.released),
+    // Live — this is what an alert rule reads.
+    saturation: poolSaturation(),
+    open:   live ? live.open   : null,
+    free:   live ? live.free   : null,
+    inUse:  live ? live.inUse  : null,
+    queued: live ? live.queued : null,
   };
 }
 
@@ -113,4 +208,4 @@ async function closePool() {
   logger.db('Database connection pool closed');
 }
 
-module.exports = { pool, testConnection, closePool, getPoolStats };
+module.exports = { pool, testConnection, closePool, getPoolStats, poolSaturation, _readLiveGauges: readLiveGauges, _classifySaturation: classifySaturation };

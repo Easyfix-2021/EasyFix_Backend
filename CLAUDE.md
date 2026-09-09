@@ -88,7 +88,11 @@ Reference contract: `/Users/harshit/Documents/GitHub/EasyFix Docs/Easyfix_APIs.d
 3. Modern success: `{success: true, data, message?}`; modern error: `{success: false, error, details?}`.
 4. Validate all request bodies with Joi; 400 with specific errors.
 5. Multi-step writes use `beginTransaction/commit/rollback`.
-6. No `console.log` — use `logger` (Pino).
+6. No `console.log` — use `logger`. It is a CUSTOM logger (`logger.js`), not Pino;
+   `pino` is not a dependency. It takes `(msg)`, `(msg, obj)` or `(obj, msg)` — a
+   second STRING argument is silently dropped, so pass structured fields as an
+   object. Enforced by review, not by the linter: `no-console` is deliberately
+   not enabled in `eslint.config.mjs`.
 7. Dates stored as MySQL DATETIME, displayed IST on frontend.
 
 ## tbl_job status codes (quick reference)

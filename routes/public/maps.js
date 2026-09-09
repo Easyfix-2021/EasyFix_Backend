@@ -81,8 +81,40 @@ async function verifyTokenAndState(req, res) {
     await requireUnconfirmedJob(jobId, pool);
     return jobId;
   } catch (e) {
-    modernError(res, e.status || 401, e.message || 'unauthorized');
-    return null;
+    /*
+     * ONLY the deliberate rejections are answered here. verifyJobToken and
+     * requireUnconfirmedJob both throw object literals carrying an explicit
+     * numeric `status` — 401 (bad/expired/wrong-type token), 404 (no such job),
+     * 410 (order left status 9). Anything arriving WITHOUT one is not an
+     * authorization outcome: it is a pool fault, a dead socket, or a TypeError.
+     *
+     * The previous `e.status || 401` swallowed those into a 401 carrying the
+     * driver's own message. Three things were wrong with that on a PUBLIC
+     * endpoint: the customer was told their link was invalid when it was fine,
+     * internal error text ("Queue limit reached.") was handed to an
+     * unauthenticated caller, and — the reason it could run for months unnoticed
+     * — a database outage never produced a single 5xx, so nothing alerting on
+     * error rates could see it.
+     *
+     * Rethrowing sends it to errorHandler: logged with a stack, answered as a
+     * generic 500. That is also what makes the surrounding try/catch in each
+     * handler load-bearing rather than decorative — it is the thing that turns
+     * this rethrow into a response instead of an unhandled rejection.
+     */
+    if (Number.isInteger(e && e.status)) {
+      modernError(res, e.status, e.message || 'unauthorized');
+      return null;
+    }
+    /*
+     * Normalised to a real Error before rethrowing, deliberately. A bare
+     * `throw e` re-throws whatever was thrown — and a falsy rejection
+     * (`throw null`, a library throwing a primitive) then reaches the handler's
+     * catch as `next(null)`, which Express 4 reads as "no error, continue to
+     * the next layer". The request falls through to the 404 handler instead of
+     * the error handler: no 500, no log, no alert — the exact silence this fix
+     * exists to remove, reintroduced one level down.
+     */
+    throw e instanceof Error ? e : new Error(`maps token gate failed: ${String(e)}`);
   }
 }
 
@@ -98,15 +130,27 @@ router.get('/autocomplete', tokenRateLimit, validate(Joi.object({
   q:     Joi.string().min(3).max(200).required(),
   sessionToken: Joi.string().min(8).max(100).optional(),
 }), 'query'), async (req, res, next) => {
-  if (!await verifyTokenAndState(req, res)) return;
-  logger.info('Public maps autocomplete · q=' + String(req.query.q).trim());
   try {
+    if (!await verifyTokenAndState(req, res)) return;
+    logger.info('Public maps autocomplete · q=' + String(req.query.q).trim());
     const out = await mapsService.autocomplete(
       String(req.query.q).trim(),
       req.query.sessionToken ? String(req.query.sessionToken) : undefined,
     );
     modernOk(res, out);
   } catch (e) {
+    /*
+     * `e.message` and `next(e)` are unguarded here ON PURPOSE, and the reason is
+     * a property of the THROW side rather than of this block. Everything that
+     * can land here is a real Error: verifyTokenAndState now normalises before
+     * rethrowing (see its catch), and a repo-wide audit found no falsy or
+     * non-Error rejection anywhere in this codebase or its 290-package
+     * production dependency tree. eslint's `prefer-promise-reject-errors` keeps
+     * that invariant true — see eslint.config.mjs, which carries the
+     * measurement. scripts/scan-catch-shape.js reports this site (and ~1300
+     * siblings) as a THEORETICAL finding; do not "fix" them one by one, and do
+     * not remove that lint rule, which is what makes them theoretical.
+     */
     logger.warn('Public maps autocomplete failed · ' + e.message);
     if (e && e.status) return modernError(res, e.status, e.message);
     next(e);
@@ -130,9 +174,9 @@ router.get('/geocode', tokenRateLimit, validate(Joi.object({
   latlng:   Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).optional(),
   sessionToken: Joi.string().min(8).max(100).optional(),
 }).or('place_id', 'address', 'latlng'), 'query'), async (req, res, next) => {
-  if (!await verifyTokenAndState(req, res)) return;
-  logger.info('Public maps geocode · by=' + (req.query.place_id ? 'place_id' : req.query.address ? 'address' : 'latlng'));
   try {
+    if (!await verifyTokenAndState(req, res)) return;
+    logger.info('Public maps geocode · by=' + (req.query.place_id ? 'place_id' : req.query.address ? 'address' : 'latlng'));
     const sessionToken = req.query.sessionToken ? String(req.query.sessionToken) : null;
     if (req.query.place_id && sessionToken) {
       const out = await mapsService.placeDetails({ place_id: String(req.query.place_id), sessionToken });
@@ -159,10 +203,15 @@ router.get('/geocode', tokenRateLimit, validate(Joi.object({
  */
 router.get('/config', tokenRateLimit, validate(Joi.object({
   token: Joi.string().required(),
-}), 'query'), async (req, res) => {
-  if (!await verifyTokenAndState(req, res)) return;
-  logger.info('Public maps config requested');
-  modernOk(res, { apiKey: mapsService.getConfigKey() });
+}), 'query'), async (req, res, next) => {
+  try {
+    if (!await verifyTokenAndState(req, res)) return;
+    logger.info('Public maps config requested');
+    modernOk(res, { apiKey: mapsService.getConfigKey() });
+  } catch (e) {
+    logger.warn('Public maps config failed · ' + e.message);
+    next(e);
+  }
 });
 
 module.exports = router;

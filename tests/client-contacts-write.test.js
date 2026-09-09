@@ -162,7 +162,14 @@ test('status must be 0 or 1', async () => {
 
 test('signup is PUBLIC — it sits above requireSpocAuth', async () => {
   const idx = (p, m) => router.stack.findIndex((e) => e.route && e.route.path === p && e.route.methods[m]);
-  const gate = router.stack.findIndex((e) => !e.route && /requireSpocAuth/.test(String(e.handle)));
+  // Matched by IDENTITY, not by a regex over the handler's source. The source
+  // form silently stopped finding the gate the moment client-auth was wrapped
+  // for async-rejection safety (utils/async-middleware.js) — the name vanished
+  // from the stringified function even though the same middleware was still
+  // mounted in the same place. Identity cannot be fooled by wrapping, renaming,
+  // or by the name merely appearing in a comment.
+  const requireSpocAuth = require('../middleware/client-auth');
+  const gate = router.stack.findIndex((e) => !e.route && e.handle === requireSpocAuth);
   assert.ok(gate > 0, 'the auth gate must be findable');
   assert.ok(idx('/auth/signup', 'post') < gate,
     'someone without an account cannot be authenticated — the route must precede the gate');

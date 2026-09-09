@@ -118,6 +118,44 @@ jobs:
 
       - name: Lint (no-undef — the copy-paste-across-handlers guard)
         run: npm run lint
+      # UNGUARDED-AWAIT GATE. In Express 4 a rejection from an `await` that is not
+      # inside its handler's try reaches no error middleware: the request hangs,
+      # and before server.js grew an `unhandledRejection` listener it EXITED THE
+      # PROCESS — that is what restarted production on 2026-09-08 from a single
+      # pool error in requireAuth.
+      #
+      # --self-test RUNS FIRST, AND THAT ORDER IS THE POINT. The census exits 0
+      # when it finds nothing, and a scanner that has stopped working finds
+      # nothing too. --self-test drives 17 hand-written fixtures with known
+      # verdicts, so it fails when the tool breaks rather than when the tree is
+      # clean. Gating on --gate alone would be a green light attached to nothing.
+      #
+      # --gate then checks its own CAPABILITY before its result: 0 parse errors
+      # (an unparsed file was not scanned) and a floor on the number of async
+      # handlers found (939 today) so a collapse in detection fails loudly
+      # instead of reporting a clean tree. See the header of the script.
+      - name: Unguarded-await scanner self-test (the tool must be able to fail)
+        run: node scripts/scan-unguarded-await.js --self-test
+      - name: Unguarded-await gate (Express 4 async-handler rejections)
+        run: node scripts/scan-unguarded-await.js --gate
+      # SCOPED-SKILL SCOPE GATE. A skill under `.claude/skills/` is preferred OVER
+      # the general skill of the same name whenever work happens in this repo —
+      # authority granted by the file's PATH, which is set by whoever copied it.
+      # On 2026-09-08 all five here turned out to be copies from a sibling
+      # project: wrong tables, wrong paths, and a security checklist asserting an
+      # auth model this product explicitly does not use. They had been preferred
+      # the whole time. Copying is the cheapest way to make a scoped skill, so
+      # the failure is produced by ordinary work and a prose warning will not hold.
+      #
+      # --self-test FIRST, same reason as the scanner above: the check exits 0
+      # when it finds nothing, and a checker that has stopped working finds
+      # nothing too. The fixtures include every false positive this tool has had
+      # (bare filenames, require specifiers, package names, git refs, timezones),
+      # so relaxing the rule to make a file pass turns them red.
+      - name: Skill-scope checker self-test (the tool must be able to fail)
+        run: npm run check:skills:self-test
+      - name: Scoped skills describe THIS repository
+        run: npm run check:skills
       # CROSS-REPO PARITY — see ci.yml for the full rationale. Short version:
       # tests/wire-contract.test.js and tests/job-search-parity.test.js read two
       # files out of the CRM repo, and THIS is the job that gates the deploy

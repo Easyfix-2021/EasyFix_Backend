@@ -1103,8 +1103,9 @@ router.post('/profile/personal-details', validate(Joi.object({
 }).min(1)), async (req, res, next) => {
   const efrId = req.tech.efr_id;
   const lockKey = `efr_doc:${efrId}`;                 // serialize doc upserts per tech (no UNIQUE in schema)
-  const conn = await pool.getConnection();
+  let conn;                                           // acquired inside the try; finally releases only if we got one
   try {
+    conn = await pool.getConnection();
     logger.info('Save personal-details profile section');
     const b = req.body;
     const marital = b.maritalStatus || b.martialStatus || null;
@@ -1161,7 +1162,7 @@ router.post('/profile/personal-details', validate(Joi.object({
     next(e);
   } finally {
     try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (_) { /* lock auto-frees on release */ }
-    conn.release();
+    if (conn) conn.release();
   }
 });
 
@@ -1188,8 +1189,9 @@ router.post('/profile/professional-details', validate(Joi.object({
 }).min(1).unknown(true)), async (req, res, next) => {
   const efrId = req.tech.efr_id;
   const lockKey = `efr_doc:${efrId}`;
-  const conn = await pool.getConnection();
+  let conn;                                           // acquired inside the try; finally releases only if we got one
   try {
+    conn = await pool.getConnection();
     logger.info('Save professional-details profile section');
     const b = req.body;
     const useWhatsapp = b.useWhatsapp === undefined ? null : (b.useWhatsapp ? 1 : 0);
@@ -1262,7 +1264,7 @@ router.post('/profile/professional-details', validate(Joi.object({
     next(e);
   } finally {
     try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (_) { /* lock auto-frees */ }
-    conn.release();
+    if (conn) conn.release();
   }
 });
 

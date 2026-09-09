@@ -10,6 +10,8 @@ const { verifyToken } = require('../utils/jwt');
 const { findUserById } = require('../services/auth.service');
 const techAuth = require('../services/tech-auth.service');
 const { modernError } = require('../utils/response');
+const { asyncMiddleware } = require('../utils/async-middleware');
+
 
 /*
  * Token sources, in priority order:
@@ -97,4 +99,7 @@ async function requireAuth(req, res, next) {
 // security scheme to every route the middleware guards. See docs/openapi-autogen.js.
 requireAuth._openapi = { security: 'bearerAdmin' };
 
-module.exports = requireAuth;
+// Wrapped: the DB lookup above is awaited outside any try. Without this,
+// a pool/DB fault here EXITS THE PROCESS rather than returning a 500.
+// See utils/async-middleware.js (2026-09-08 incident).
+module.exports = asyncMiddleware(requireAuth);

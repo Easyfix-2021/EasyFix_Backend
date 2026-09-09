@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { pool, getPoolStats } = require('../db');
+const { pool, getPoolStats, poolSaturation } = require('../db');
 const { getReadPoolStats, identify, breakerOpen } = require('../db-read');
 const { modernOk, modernError } = require('../utils/response');
 const integrationRouter = require('./integration');
@@ -23,6 +23,21 @@ router.get('/health', (_req, res) => {
      */
     commit: process.env.GIT_COMMIT || 'unknown',
     uptime: process.uptime(),
+    /*
+     * Pool saturation on the CHEAP liveness endpoint, deliberately.
+     *
+     * poolSaturation() reads in-memory gauges off the mysql2 pool and issues NO
+     * query, so it costs nothing here — which matters because this is the
+     * endpoint anything polling frequently will hit (the Dockerfile HEALTHCHECK
+     * curls it every 30s). /api/health/db is the one that pays a round-trip.
+     *
+     * ⚠ This field must NEVER change the response STATUS. This route is the
+     * container HEALTHCHECK target: 503-ing on saturation would restart the
+     * container under load, which is precisely the wrong response — it drops
+     * every in-flight request and returns to a cold pool. Report, never fail.
+     * Alert on `pool.status === 'saturated'` from outside.
+     */
+    pool: poolSaturation(),
     menuFilter: {
       enabled: visible !== null,
       visibleCount: visible ? visible.size : null,

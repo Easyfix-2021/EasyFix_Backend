@@ -28,6 +28,31 @@ const logger = require('../../logger');
  * failure if anyone tries to use this feature before migrations run.
  */
 
+/*
+ * A rejection is NOT guaranteed to be an Error. mysql2, a driver, or any
+ * library can throw a string, an object literal, or `null`, and two things
+ * break on that inside these catch blocks:
+ *
+ *   `e.message`  → TypeError, raised INSIDE the catch, so it escapes the
+ *                  handler entirely. In Express 4 that is an unhandled
+ *                  rejection: no response, request hangs, and before
+ *                  server.js grew its backstop it exited the process.
+ *   `next(e)`    → with a falsy `e`, Express reads next(null) as "no error,
+ *                  continue to the next layer". The request falls through to
+ *                  the 404 handler with no 500 and nothing logged — the
+ *                  failure disappears rather than surfacing.
+ *
+ * Both are the same defect as the one fixed in routes/public/maps.js on
+ * 2026-09-08: an error path that assumes the shape of what it caught.
+ */
+function asError(e) {
+  if (e instanceof Error) return e;
+  if (typeof e === 'string' && e) return new Error(e);
+  let detail;
+  try { detail = JSON.stringify(e); } catch (_) { detail = undefined; }
+  return new Error(`non-Error rejection: ${detail === undefined ? String(e) : detail}`);
+}
+
 router.get('/', async (req, res, next) => {
   try {
     const serviceId = req.query.serviceId ? Number(req.query.serviceId) : null;
@@ -63,7 +88,7 @@ router.get('/', async (req, res, next) => {
       }
     }
     modernOk(res, rows.map((r) => ({ ...r, product_codes: codesByProduct.get(r.id) || [] })));
-  } catch (e) { next(e); }
+  } catch (e) { next(asError(e)); }
 });
 
 router.get('/:id', async (req, res, next) => {
@@ -99,7 +124,7 @@ router.get('/:id', async (req, res, next) => {
       product_codes: codes.map((c) => c.code),
       additional_images: imgs,
     });
-  } catch (e) { next(e); }
+  } catch (e) { next(asError(e)); }
 });
 
 const createBody = Joi.object({
@@ -111,8 +136,9 @@ const createBody = Joi.object({
 });
 
 router.post('/', validate(createBody), async (req, res, next) => {
-  const conn = await pool.getConnection();
+  let conn;                                  // acquired inside the try; finally releases only if we got one
   try {
+    conn = await pool.getConnection();
     logger.info('Create product · service_id=' + req.body.service_id + ' codes=' + req.body.product_codes.length);
     await conn.beginTransaction();
     const [ins] = await conn.query(
@@ -131,7 +157,7 @@ router.post('/', validate(createBody), async (req, res, next) => {
     logger.info('Product created · id=' + productId);
     res.status(201);
     modernOk(res, { id: productId }, 'product created');
-  } catch (e) { await conn.rollback(); logger.error('Create product failed · ' + e.message); next(e); } finally { conn.release(); }
+  } catch (e) { const err = asError(e); try { await conn.rollback(); } catch (_) { /* connection already gone */ } logger.error('Create product failed · ' + err.message); next(err); } finally { if (conn) conn.release(); }
 });
 
 router.patch('/:id', validate(Joi.object({
@@ -141,18 +167,39 @@ router.patch('/:id', validate(Joi.object({
   product_codes: Joi.array().items(Joi.string().trim().min(1).max(100)).optional(),
   additional_image_ids: Joi.array().items(Joi.number().integer().positive()).optional(),
 }).min(1)), async (req, res, next) => {
-  const conn = await pool.getConnection();
+  let conn;                                  // acquired inside the try; finally releases only if we got one
   try {
+    conn = await pool.getConnection();
     logger.info('Update product · id=' + req.params.id + ' fields=' + Object.keys(req.body).join(','));
     await conn.beginTransaction();
     const sets = [], vals = [];
     if (req.body.name)            { sets.push('name = ?');           vals.push(req.body.name); }
     if (req.body.service_id)      { sets.push('service_id = ?');     vals.push(req.body.service_id); }
     if (req.body.primary_img_id !== undefined) { sets.push('primary_img_id = ?'); vals.push(req.body.primary_img_id); }
+    /*
+     * Existence is checked UNCONDITIONALLY, before any write, and it is its own
+     * SELECT rather than a side effect of the UPDATE. The previous form —
+     * `affectedRows === 0` inside `if (sets.length > 0)` — was wrong in both
+     * directions:
+     *
+     *   MISSED a real 404. A body carrying only product_codes or
+     *   additional_image_ids sets nothing on `product`, so sets.length is 0,
+     *   the branch never runs, and the handler went on to DELETE + INSERT child
+     *   rows for a product id that does not exist — then committed and answered
+     *   200 {updated:true}. Orphan rows, reported as success.
+     *
+     *   INVENTED a 404. MySQL reports affectedRows = 0 when an UPDATE matches a
+     *   row but changes nothing, so re-saving a product with unchanged values
+     *   answered "product not found" for a product that plainly exists.
+     *
+     * Inside the transaction, so the row cannot vanish between the check and
+     * the writes.
+     */
+    const [[exists]] = await conn.query('SELECT id FROM product WHERE id = ? LIMIT 1', [req.params.id]);
+    if (!exists) { await conn.rollback(); return modernError(res, 404, 'product not found'); }
     if (sets.length > 0) {
       vals.push(req.params.id);
-      const [r] = await conn.query(`UPDATE product SET ${sets.join(', ')} WHERE id = ?`, vals);
-      if (r.affectedRows === 0) { await conn.rollback(); return modernError(res, 404, 'product not found'); }
+      await conn.query(`UPDATE product SET ${sets.join(', ')} WHERE id = ?`, vals);
     }
     if (req.body.product_codes) {
       // Legacy replaces all codes on update
@@ -171,15 +218,16 @@ router.patch('/:id', validate(Joi.object({
     await conn.commit();
     logger.info('Product updated · id=' + req.params.id);
     modernOk(res, { updated: true });
-  } catch (e) { await conn.rollback(); logger.error('Update product failed · id=' + req.params.id + ' · ' + e.message); next(e); } finally { conn.release(); }
+  } catch (e) { const err = asError(e); try { await conn.rollback(); } catch (_) { /* connection already gone */ } logger.error('Update product failed · id=' + req.params.id + ' · ' + err.message); next(err); } finally { if (conn) conn.release(); }
 });
 
 router.delete('/:id', async (req, res, next) => {
   // Legacy has no soft-delete column on `product`; the safest delete is
   // to cascade child rows in one transaction. Codes + additional images
   // are FK children with no audit value beyond the parent row.
-  const conn = await pool.getConnection();
+  let conn;                                  // acquired inside the try; finally releases only if we got one
   try {
+    conn = await pool.getConnection();
     logger.info('Delete product · id=' + req.params.id);
     await conn.beginTransaction();
     await conn.query('DELETE FROM product_code WHERE product_id = ?', [req.params.id]);
@@ -189,7 +237,7 @@ router.delete('/:id', async (req, res, next) => {
     await conn.commit();
     logger.info('Product deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
-  } catch (e) { await conn.rollback(); logger.error('Delete product failed · id=' + req.params.id + ' · ' + e.message); next(e); } finally { conn.release(); }
+  } catch (e) { const err = asError(e); try { await conn.rollback(); } catch (_) { /* connection already gone */ } logger.error('Delete product failed · id=' + req.params.id + ' · ' + err.message); next(err); } finally { if (conn) conn.release(); }
 });
 
 module.exports = router;

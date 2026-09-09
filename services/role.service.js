@@ -269,7 +269,37 @@ async function getRoleByIdFull(roleId) {
  * when the mutation is broad (e.g. editing role_menu_action which
  * affects every user holding that role).
  */
-const PERMISSIONS_CACHE_TTL_MS = 60 * 1000;
+/*
+ * UNIFIED with the auth user-row cache (services/auth.service.js) — same env
+ * knob, same default. Reconciled 2026-09-08, and the reasoning is worth keeping
+ * because the original 60s was chosen under a premise that turned out to be false.
+ *
+ * WHY THEY MUST MATCH. A single request passes through BOTH caches: requireAuth
+ * resolves the user row, then a guard resolves that user's permissions. The
+ * staleness a person actually experiences is therefore the MAX of the two, not
+ * either one — so a 15s user cache next to a 60s permissions cache is a 60s
+ * system with a 15s number written on half of it. One knob, one number, one
+ * thing to reason about.
+ *
+ * WHY 15s AND NOT 60s. Production runs a SINGLE backend process
+ * (deploy/docker-compose.prod-backend.yml sets container_name, which blocks
+ * --scale; ecosystem.config.js is instances:1 / exec_mode:'fork'). So
+ * in-process invalidation is COMPLETE, not best-effort: every write that calls
+ * invalidateUserCaches() is visible on the very next request. The TTL is no
+ * longer the staleness bound for instrumented writes — it is only the backstop
+ * for a direct SQL edit or a writer nobody wired. 15s makes that backstop cheap
+ * to live with, and the extra misses are two indexed point lookups.
+ *
+ * ⚠ If this ever moves to cluster mode or more than one container, revisit BOTH
+ * this and invalidateUserCaches(): the TTL becomes the only cross-process bound
+ * again, and that is the world the original 60s was reasoning about.
+ */
+const PERMISSIONS_CACHE_TTL_MS = Number(process.env.AUTH_USER_CACHE_TTL_MS ?? 15_000);
+// NOTE the `?? 15_000` and NOT `|| 15_000`: the knob documents 0 as "disable the
+// cache", and `||` would quietly turn that 0 back into 15s here while genuinely
+// disabling the auth cache next door — a kill switch that half-works is worse than
+// none, because the operator believes both are off. Asserted in
+// tests/auth-cache-reconciliation.test.js.
 const _permissionsCache    = new Map(); // user_id (number) → { result, expiresAt }
 const _permissionsInflight = new Map(); // user_id (number) → Promise<result>
 
@@ -277,6 +307,11 @@ async function getEffectivePermissions(userId) {
   if (!userId) return { menuIds: [], actionPermissions: [] };
   const key = Number(userId);
   const now = Date.now();
+
+  // Kill switch, shared with the auth user-row cache. 0 means "no caching",
+  // and it has to bypass the single-flight join too — otherwise concurrent
+  // callers would still share one result and the switch would only look off.
+  if (!(PERMISSIONS_CACHE_TTL_MS > 0)) return _loadEffectivePermissions(key);
 
   const cached = _permissionsCache.get(key);
   if (cached && cached.expiresAt > now) return cached.result;

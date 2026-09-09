@@ -2,6 +2,8 @@ const jwt = require('jsonwebtoken');
 const { findSpocById } = require('../services/client-auth.service');
 const { accessFromSpoc } = require('../services/client-access.service');
 const { modernError } = require('../utils/response');
+const { asyncMiddleware } = require('../utils/async-middleware');
+
 
 async function requireSpocAuth(req, res, next) {
   // Accept both the new cookie name (`client_auth_token`, aligned with the
@@ -48,4 +50,7 @@ async function requireSpocAuth(req, res, next) {
 // scheme to any route guarded by this middleware.
 requireSpocAuth._openapi = { security: 'bearerClient' };
 
-module.exports = requireSpocAuth;
+// Wrapped: the DB lookup above is awaited outside any try. Without this,
+// a pool/DB fault here EXITS THE PROCESS rather than returning a 500.
+// See utils/async-middleware.js (2026-09-08 incident).
+module.exports = asyncMiddleware(requireSpocAuth);

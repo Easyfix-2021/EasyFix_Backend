@@ -17,6 +17,65 @@ const easyfixerWorkEligibility = require('./easyfixer-work-eligibility.service')
 const properties = require('./properties.service');
 
 /*
+ * POOL BULKHEAD for the ranking stats fan-out.
+ *
+ * MEASURED, not assumed. Instrumenting the live mysql2 pool during one real
+ * rankCandidatesForJob() call (QA: 481k jobs, 4.6k active technicians) recorded
+ * a PEAK OF 16 SIMULTANEOUS POOL ACQUIRES, held for the duration of the call —
+ * 14 queries in the statsForCandidates Promise.all plus the two started just
+ * above it. The static count and the runtime peak agree, so 16 is structural,
+ * not a latency artefact.
+ *
+ * Against production's connectionLimit 30 / queueLimit 50 (db.js):
+ *     2 concurrent opens → the pool is full and requests begin queueing
+ *     6 concurrent opens → 96 acquires against an 80 ceiling → mysql2 throws
+ *                          "Queue limit reached." to EVERY request in the
+ *                          process, including the per-request auth lookup.
+ * Six operators opening the assign modal at once is an ordinary Monday, so this
+ * one endpoint could take the process down without anything being "wrong".
+ *
+ * The gate is MODULE-level, not per-call, and that is the whole point: a
+ * per-call cap still lets N operators contribute N × cap. A module-level cap
+ * bounds what this ONE endpoint can ever take from the shared pool, so auth and
+ * every other query keep room. Under load ranking gets SLOWER and the process
+ * stays UP. That trade is deliberate — a slow assign modal is a complaint, a
+ * restarted container is an outage.
+ *
+ * Sized below connectionLimit on purpose. Raise only alongside
+ * DB_CONNECTION_LIMIT, never on its own.
+ */
+const STATS_QUERY_CONCURRENCY = Math.max(1, parseInt(process.env.RANKING_STATS_CONCURRENCY || '12', 10));
+let statsInFlight = 0;
+const statsWaiters = [];
+
+function releaseStatsSlot() {
+  // Hand the slot DIRECTLY to the next waiter instead of decrementing and
+  // letting it re-race the check in gatedQuery — without the handoff a burst
+  // of waiters can all observe a free slot at once and overshoot the cap.
+  const next = statsWaiters.shift();
+  if (next) return next();
+  statsInFlight -= 1;
+  return undefined;
+}
+
+async function gatedQuery(sql, params) {
+  if (statsInFlight >= STATS_QUERY_CONCURRENCY) {
+    await new Promise((resolve) => { statsWaiters.push(resolve); });
+  } else {
+    statsInFlight += 1;
+  }
+  try {
+    return await pool.query(sql, params);
+  } finally {
+    releaseStatsSlot();
+  }
+}
+
+// Test seam: lets the suite assert the cap actually bounds concurrency.
+const _statsGate = { inFlight: () => statsInFlight, limit: () => STATS_QUERY_CONCURRENCY, run: gatedQuery };
+
+
+/*
  * Candidate ranking — single shared pipeline used by both:
  *   - on-create auto-assign (services/auto-assign.service.js delegates here)
  *   - operator-driven Assign / Reassign modals on /my-orders and /jobs
@@ -603,7 +662,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     const params = [...efrIds];
     if (job.fk_service_catg_id) { sql += ' AND m.category_id = ?';     params.push(job.fk_service_catg_id); }
     if (job.fk_service_type_id) { sql += ' AND m.service_type_id = ?'; params.push(job.fk_service_type_id); }
-    deepSkillQuery = pool.query(sql, params);
+    deepSkillQuery = gatedQuery(sql, params);
   } else {
     // No skill criteria on the job — every tech trivially "matches".
     deepSkillQuery = Promise.resolve([efrIds.map((id) => ({ efr_id: id }))]);
@@ -614,7 +673,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   // that separates "easyfixer has no skills on file" from "has skills, but
   // none match this job".
   const anySkillQuery = jobHasSkillReq
-    ? pool.query(
+    ? gatedQuery(
         `SELECT DISTINCT m.easyfixer_id AS efr_id
            FROM tbl_efr_deepskill_mapping m
           WHERE m.easyfixer_id IN (${placeholders})
@@ -683,7 +742,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     techZoneRowsResult,
   ] = await Promise.all([
     // Active jobs (status 0/1/2)
-    pool.query(
+    gatedQuery(
       `SELECT fk_easyfixter_id AS efr_id, COUNT(*) AS active_jobs
          FROM tbl_job
         WHERE fk_easyfixter_id IN (${placeholders})
@@ -696,7 +755,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     // COMPLETED jobs (status 3/5), mirroring the Manage Easyfixers job_count
     // column so the chip means the same thing on both surfaces.
     // job_count < 5 => Fresher chip in the Top 10 / Search candidate list.
-    pool.query(
+    gatedQuery(
       `SELECT fk_easyfixter_id AS efr_id, COUNT(DISTINCT job_id) AS job_count
          FROM tbl_job
         WHERE fk_easyfixter_id IN (${placeholders})
@@ -772,7 +831,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
      *                            technician off their own reassign list.
      */
     conflictAt
-      ? pool.query(
+      ? gatedQuery(
           `SELECT DISTINCT fk_easyfixter_id AS efr_id
              FROM tbl_job
             WHERE fk_easyfixter_id IN (${placeholders})
@@ -787,7 +846,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       : Promise.resolve([[]]),
 
     // 90d rating
-    pool.query(
+    gatedQuery(
       `SELECT easyfixer_id AS efr_id, AVG(customer_rating) AS avg_rating, COUNT(*) AS rating_count
          FROM tbl_easyfixer_rating_by_customer
         WHERE easyfixer_id IN (${placeholders})
@@ -797,7 +856,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     ),
 
     // TAT (avg checkout - scheduled hours, completed jobs only)
-    pool.query(
+    gatedQuery(
       `SELECT fk_easyfixter_id AS efr_id,
               AVG(TIMESTAMPDIFF(HOUR, scheduled_date_time, checkout_date_time)) AS avg_tat_hours,
               COUNT(*) AS tat_count
@@ -813,7 +872,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
 
     // SDA — same-day-attempt rate; checkin date == requested date.
     // SUM in a CASE counts the SDA hits; total attempts is the row count.
-    pool.query(
+    gatedQuery(
       `SELECT fk_easyfixter_id AS efr_id,
               SUM(CASE WHEN DATE(checkin_date_time) = DATE(requested_date_time) THEN 1 ELSE 0 END) AS sda,
               SUM(CASE WHEN job_status IN (2, 3, 5) THEN 1 ELSE 0 END) AS attempted
@@ -827,7 +886,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
 
     // Worked-for-this-client before?
     job.fk_client_id
-      ? pool.query(
+      ? gatedQuery(
           `SELECT DISTINCT fk_easyfixter_id AS efr_id
              FROM tbl_job
             WHERE fk_easyfixter_id IN (${placeholders})
@@ -845,7 +904,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     // `worked_for_vertical` field keeps feeding off THIS map so the ranking
     // order (RANKING_ORDER) is unchanged.
     job.fk_service_catg_id
-      ? pool.query(
+      ? gatedQuery(
           `SELECT DISTINCT fk_easyfixter_id AS efr_id
              FROM tbl_job
             WHERE fk_easyfixter_id IN (${placeholders})
@@ -866,7 +925,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
      * only — deliberately NOT wired into the ranking sort.
      */
     job.fk_client_id
-      ? pool.query(
+      ? gatedQuery(
           `SELECT DISTINCT j.fk_easyfixter_id AS efr_id
              FROM tbl_job j
             WHERE j.fk_easyfixter_id IN (${placeholders})
@@ -916,7 +975,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     //     than closed. That follows directly from the rule — we cannot claim
     //     someone is "explicitly absent" on the strength of a failed query.
     reqDate
-      ? pool.query(
+      ? gatedQuery(
           `SELECT DISTINCT easyfixer_id AS efr_id
              FROM tbl_easyfixer_attendance
             WHERE easyfixer_id IN (${placeholders})
@@ -935,7 +994,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     // Tech base fields — current pincode (efr_pin_no) + zone FK
     // (efr_zone_city_id). efr_pin_no EXISTS on the physical table even
     // though it's absent from the Java entity subset (locked decision).
-    pool.query(
+    gatedQuery(
       `SELECT e.efr_id, e.efr_pin_no, e.efr_zone_city_id
          FROM tbl_easyfixer e
         WHERE e.efr_id IN (${placeholders})`,
@@ -944,7 +1003,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
 
     // Serviceable pincodes — comma-separated TEXT per tech. Split to array
     // by the caller. Fail-soft if the table is absent on this deploy.
-    pool.query(
+    gatedQuery(
       `SELECT easyfixer_id AS efr_id, pincodes
          FROM tbl_efr_serviceable_pincodes
         WHERE easyfixer_id IN (${placeholders})`,
@@ -953,7 +1012,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
 
     // Concurrent jobs scoped to the PROPOSED job date (active statuses only).
     reqDate
-      ? pool.query(
+      ? gatedQuery(
           `SELECT fk_easyfixter_id AS efr_id, COUNT(*) AS cnt
              FROM tbl_job
             WHERE fk_easyfixter_id IN (${placeholders})
@@ -968,7 +1027,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     //   efr_zone_city_id → tbl_zone_city_mapping.city_zone_id → zone_id
     //   → tbl_zone_master.zone_name.
     // (Job-pincode zone is resolved separately in resolveJobPincodeContext.)
-    pool.query(
+    gatedQuery(
       `SELECT e.efr_id, zm.zone_id, zm.zone_name
          FROM tbl_easyfixer e
          LEFT JOIN tbl_zone_city_mapping zcm ON zcm.city_zone_id = e.efr_zone_city_id
@@ -1017,7 +1076,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   if (matrixSkillIds.size && efrIds.length) {
     try {
       const skillList = [...matrixSkillIds];
-      const [rows] = await pool.query(
+      const [rows] = await gatedQuery(
         `SELECT DISTINCT m.easyfixer_id AS efr_id FROM tbl_efr_deepskill_mapping m
           WHERE m.easyfixer_id IN (${efrIds.map(() => '?').join(',')}) AND m.is_repairing = 1
             AND m.parent_skill_id IN (${skillList.map(() => '?').join(',')})`,
@@ -1072,7 +1131,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   if (allServPins.size) {
     try {
       const pins = [...allServPins];
-      const [rows] = await pool.query(
+      const [rows] = await gatedQuery(
         `SELECT p.pincode, zpm.zone_id
            FROM tbl_pincode p
            JOIN tbl_zone_pincode_mapping zpm ON zpm.pincode_id = p.pincode_id
@@ -2718,6 +2777,7 @@ async function recommendSlotsForJob(jobId, { date, nowMs = Date.now() } = {}) {
 }
 
 module.exports = {
+  _statsGate,
   rankCandidatesForJob,
   searchTechniciansForJob,
   pickAutoAssignCandidate,

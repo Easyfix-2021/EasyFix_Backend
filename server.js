@@ -466,6 +466,31 @@ async function start() {
     setTimeout(() => process.exit(1), 10000).unref();
   };
 
+  /*
+   * LAST-RESORT NET — never let one request's rejection restart the container.
+   *
+   * Node >= 15 defaults to --unhandled-rejections=throw, so before this listener
+   * existed ANY promise rejection nothing caught terminated the process. On
+   * 2026-09-08 a pool "Queue limit reached." inside requireAuth did exactly that:
+   * a fault that should have cost ONE request a 500 instead killed every
+   * in-flight request and cold-started the container.
+   *
+   * This is a BACKSTOP, not the fix. It cannot send a response — the request
+   * that rejected still hangs until the client times out — so the caller-side
+   * fix is still to route the rejection to `next(err)`
+   * (see utils/async-middleware.js). What this guarantees is blast radius: one
+   * hung request and a loud log, instead of an outage. Logged at error level
+   * with the stack precisely so the un-wrapped site gets found and fixed.
+   */
+  process.on('unhandledRejection', (reason) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    logger.error(
+      { err: { message: err.message, stack: err.stack, code: err.code } },
+      'UNHANDLED REJECTION — request left hanging, process kept alive. '
+      + 'Find the await that escaped its try and wrap it (utils/async-middleware.js).'
+    );
+  });
+
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 }

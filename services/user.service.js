@@ -1,6 +1,10 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const roleService = require('./role.service');
+// requireAuth's per-user principal cache lives here; every write below that
+// touches a cached column drops the entry. No cycle: auth.service requires
+// only db/logger/utils.
+const authService = require('./auth.service');
 const { parseAllowedRows, parseAllowedInput, NO_ACCESS_KEY } = require('../lib/job-stages');
 /*
  * Employee code (tbl_user.user_code) — the format lives in ONE place. Never
@@ -1820,7 +1824,12 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
     // Per-user perms cache invalidation. A user_role change is the obvious
     // trigger; other field edits (name, email, etc.) don't change perms but
     // clearing one entry is cheap so we do it unconditionally.
-    roleService.invalidatePermissionsCache(userId);
+    authService.invalidateUserCaches(userId);   // busts the user row AND permissions
+    // requireAuth's principal cache (services/auth.service.js). MUTABLE_COLUMNS
+    // includes user_role, city_id and all four manage_* scope columns, and the
+    // is_active branch above pushes user_status — i.e. every security-relevant
+    // column that cache holds is reachable from here. Cleared unconditionally
+    // for the same reason as the perms cache: cheaper than sniffing the diff.
     // Hierarchy adjacency invalidation. reporting_manager / user_status /
     // user_type_id are all reachable via this update path; rather than
     // sniff which field changed, just clear unconditionally (rebuild ~1 ms).
@@ -2108,7 +2117,12 @@ async function deactivateUser(userId, updatedBy) {
     // Deactivated user's perms cache entry would still serve stale data
     // until TTL; drop it now so a re-activation or any racing request
     // immediately re-resolves against the live row.
-    roleService.invalidatePermissionsCache(userId);
+    authService.invalidateUserCaches(userId);   // busts the user row AND permissions
+    // requireAuth's principal cache. THE important one: findUserById filters
+    // `user_status = 1`, so a cached hit IS the authentication decision — a
+    // deactivated user with a live cache entry keeps a working session. This
+    // drops it on THIS replica immediately; other replicas fall back to the
+    // 15s TTL (see the header in services/auth.service.js).
     // Hierarchy view: _loadHierarchyAdjacency queries WHERE user_status=1,
     // so this user just disappeared from every manager's downstream list.
     // Clear so the next read reflects the change.

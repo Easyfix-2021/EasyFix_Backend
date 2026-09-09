@@ -117,6 +117,24 @@ function registerJob({
  * error to the operator via the job's lastError.
  */
 async function invokeJob(job, kind /* 'cron' | 'manual' */) {
+  /*
+   * RE-ENTRANCY GUARD. node-cron defaults to noOverlap=false and every
+   * schedule site here passes only { timezone }, so a tick whose run outlasts
+   * its interval starts a SECOND run on top of the first. `job.running` was
+   * already being maintained but never read, so nothing stopped the stacking:
+   * runs pile up, each clobbering the other's telemetry (the Scheduled Jobs
+   * page shows an idle card for a live job, and requestCancel refuses with
+   * "not running"), and each stacked run adds its own pool demand on top of a
+   * pool that is evidently already slow — which is how a transient slowdown
+   * ratchets instead of draining.
+   *
+   * Manual triggers stay exempt so an operator can still force a run.
+   */
+  if (job.running && kind === 'cron') {
+    logger.warn(`Cron job "${job.id}" skipped — previous run still in flight since `
+      + new Date(job.runningSince).toISOString());
+    return null;
+  }
   const t0 = Date.now();
   job.lastRunAt = new Date();
   job.lastTriggerKind = kind;

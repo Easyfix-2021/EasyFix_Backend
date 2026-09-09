@@ -242,8 +242,7 @@ async function buildJobPayload(jobId, eventName) {
             Key: stored,
           }), { expiresIn: ttl });
         } catch (e) {
-          // eslint-disable-next-line no-console
-          console.warn('webhook: S3 presign failed for', stored, e?.message);
+          logger.warn('webhook: S3 presign failed', { stored, err: e?.message });
           url = `${IMAGE_URL_BASE}/upload_jobs/${stored}`;
         }
       } else {
