@@ -26,13 +26,35 @@ const properties = require('./properties.service');
  * above it. The static count and the runtime peak agree, so 16 is structural,
  * not a latency artefact.
  *
- * Against production's connectionLimit 30 / queueLimit 50 (db.js):
- *     2 concurrent opens → the pool is full and requests begin queueing
- *     6 concurrent opens → 96 acquires against an 80 ceiling → mysql2 throws
- *                          "Queue limit reached." to EVERY request in the
- *                          process, including the per-request auth lookup.
- * Six operators opening the assign modal at once is an ordinary Monday, so this
- * one endpoint could take the process down without anything being "wrong".
+ * POOL BUDGET — re-measured 2026-09-09. The arithmetic that used to sit here
+ * reasoned against "connectionLimit 30 / queueLimit 50 (db.js)" and concluded
+ * six concurrent opens would take the process down. Production has never run
+ * 30/50. Ask the PROCESS, not this file — db-pool-config.js's 100/150 are
+ * FALLBACKS and the host env overrides them:
+ *
+ *     curl -s https://backend.easyfix.in/api/health/db
+ *     → limit 50, queueMax 100, lifetime enqueued 0
+ *
+ * `enqueued: 0` over the container's lifetime means no request has ever waited
+ * for a connection. This gate is insurance, not a fix for a live incident.
+ *
+ * Because the gate is MODULE-level, ranking's draw is 12 of 50 — 24% of the
+ * pool — no matter how many operators open the modal. RANKING CANNOT EXHAUST
+ * THE POOL. One request's statsForCandidates fires up to 16 gatedQuery calls,
+ * so a SINGLE request saturates the gate (12 run, 4 wait in statsWaiters);
+ * that is the bulkhead working, not a symptom.
+ *
+ * What is NOT bounded is the ungated half, outside this file. One cold Schedule
+ * & Assign open fires FIVE concurrent admin requests — /:id, /:id/candidates,
+ * /:id/offers, plus /:id/comments and /:id/customer-requests from
+ * JobContextPanel — and each runs scopedJob → job.getById(), whose Promise.all
+ * takes 3 connections at once:
+ *     15 ungated concurrent acquires per open (5 × 3)
+ *     saturation N = (50 − 12) / 15 = 2.5 → 3 simultaneous opens
+ * The two bursts are ~7 sequential round-trips apart, so they do not coincide.
+ * Widening this cap does not improve that number and narrowing it does not
+ * help — the fix is a lean scopedJob for the routes that need only the scope
+ * scalars, not a different value here.
  *
  * The gate is MODULE-level, not per-call, and that is the whole point: a
  * per-call cap still lets N operators contribute N × cap. A module-level cap
@@ -1885,9 +1907,11 @@ async function rankCandidatesForJob(jobId, {
   let rejected = [];
   let totalEligible = eligible.length;
   let cfgMaxConcurrent = DEFAULTS.MAX_CONCURRENT_JOBS;
-  // Batched ranking config — resolved at most ONCE (only when there are
-  // eligible techs to score) and shared by the city + zone stats passes so we
-  // don't pay the settings round-trip twice.
+  // Batched ranking config — resolved ONCE per request (only when there are
+  // eligible techs to score) and shared by the city + zone stats passes AND by
+  // ensureAssignedFirst, which used to re-resolve it because it called
+  // statsForCandidates without the cfg argument. The claim that it is paid once
+  // is only true now that every caller is threaded.
   let rankingCfg = null;
 
   if (eligible.length > 0) {
@@ -1938,7 +1962,7 @@ async function rankCandidatesForJob(jobId, {
     // can_offer=false, so it does not become a recommendation or assignment
     // target; it only tells Ops who currently owns the job.
     const incumbentContext = assignedEfrId
-      ? await ensureAssignedFirst([], assignedEfrId, job, [])
+      ? await ensureAssignedFirst([], assignedEfrId, job, [], rankingCfg)
       : [];
     logger.info('Returning ' + incumbentContext.length + ' context candidate(s) · no eligible techs · jobId=' + jobId + ' · reason=' + emptyReason.code);
     return {
@@ -1979,7 +2003,7 @@ async function rankCandidatesForJob(jobId, {
   // + scores them so they still render with is_current=true.
   let candidatesList = scored.slice(0, limit);
   if (assignedEfrId) {
-    candidatesList = await ensureAssignedFirst(candidatesList, assignedEfrId, job, scored);
+    candidatesList = await ensureAssignedFirst(candidatesList, assignedEfrId, job, scored, rankingCfg);
   }
 
   /*
@@ -2022,7 +2046,7 @@ async function rankCandidatesForJob(jobId, {
  * scored independently — so operators can see who's currently on the job
  * even when they wouldn't be auto-eligible.
  */
-async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll) {
+async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll, cfg = null) {
   // Path A: the assigned tech is already in the scored set — just promote.
   const idx = candidatesList.findIndex((c) => Number(c.efr_id) === assignedEfrId);
   if (idx !== -1) {
@@ -2050,7 +2074,11 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
   );
   if (!techRow) return candidatesList;
 
-  const stats = await statsForCandidates([assignedEfrId], job, job.fk_client_id);
+  // cfg is threaded in rather than re-resolved: without it statsForCandidates
+  // calls getRankingConfig again for a config the caller already paid for on
+  // this same request. The comment above rankingCfg claims the round-trip is
+  // paid "at most ONCE", and this path was the exception that made it false.
+  const stats = await statsForCandidates([assignedEfrId], job, job.fk_client_id, cfg);
   const s = stats.get(assignedEfrId);
   const assignedRow = { ...buildCandidateRow(techRow, s, job), is_current: true };
   return [assignedRow, ...candidatesList];
