@@ -305,6 +305,40 @@ const r0 = (n) => Math.round(n);
  * Ordered most-recent period first within each client; rows in driver order
  * (client_id DESC), then PM name for the FE rowspan grouping (FE sorts).
  */
+/*
+ * The headline rollup for the CURRENT period.
+ *
+ * Bucket 0, because this service returns most-recent FIRST (`.reverse()`
+ * above) — the OPPOSITE of the sibling technician-performance report, whose
+ * buildPeriods() is oldest -> newest. Both screens used to infer the
+ * convention and both inferred it wrong, in opposite directions, each summing
+ * the oldest bucket under a "current period" caption.
+ *
+ * Shipping `currentPeriodIndex` is the point: no consumer should have to know
+ * which way this particular report happens to order its buckets.
+ */
+function rollupCurrentPeriod(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  let tickets = 0;
+  let revenue = 0;
+  let label = '';
+  for (const r of list) {
+    const current = r.periods && r.periods[0];
+    if (!current) continue;
+    if (!label) label = current.label || '';
+    tickets += Number(current.ticketCreated) || 0;
+    revenue += Number(current.sumOfTotalCharge) || 0;
+  }
+  return {
+    currentPeriodIndex: 0,
+    currentPeriodLabel: label,
+    clients: list.length,
+    tickets,
+    revenue,
+    averageTicketSize: tickets > 0 ? Math.round((revenue / tickets) * 100) / 100 : 0,
+  };
+}
+
 async function getClientPerformance({ period = 'monthly', filters = {} } = {}) {
   logger.info('Building Client Performance report · period=' + period);
   const periods = buildPeriods(period); // most-recent first, length 3
@@ -422,4 +456,5 @@ function toXlsx(rows, period) {
   return { columns, rows: flatRows };
 }
 
-module.exports = { getClientPerformance, toXlsx };
+module.exports = {
+  rollupCurrentPeriod, getClientPerformance, toXlsx };

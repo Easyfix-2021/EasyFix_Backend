@@ -94,21 +94,17 @@ const COLUMN_RULES = [
   },
 ];
 
-// Headline KPIs from the grouped rows — totals for the MOST-RECENT period
-// (index 0 of each client's periods array), the period the title reflects.
+/*
+ * Headline KPIs, from the service's own rollup rather than a second loop here.
+ * This function used to compute them, which put them out of reach of the JSON
+ * branch and left the screen to re-derive its own — off by one period.
+ */
 function buildKpis(rows) {
-  let tickets = 0;
-  let revenue = 0;
-  for (const r of rows) {
-    const recent = r.periods && r.periods[0];
-    if (!recent) continue;
-    tickets += Number(recent.ticketCreated) || 0;
-    revenue += Number(recent.sumOfTotalCharge) || 0;
-  }
+  const r = service.rollupCurrentPeriod(rows);
   return [
-    { label: 'Tickets Received', value: tickets },
-    { label: 'Revenue', value: revenue, numFmt: FMT.RUPEE, accent: 'FF10B981' },
-    { label: 'Clients', value: rows.length, accent: 'FFF59E0B' },
+    { label: 'Tickets Received', value: r.tickets },
+    { label: 'Revenue', value: r.revenue, numFmt: FMT.RUPEE, accent: 'FF10B981' },
+    { label: 'Clients', value: r.clients, accent: 'FFF59E0B' },
   ];
 }
 
@@ -149,7 +145,16 @@ router.get('/', validate(querySchema, 'query'), async (req, res, next) => {
     }
 
     logger.info('Returning ' + rows.length + ' clients');
-    return modernOk(res, rows);
+    /*
+     * `{ rows, rollup }` rather than a bare array (2026-09-09), so the page
+     * stops re-deriving the current-period totals — and stops having to know
+     * that THIS report orders its buckets most-recent-first while its sibling
+     * does the opposite.
+     *
+     * The frontend reads both shapes (Array.isArray(data) ? data : data.rows),
+     * so the two repos can deploy in either order without a broken window.
+     */
+    return modernOk(res, { rows, rollup: service.rollupCurrentPeriod(rows) });
   } catch (err) {
     if (err && err.status) {
       logger.warn('Client Performance report failed · ' + err.message);

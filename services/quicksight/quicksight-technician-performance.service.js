@@ -497,6 +497,65 @@ function pct(count, denom) {
  * periods (legacy 4908-4946) so the FE always has [0] and [1] to read labels
  * from. period startDate/endDate are the DISPLAY dates (sqlEnd - 1).
  */
+/*
+ * The headline rollup — which bucket is CURRENT, and the totals over the rows
+ * given.
+ *
+ * WHY IT LIVES HERE (2026-09-09). It used to be written inline in the route's
+ * `format === 'xlsx'` branch, reachable only by the download. The on-screen
+ * page therefore re-derived it from the JSON branch and had to GUESS which end
+ * of the 3-period array was current — and guessed wrong, summing the OLDEST
+ * bucket under a "Latest Period" caption while the XLSX, one click away, showed
+ * the newest. Same filters, two answers, no way to reconcile them because the
+ * correct version lived in a branch the page could not call.
+ *
+ * `latestPeriodIndex` is the important half. buildPeriods() returns
+ * oldest -> newest, so the current bucket is the LAST one — but that is a
+ * convention of THIS service (the sibling client-performance report reverses,
+ * and its screen made the mirror-image mistake). Shipping the index means no
+ * consumer has to know the convention, which is the actual defect.
+ *
+ * Pure over the rows handed in, so the export can pass the full filtered set
+ * and the JSON branch its page without either needing a second query.
+ */
+function rollupLatestPeriod(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  let totalAllocated = 0;
+  let totalCompleted = 0;
+  let technicians = 0;
+  let latestPeriodLabel = '';
+  let latestPeriodIndex = -1;
+
+  for (const tx of list) {
+    const dw = tx.technicianPerformanceDataDateWise || [];
+    if (!dw.length) continue;
+    const idx = dw.length - 1;              // oldest -> newest: current is last
+    const latest = dw[idx];
+    if (latestPeriodIndex === -1) {
+      latestPeriodIndex = idx;
+      latestPeriodLabel = latest.detailsFor || '';
+    }
+    // The synthetic "No Technician" row carries a null id and must not be
+    // counted as a person or contribute volume.
+    if (!latest || tx.txId == null) continue;
+    technicians += 1;
+    totalAllocated += Number(latest.txTktCreated) || 0;
+    totalCompleted += Number(latest.txCompletedOrder) || 0;
+  }
+
+  return {
+    latestPeriodIndex: latestPeriodIndex === -1 ? 0 : latestPeriodIndex,
+    latestPeriodLabel,
+    technicians,
+    totalAllocated,
+    totalCompleted,
+    // One decimal, matching the XLSX cell this replaced.
+    completionPct: totalAllocated > 0
+      ? Math.round((totalCompleted / totalAllocated) * 1000) / 10
+      : 0,
+  };
+}
+
 async function getTechnicianPerformance({ flag = 'monthly', page = 1, pageSize = 10, filters = {} } = {}) {
   logger.info('Technician Performance · flag=' + flag + ' page=' + page + ' pageSize=' + pageSize);
   const periods = buildPeriods(flag); // oldest→newest, length 3
@@ -597,7 +656,8 @@ async function getTechnicianPerformance({ flag = 'monthly', page = 1, pageSize =
   });
 
   logger.info('Returning ' + data.length + ' technicians · totalRecords=' + totalRecords);
-  return { data, page, pageSize, totalRecords, totalPages };
+  // Shipped on the JSON branch too, so the page never re-derives it.
+  return { data, page, pageSize, totalRecords, totalPages, rollup: rollupLatestPeriod(data) };
 }
 
 function zeroPeriod(p) {
@@ -771,6 +831,7 @@ function toXlsx(payload) {
 
 module.exports = {
   getTechnicianPerformance,
+  rollupLatestPeriod,
   getTxPerformanceCategoryWise,
   toXlsx,
   // Cap surfaced so the route's xlsx export can request the full set

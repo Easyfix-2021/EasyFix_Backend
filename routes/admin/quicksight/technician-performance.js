@@ -145,24 +145,14 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
         { match: (k) => k === 'stateName' || k === 'txCity' || k === 'txName', hints: { align: 'left' } },
       ]);
 
-      // KPIs — totals across the FULL filtered set, summed from the most-recent
-      // period (last bucket; periods are oldest→newest) so the cards reflect the
-      // current window the user is looking at.
-      const list = (payload && payload.data) || [];
-      let totalAllocated = 0;
-      let totalCompleted = 0;
-      for (const tx of list) {
-        const dw = tx.technicianPerformanceDataDateWise || [];
-        const latest = dw[dw.length - 1];
-        if (!latest || tx.txId == null) continue; // skip synthetic "No Technician" row
-        totalAllocated += Number(latest.txTktCreated) || 0;
-        totalCompleted += Number(latest.txCompletedOrder) || 0;
-      }
-      const completionPct = totalAllocated > 0
-        ? Math.round((totalCompleted / totalAllocated) * 1000) / 10
-        : 0;
-      const sampleLatest =
-        list[0]?.technicianPerformanceDataDateWise?.slice(-1)[0]?.detailsFor || '';
+      /*
+       * KPIs — totals across the FULL filtered set, from the service's own
+       * rollup. This loop used to live here, which made it unreachable from the
+       * JSON branch and forced the screen to re-derive it (and get the period
+       * backwards). The payload already carries it; the export just reads the
+       * one for the full set it re-fetched above.
+       */
+      const { totalAllocated, totalCompleted, completionPct, latestPeriodLabel: sampleLatest } = payload.rollup;
 
       await streamStyledXlsx(res, `technician-performance-${flag}-${fileStamp()}.xlsx`, {
         title: 'EasyFix · Technician Performance',
