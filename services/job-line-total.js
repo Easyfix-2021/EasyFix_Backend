@@ -15,6 +15,7 @@ const { pool } = require('../db');
  *   routes/admin/jobs.js   estimate email per-line charge × qty + material
  *   routes/client/index.js client approval lines   charge × qty + material
  *   routes/client/index.js services_subtotal       charge × qty          (no material)
+ *                          — renamed service_charge_subtotal; see totalsFor
  *   routes/admin/finance.js invoice lines          charge × qty + material
  *   routes/admin/finance.js invoice header (SQL)   charge × qty          (no material)
  *   CRM JobTransactionView "Job Total"             charge                (no qty, no material)
@@ -94,9 +95,27 @@ const LINE_JOINS = `LEFT JOIN tbl_client_service   CS ON CS.client_service_id = 
        LEFT JOIN tbl_client_rate_card CR ON CR.crc_id            = CS.rate_card_id
        LEFT JOIN tbl_service_type     st ON st.service_type_id   = js.service_type_id`;
 
+/*
+ * NAMES THAT SAY WHAT THEY HOLD (2026-09-09).
+ *
+ * This used to expose `services_subtotal`, which excluded material — and
+ * material_charge is a column ON tbl_job_services, i.e. it belongs to the very
+ * service rows the field is named after. So "the subtotal for services"
+ * understated those services by their own parts, and the only defence was a
+ * comment calling it a breakdown row. Nothing rendered it: the client portal
+ * declared it in two type definitions and displayed only grand_total.
+ *
+ * A field nobody reads and everybody would misread is worse than no field, so
+ * the split is kept (labour and parts are genuinely different lines on a
+ * quotation) and the labour one is renamed to stop claiming to be the total.
+ *
+ *   service_charge_subtotal   charge x quantity      — labour
+ *   material_subtotal         material_charge        — parts
+ *   grand_total               both                   — what is owed
+ */
 function totalsFor(lines) {
   return {
-    services_subtotal: lines.reduce((s, l) => s + serviceCharge(l), 0),
+    service_charge_subtotal: lines.reduce((s, l) => s + serviceCharge(l), 0),
     material_subtotal: lines.reduce((s, l) => s + Number(l.material_charge || 0), 0),
     grand_total: lines.reduce((s, l) => s + l.line_total, 0),
   };

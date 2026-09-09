@@ -11,7 +11,8 @@
  *   estimate preview / email / client approval   charge × qty + material
  *   invoice lines                                charge × qty + material
  *   invoice header (SQL)                         charge × qty            ← under-billed
- *   client services_subtotal                     charge × qty            (a breakdown row)
+ *   client services_subtotal                     charge × qty            ← named for services,
+ *                                                                          dropped their material
  *   CRM JobTransactionView "Job Total"           charge                  ← no qty, no material
  *
  * The invoice header was live under-billing and is fixed in
@@ -91,12 +92,12 @@ test('quantity is applied, and a missing quantity means one — not zero', () =>
   assert.match(LINE_TOTAL_SQL('js'), /COALESCE\(js\.quantity, 1\)/, 'and the SQL must default it the same way');
 });
 
-test('serviceCharge is the material-free breakdown row, and the two add up', () => {
+test('service_charge_subtotal is labour only, and the parts add back to the total', () => {
   for (const row of ROWS) {
     const material = Number(row.material_charge || 0);
     assert.equal(
       serviceCharge(row) + material, lineTotal(row),
-      'services_subtotal + material_subtotal must equal grand_total, or the client sees a breakdown that does not sum',
+      'service_charge_subtotal + material_subtotal must equal grand_total, or the client sees a breakdown that does not sum',
     );
   }
 });
