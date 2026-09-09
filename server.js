@@ -264,6 +264,40 @@ async function start() {
     logger.warn(`Properties preload failed — ${err.message}. Continuing with env-only config.`);
   }
 
+  /*
+   * Report property keys the code reads that this database has no row for.
+   *
+   * getProperty() returns undefined for an absent key and every caller treats
+   * that as "off" or falls back to a default — correct, and the reason a
+   * missing row is invisible. A key that was never created looks exactly like
+   * a feature somebody switched off, so the gap surfaces only when a human
+   * goes looking for a switch that isn't there (which is how
+   * pincode.serviceable_recompute.enabled was found, weeks after shipping).
+   *
+   * WARN, never fatal, and deliberately so: several referenced keys have code
+   * defaults and legitimately need no row, so refusing to boot would turn a
+   * benign gap into an outage — a worse failure than the silence it replaces.
+   * Wrapped, because a config AUDIT must never be the thing that stops a boot.
+   */
+  try {
+    const { auditPropertyKeys } = require('./lib/property-key-audit');
+    const props = await require('./services/properties.service').getAllProperties();
+    const a = auditPropertyKeys({ root: __dirname, presentKeys: Object.keys(props) });
+    if (a.notSeeded.length) {
+      logger.warn('Property keys read by the code that NO migration creates — nobody ever wrote '
+        + 'the row, so these features cannot be switched on: ' + a.notSeeded.join(', '));
+    }
+    if (a.notApplied.length) {
+      logger.warn('Property keys whose seed migration has not run on this database: '
+        + a.notApplied.join(', '));
+    }
+    if (!a.notSeeded.length && !a.notApplied.length) {
+      logger.info('Property-key audit OK · all ' + a.referenced + ' referenced keys have rows');
+    }
+  } catch (err) {
+    logger.warn(`Property-key audit skipped — ${err.message}`);
+  }
+
   // Schema parity check — fails the boot if any column the code touches
   // is missing from the live INFORMATION_SCHEMA. Caught 6 phantom-column
   // bugs during the final migration audit; cheap to run on every start

@@ -48,7 +48,10 @@
 --
 -- APPLIED
 --   QA (10.30.2.30 / easyfix): 2026-09-09.
---   Production: pending.
+--   Production: 2026-09-09, applied by Harshit.
+--   This file then moved to migrations/executed/ and is FROZEN. To turn the
+--   job off later, UPDATE the row to 'false' and restart — do not edit or
+--   re-run this file, and do not delete the row.
 -- ─────────────────────────────────────────────────────────────────────
 
 
