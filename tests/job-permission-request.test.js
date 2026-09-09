@@ -21,10 +21,20 @@
  * process.
  */
 process.env.NOTIFICATIONS_DISABLE = 'true';
+// Force the LOCAL-DISK storage branch: cleared before utils/s3-storage.js reads
+// it at require time, so the fulfil test cannot reach a real bucket.
+process.env.S3_BUCKET_NAME = '';
 
-const { test, beforeEach } = require('node:test');
+const { test, beforeEach, after } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { installFakePool } = require('./helpers/fake-pool');
+
+// The fulfil path really writes the uploaded document; give it a temp root.
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'easyfix-permission-'));
+process.env.UPLOAD_JOB_FILES = tmpRoot;
 
 /* The caller is efr 42 / SPOC 42 of client 133; job 5001 is theirs. */
 let jobRow = null;
@@ -32,6 +42,7 @@ let openRequest = null;                    // what findOpen() sees
 let storedRequest = null;                  // what rowById() sees
 let me = { manager_id: 7 };                // not top of tree → hierarchy applies
 let subtree = [{ id: 42 }, { id: 43 }];
+let storedDocument = null;                 // whatever the upload actually wrote
 
 const fake = installFakePool([
   // Column-presence probes inside job.service.getById. [] = "column absent".
@@ -47,7 +58,25 @@ const fake = installFakePool([
   [/FROM tbl_job_permission_request[\s\S]*AND status = \?/i, () => (openRequest ? [openRequest] : [])],
   [/SELECT id, job_id, status FROM tbl_job_permission_request/i, () => (storedRequest ? [storedRequest] : [])],
   [/INSERT INTO tbl_job_permission_request/i, () => ({ insertId: 77 })],
-  [/UPDATE tbl_job_permission_request/i, () => ({ affectedRows: 1 })],
+  // An UPDATE that leaves the row unchanged cannot show that fulfil() answers
+  // with the FULFILLED item — the second rowById would still read 'requested'.
+  [/UPDATE tbl_job_permission_request/i, (sql, params) => {
+    if (storedRequest) {
+      storedRequest = { ...storedRequest, status: params[0], resolved_on: '2026-09-09 12:00:00' };
+      if (params[0] === 'fulfilled') storedRequest.document_image_id = 991;
+      if (params[0] === 'declined') storedRequest.decline_reason = params[1];
+    }
+    return { affectedRows: 1 };
+  }],
+
+  // ── tbl_job_image — the document the client uploads ────────────────
+  // The INSERT captures the value the upload actually stored, and the read
+  // hands that same value back, so `documentKind` is derived from a real
+  // filename rather than from one the test made up.
+  [/SELECT COUNT\(\*\) AS existing FROM tbl_job_image/i, () => [{ existing: 0 }]],
+  [/INSERT INTO tbl_job_image/i, (sql, params) => { storedDocument = params[1]; return { insertId: 991 }; }],
+  [/SELECT image FROM tbl_job_image WHERE image_id = \? LIMIT 1/i,
+    () => (storedDocument ? [{ image: storedDocument }] : [])],
 
   // The job itself — job.service.getById's projection.
   [/^\s*SELECT j\.\*/i, () => (jobRow ? [jobRow] : [])],
@@ -119,7 +148,10 @@ beforeEach(() => {
   storedRequest = request();
   me = { manager_id: 7 };
   subtree = [{ id: 42 }, { id: 43 }];
+  storedDocument = null;
 });
+
+after(() => { fs.rmSync(tmpRoot, { recursive: true, force: true }); });
 
 /* ─── 1. THE IDEMPOTENCY RULE ─────────────────────────────────────────── */
 
@@ -222,13 +254,102 @@ test('an already-answered request is 409, not a silent overwrite', async () => {
 
 /* ─── 4. THE WIRE SHAPE THREE OTHER FRONTENDS ARE CODED AGAINST ───────── */
 
-test('a list item carries exactly the contracted keys', async () => {
+/*
+ * This assertion was a SUBSET check (`k in item` over a list) — which is why
+ * adding documentKind / documentMimeType did not break it, and would not have
+ * broken it for the next person either. A subset check cannot see a field that
+ * appeared, so nothing in the suite noticed the wire shape changing. It is an
+ * EXACT set now: adding a key is a deliberate act with a test to update, and
+ * removing one — the change three frontends actually break on — still fails.
+ */
+const CONTRACT_KEYS = [
+  'id', 'jobId', 'kind', 'note', 'status', 'requestedBy', 'requestedAt', 'fulfilledAt',
+  'documentUrl', 'documentKind', 'documentMimeType', 'reason',
+];
+
+test('a list item carries exactly the contracted keys — no more, no fewer', async () => {
   storedRequest = request();
   const r = await run(mobileRouter, '/:jobId/permission-requests', 'get', techReq());
   const [item] = r.body.data.items;
-  for (const k of ['id', 'kind', 'note', 'status', 'requestedAt', 'fulfilledAt', 'documentUrl']) {
-    assert.ok(k in item, `the contract's \`${k}\` is missing — a frontend reads it`);
-  }
+  assert.deepEqual(Object.keys(item).sort(), [...CONTRACT_KEYS].sort(),
+    'the wire item is what three frontends are coded against — changing it is '
+    + 'a deliberate act, not a side effect');
   assert.equal(item.documentUrl, null,
     'an unfulfilled request has no document; null is the contracted empty value');
+  assert.equal(item.documentKind, null,
+    'null means there is nothing to render; "unknown" would mean there IS a '
+    + 'document whose type we could not establish, which is a different thing');
+  assert.equal(item.documentMimeType, null);
+});
+
+/* ─── 5. FULFIL — the client uploads the permit ───────────────────────────
+ *
+ * There was no positive fulfil test at all: every client-side test proved a
+ * REFUSAL (wrong tenant, wrong subtree, already answered), so the path a client
+ * actually walks — upload, row flips to fulfilled, technician gets an item that
+ * says what the file is — was covered by nothing.
+ *
+ * The type fields are the point. documentUrl is a presigned URL to an
+ * EXTENSION-LESS S3 key, so nothing downstream can tell a JPEG from a PDF by
+ * looking at it, and two of the three real permit samples are PDFs. A frontend
+ * that assumes <img> renders a broken tile for those.
+ */
+const PDF_BYTES = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.from('1 0 obj\n<<>>\nendobj\n')]);
+const JPEG_BYTES = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.from('\x00\x10JFIF\x00')]);
+
+const fulfilReq = (buffer, mimetype, originalname) => spocReq({
+  originalUrl: '/api/client/permission-requests/77/fulfil',
+  // multer's .single('file') runs in this stack; with no multipart content-type
+  // it passes straight through, so the parsed file is supplied directly.
+  headers: {},
+  file: { buffer, mimetype, originalname },
+});
+
+test('a SPOC in scope can fulfil, and the request flips to fulfilled', async () => {
+  const r = await run(clientRouter, '/permission-requests/:id/fulfil', 'post',
+    fulfilReq(PDF_BYTES, 'application/pdf', 'phoenix-gate-pass.pdf'));
+
+  assert.equal(r.statusCode, null, 'a successful modernOk leaves the default 200');
+  const write = fake.calls.find((c) => /UPDATE tbl_job_permission_request/i.test(c.sql));
+  assert.ok(write, 'fulfil must write');
+  assert.equal(write.params[0], 'fulfilled');
+  assert.equal(write.params[1], 991, 'the document row id must be recorded on the request');
+  assert.equal(write.params[2], 42, 'the answering SPOC is recorded');
+
+  assert.equal(r.body.data.status, 'fulfilled');
+  assert.ok(r.body.data.documentUrl, 'a fulfilled request must carry a URL the tag can load');
+});
+
+test('a fulfilled PDF says it is a PDF', async () => {
+  const r = await run(clientRouter, '/permission-requests/:id/fulfil', 'post',
+    fulfilReq(PDF_BYTES, 'application/pdf', 'pacific-mall-pazo-export.pdf'));
+  assert.equal(r.body.data.documentKind, 'pdf',
+    'without this a frontend renders a PDF permit in an <img> and shows a broken tile');
+  assert.equal(r.body.data.documentMimeType, 'application/pdf');
+});
+
+test('a photographed paper permit says it is an image', async () => {
+  const r = await run(clientRouter, '/permission-requests/:id/fulfil', 'post',
+    fulfilReq(JPEG_BYTES, 'image/jpeg', 'm5-ecity-ppz-form.jpg'));
+  assert.equal(r.body.data.documentKind, 'image');
+  assert.equal(r.body.data.documentMimeType, 'image/jpeg');
+});
+
+test('a fulfilled item still carries exactly the contracted keys', async () => {
+  const r = await run(clientRouter, '/permission-requests/:id/fulfil', 'post',
+    fulfilReq(PDF_BYTES, 'application/pdf', 'gate-pass.pdf'));
+  assert.deepEqual(Object.keys(r.body.data).sort(), [...CONTRACT_KEYS].sort());
+});
+
+test('a permit that is not an image or a PDF is refused, and nothing is fulfilled', async () => {
+  // The allowlist lives in job-image.service.js so it covers every caller; this
+  // proves the permit route is one of them, and that a refused upload leaves the
+  // request OPEN rather than half-answered.
+  const exe = Buffer.concat([Buffer.from('MZ'), Buffer.from([0x90, 0x00, 0x03, 0x00]), Buffer.alloc(16)]);
+  const r = await run(clientRouter, '/permission-requests/:id/fulfil', 'post',
+    fulfilReq(exe, 'application/pdf', 'gate-pass.pdf'));
+
+  assert.equal(r.statusCode, 400);
+  assert.match(r.body.error, /unsupported file type/i);
+  assert.equal(updated(), false, 'a refused document must not resolve the request');
 });

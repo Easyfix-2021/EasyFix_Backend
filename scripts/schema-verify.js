@@ -325,6 +325,13 @@ const EXPECTED = {
     'efr_address', 'efr_address_res', 'efr_pin_no',
     'efr_marital_status', 'efr_children', 'about_yourself', 'about_yourself2',
     'efr_profile_img', 'efr_profile_perc',
+    // The four per-section completion percentages beside efr_profile_perc.
+    // routes/mobile/index.js reads all five in one SELECT and writes them
+    // back with COALESCE; only the aggregate was ever listed, so the four
+    // that drive the onboarding checklist were unguarded. Each confirmed
+    // present on tbl_easyfixer (float) before being added.
+    'efr_personal_details_perc', 'efr_professional_details_perc',
+    'efr_bank_details_perc', 'efr_identity_details_perc',
     'user_id', 'experience_id', 'updated_by',
     'insert_date', 'update_date',
     // Assignment + ranking inputs (services/auto-assign.service.js,

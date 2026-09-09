@@ -1,7 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const s3Storage = require('../utils/s3-storage');
-const { uploadJobImage } = require('./job-image.service');
+const { uploadJobImage, resolveImageType } = require('./job-image.service');
 const pushDelivery = require('./push-delivery.service');
 const emailService = require('./email.service');
 
@@ -36,14 +36,42 @@ const emailService = require('./email.service');
  * PROOF_AFTER_CATEGORIES (utils/job-image-buckets.js), so a gate pass can never
  * be served to anyone as a before/after work photo.
  *
+ * WHAT A CLIENT MAY UPLOAD is decided in that service, not here: images (PNG,
+ * JPEG, GIF, WebP) and application/pdf, verified by sniffing the leading bytes
+ * rather than by trusting the multipart Content-Type. A permit is a photo of a
+ * paper form as often as it is a PDF export, so both must pass — and nothing
+ * else may, since the stored object is served from a presigned URL.
+ *
  * ── documentUrl IS PRESIGNED, NEVER AN AUTHED ENDPOINT ──────────────────
- * Both frontends render this in an <img> / <Image>, and neither can attach a
- * bearer to one: an <img> pointing at an authenticated endpoint 401s silently
- * and shows a broken tile with nothing in the console. So the read path is
- * s3Storage.resolveImageUrl(), which returns a short-TTL presigned S3 URL (or
- * the Nginx-served /easydoc URL when S3 is off) — a URL the tag can actually
- * load. It is null when the row has no document yet, and the frontends must
- * treat null as "nothing to show", not as an error.
+ * Neither frontend can attach a bearer to an <img> / <Image> / <iframe>: one
+ * pointing at an authenticated endpoint 401s silently and shows a broken tile
+ * with nothing in the console. So the read path is s3Storage.resolveImageUrl(),
+ * which returns a short-TTL presigned S3 URL (or the Nginx-served /easydoc URL
+ * when S3 is off) — a URL the tag can actually load. It is null when the row has
+ * no document yet, and the frontends must treat null as "nothing to show", not
+ * as an error.
+ *
+ * ── AND IT IS NOT ALWAYS AN IMAGE ───────────────────────────────────────
+ * A permit is an arbitrary third-party artifact. Of the three real samples the
+ * product owner supplied, one is a screenshot of a mall web portal, one a photo
+ * of a signed-and-stamped paper form, and one a set of Pazo workflow exports —
+ * PDFs. Two of the three are not images, and an <img> pointing at a PDF is the
+ * same broken tile as a 401.
+ *
+ * The URL cannot be sniffed for the answer: the S3 key carries NO extension by
+ * ops convention. So the item carries the type explicitly —
+ *
+ *   documentKind      'image' | 'pdf' | 'unknown', or null when there is no
+ *                     document. THE FIELD TO BRANCH ON: <img> for 'image', a
+ *                     PDF viewer / "Open document" link for 'pdf', and the same
+ *                     link for 'unknown' — a download always works, a render
+ *                     might not.
+ *   documentMimeType  the exact type when it could be established, else null.
+ *
+ * Both are ADDITIVE; every field the two frontends already read is unchanged.
+ * Derivation and its limits live in services/job-image.service.js
+ * (resolveImageType) — the type is not a column on tbl_job_image, and the
+ * comment there says exactly where it does come from.
  *
  * ── NO NEW CLIENT ACCESS SURFACE ────────────────────────────────────────
  * services/client-access.service.js gates six named SURFACES. This adds a
@@ -107,11 +135,20 @@ async function rowById(id, db = pool) {
 async function toItem(row) {
   if (!row) return null;
   let documentUrl = null;
+  // null = there is no document. 'unknown' = there IS one and we could not
+  // establish its type — the frontend then offers a link rather than a render.
+  let documentKind = row.document_image_id ? 'unknown' : null;
+  let documentMimeType = null;
   if (row.document_image_id) {
     try {
       const [[img]] = await pool.query(
         'SELECT image FROM tbl_job_image WHERE image_id = ? LIMIT 1', [row.document_image_id]);
-      if (img && img.image) documentUrl = await s3Storage.resolveImageUrl(img.image);
+      if (img && img.image) {
+        documentUrl = await s3Storage.resolveImageUrl(img.image);
+        const type = await resolveImageType(img.image);
+        documentMimeType = type.mimeType;
+        documentKind = type.kind;
+      }
     } catch (e) {
       // A storage hiccup must not blank the whole list — the row still says
       // "fulfilled", and the tile shows the empty state rather than an error.
@@ -128,6 +165,8 @@ async function toItem(row) {
     requestedAt: row.requested_on,
     fulfilledAt: row.resolved_on ?? null,
     documentUrl,
+    documentKind,
+    documentMimeType,
     reason: row.decline_reason ?? null,
   };
 }

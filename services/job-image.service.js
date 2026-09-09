@@ -1,3 +1,4 @@
+const path = require('node:path');
 const { pool } = require('../db');
 const logger = require('../logger');
 const s3Storage = require('../utils/s3-storage');
@@ -13,12 +14,212 @@ const { writeBuffer } = require('../utils/file-storage');
  * local-disk fallback (dev / single-host). Always writes a tbl_job_image row
  * with the resolved key/filename in `image`.
  */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * WHAT MAY BE UPLOADED — ONE RULE, BOTH STORAGE BRANCHES
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * THE HOLE THIS CLOSES. utils/file-storage.js has a well-formed ALLOWED_MIME
+ * list, but it is only reached through writeBuffer() — i.e. the LOCAL-DISK
+ * branch below. With S3 configured (every deployed environment) that branch
+ * never runs, so until this check existed the client-declared mimetype was
+ * written verbatim onto the S3 object's Content-Type and handed back through a
+ * presigned URL. An `.exe`, or a `text/html` document that then executes on the
+ * bucket's origin, was storable and servable. Grepping for the allowlist finds
+ * file-storage's correct-looking one and gives the wrong answer, because
+ * nothing in production reaches it.
+ *
+ * So the check sits HERE, above the S3/local fork, and therefore covers all
+ * four callers — routes/admin/jobs.js (Booking), routes/admin/job-documents.js
+ * (JobSheet / PurchaseOrder), routes/client/index.js (Booking) and
+ * services/job-permission-request.service.js (Permission) — not just the route
+ * that prompted it. None of them had a multer fileFilter; all four accepted
+ * anything.
+ *
+ * WHY ONE LIST FOR EVERY CATEGORY, rather than a per-category table. Measured
+ * against the live table before choosing (1,379,052 rows):
+ *   · Everything this service has EVER written — it landed 2026-07-24 — is
+ *     png/jpeg (21 rows) plus 24 extension-less S3 keys. No PDF, no video, no
+ *     archive has ever come through this code path.
+ *   · The wide tail (63k `.zip`, 12k `.mp4`, `.heic`, `.eml`, `.xlsx`, `.htm`)
+ *     lives entirely in checkin/checkout/feedback/po/jobsheet rows written
+ *     DIRECTLY by the legacy CRM, which does not call this service. Narrowing
+ *     here cannot touch them.
+ *   · The one caller that carries documents rather than photos —
+ *     job-documents.js — exists for Job Sheets and Purchase Orders, whose
+ *     legacy population is 2,368 PDFs. Refusing PDF there would be a
+ *     regression waiting for its first user.
+ * Images + PDF is therefore a NARROWING for all four callers (each previously
+ * accepted anything) and a widening for none. A per-category map would encode a
+ * distinction that does not exist yet; add one the day a caller needs it.
+ *
+ * WHY THE DECLARED TYPE IS NOT TRUSTED. `file.mimetype` is whatever the client
+ * put in the multipart part header. Every type on this list has a stable magic
+ * number, so the bytes decide and the declaration only has to agree with them.
+ */
+const ALLOWED_UPLOAD_MIME = Object.freeze([
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
+]);
+
+/* Client-sent spellings that mean one of the above. */
+function normaliseMime(raw) {
+  const m = String(raw || '').trim().toLowerCase().split(';')[0].trim();
+  if (m === 'image/jpg' || m === 'image/pjpeg') return 'image/jpeg';
+  if (m === 'image/x-png') return 'image/png';
+  return m;
+}
+
+/*
+ * Leading-bytes sniff. Returns the real type, or null when the buffer is not
+ * one of the five — which is itself the rejection: an executable declared as
+ * `application/pdf` matches nothing here, so "declared type we cannot verify"
+ * is not an accepted state and there is no way to talk past the check.
+ *
+ * ponytail: five magic numbers, no dependency. A PDF whose `%PDF-` sits behind
+ * leading junk (the spec tolerates up to 1024 bytes of it; readers accept it,
+ * real-world permits do not do it) reads as unsupported. If one ever turns up,
+ * scan the first 1KB for the marker rather than adding a detection library.
+ */
+function sniffMime(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 3) return null;
+  if (buf.length >= 5 && buf.toString('latin1', 0, 5) === '%PDF-') return 'application/pdf';
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'image/jpeg';
+  if (buf.length >= 8 && buf.toString('hex', 0, 8) === '89504e470d0a1a0a') return 'image/png';
+  if (buf.length >= 6 && /^GIF8[79]a$/.test(buf.toString('latin1', 0, 6))) return 'image/gif';
+  if (buf.length >= 12 && buf.toString('latin1', 0, 4) === 'RIFF'
+      && buf.toString('latin1', 8, 12) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+/*
+ * The gate. Returns the type to STORE — the sniffed one, never the declared
+ * one, so the object's Content-Type can only ever be one of the five.
+ * `application/octet-stream` is accepted as a declaration (browsers send it for
+ * PDFs — file-storage's list carries the same note) and resolved by the bytes.
+ */
+function assertUploadableFile(file) {
+  const sniffed = sniffMime(file.buffer);
+  if (!sniffed || !ALLOWED_UPLOAD_MIME.includes(sniffed)) {
+    const err = new Error('unsupported file type — upload an image (PNG, JPEG, GIF, WebP) or a PDF');
+    err.status = 400;
+    throw err;
+  }
+  const declared = normaliseMime(file.mimetype);
+  if (declared && declared !== 'application/octet-stream' && declared !== sniffed) {
+    const err = new Error(`declared type "${file.mimetype}" does not match the file contents (${sniffed})`);
+    err.status = 400;
+    throw err;
+  }
+  return sniffed;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * READING THE TYPE BACK — WHY IT HAS TO BE DERIVED
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * tbl_job_image DOES NOT STORE A MIME TYPE. Its eleven columns are image_id,
+ * job_id, job_stage, image, status, created_date, updated_date, created_by,
+ * updated_by, source, image_category — verified against the live schema, not
+ * inferred. (tbl_job_media, a different table, does have content_type; that is
+ * the WhatsApp/customer-media table and nothing here writes it.) Adding a
+ * column would be an ALTER on a 1.38M-row table shared with the legacy CRM,
+ * which is exactly what the shared-DB rule forbids.
+ *
+ * It is nonetheless persisted twice already, once per storage branch:
+ *   · LOCAL / LEGACY rows keep the extension in `image` — writeBuffer names
+ *     files `{ts}_{rand}{ext}`, and 1,379,028 of the 1,379,052 rows in the
+ *     table carry one. That extension is exact, not a guess.
+ *   · S3 rows deliberately have NO extension on the key (utils/s3-storage.js
+ *     documents this) — the type lives on the object's Content-Type header,
+ *     which putJobImage sets. Reading it back costs one HeadObject.
+ * Those 24 extension-less rows are precisely the S3-keyed ones, and every
+ * permission document from now on will be one, so extension-only derivation
+ * would report "unknown" for every permit in production. Hence both sources.
+ *
+ * LIMITS, PLAINLY. An extension we do not recognise (`.zip`, `.mp4`, `.heic`,
+ * `.crdownload` — all present in legacy rows) yields `unknown`, never a guess.
+ * An extension-less row whose S3 object is missing or whose HEAD fails yields
+ * `unknown`. Nothing here re-reads the bytes; a legacy row whose extension lies
+ * about its content is reported as its extension claims. Rows written from now
+ * on cannot lie, because assertUploadableFile above sniffed them.
+ */
+const EXT_MIME = Object.freeze({
+  '.pdf': 'application/pdf',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.jfif': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+});
+
+/* The coarse branch a frontend actually switches on: <img> vs a PDF viewer. */
+function kindOfMime(mime) {
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime && mime.startsWith('image/')) return 'image';
+  return 'unknown';
+}
+
+/*
+ * ContentType of an S3 object, or null on any failure. Never throws: an
+ * unresolved type must degrade to "unknown", not blank a list.
+ *
+ * ponytail: its own S3Client because utils/s3-storage.js does not export one
+ * (five other services in this repo do the same). The cheaper upgrade, when
+ * that file is next open, is to have `exists()` return the HeadObject response
+ * it already makes and discards — resolveImageUrl calls it on every render, so
+ * the type would then cost nothing at all.
+ */
+let _headClient = null;
+async function s3ContentType(key) {
+  if (!s3Storage.isEnabled()) return null;
+  try {
+    const { S3Client, HeadObjectCommand } = require('@aws-sdk/client-s3');
+    if (!_headClient) {
+      _headClient = new S3Client({
+        region: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'ap-south-1',
+      });
+    }
+    const head = await _headClient.send(new HeadObjectCommand({
+      Bucket: s3Storage.bucketName(), Key: key,
+    }));
+    return normaliseMime(head.ContentType) || null;
+  } catch (e) {
+    logger.warn({ key, err: e?.message }, 'job image content-type HEAD failed — type reported as unknown');
+    return null;
+  }
+}
+
+/*
+ * Resolve a stored `tbl_job_image.image` value to { mimeType, kind }.
+ *   mimeType : exact string, or null when it could not be established
+ *   kind     : 'image' | 'pdf' | 'unknown' — always a string, so a frontend
+ *              can branch without sniffing a presigned URL that carries no
+ *              extension to sniff.
+ */
+async function resolveImageType(storedValue) {
+  const stored = String(storedValue || '').trim();
+  if (!stored) return { mimeType: null, kind: 'unknown' };
+
+  const ext = path.extname(stored).toLowerCase();
+  if (ext) {
+    const mimeType = EXT_MIME[ext] || null;
+    return { mimeType, kind: kindOfMime(mimeType) };
+  }
+
+  const mimeType = await s3ContentType(stored);
+  return { mimeType, kind: kindOfMime(mimeType) };
+}
+
 async function uploadJobImage({ jobId, file, category = 'Booking' }) {
   if (!file || !file.buffer) {
     const err = new Error('missing "file" upload');
     err.status = 400;
     throw err;
   }
+  // Above the storage fork on purpose — see the block comment. The STORED type
+  // is the sniffed one, so a lying Content-Type cannot reach the bucket.
+  const contentType = assertUploadableFile(file);
 
   // Next seq from existing rows (human-readable key; not a uniqueness key).
   const [[{ existing }]] = await pool.query(
@@ -32,18 +233,18 @@ async function uploadJobImage({ jobId, file, category = 'Booking' }) {
       image = await s3Storage.putJobImage({
         jobId, seq,
         buffer: file.buffer,
-        contentType: file.mimetype,
+        contentType,
         originalName: file.originalname,
         category,
       });
       storage = 's3';
     } catch (e) {
       logger.warn({ jobId, seq, err: e.message }, 'job image S3 put failed — local fallback');
-      image = writeBuffer('job_files', file.buffer, file.originalname, file.mimetype).filename;
+      image = writeBuffer('job_files', file.buffer, file.originalname, contentType).filename;
       storage = 'local-fallback';
     }
   } else {
-    image = writeBuffer('job_files', file.buffer, file.originalname, file.mimetype).filename;
+    image = writeBuffer('job_files', file.buffer, file.originalname, contentType).filename;
     storage = 'local';
   }
 
@@ -52,8 +253,15 @@ async function uploadJobImage({ jobId, file, category = 'Booking' }) {
      VALUES (?, ?, ?, ?, NOW())`,
     [jobId, image, String(category).toLowerCase(), 0]);
 
-  logger.info('Job image stored · job=' + jobId + ' · seq=' + seq + ' · storage=' + storage);
-  return { image_id: ins.insertId, job_id: jobId, image, image_category: String(category).toLowerCase(), job_stage: 0, seq, storage };
+  logger.info('Job image stored · job=' + jobId + ' · seq=' + seq + ' · storage=' + storage
+    + ' · type=' + contentType);
+  return {
+    image_id: ins.insertId, job_id: jobId, image,
+    image_category: String(category).toLowerCase(), job_stage: 0, seq, storage,
+    // The verified type, for a caller that wants to answer "image or PDF?"
+    // without a second round trip through resolveImageType().
+    mime_type: contentType, kind: kindOfMime(contentType),
+  };
 }
 
 /**
@@ -179,4 +387,9 @@ async function deleteJobImage({ imageId, jobId = null, categories = null }) {
   return { image_id: Number(imageId), job_id: row.job_id, image_category: row.image_category };
 }
 
-module.exports = { uploadJobImage, serveResolvedImage, deleteJobImage };
+module.exports = {
+  uploadJobImage, serveResolvedImage, deleteJobImage,
+  // Upload allowlist (GAP 2) + type read-back (GAP 1) — exported for the
+  // permission-request service's wire item and for the tests that pin them.
+  ALLOWED_UPLOAD_MIME, sniffMime, assertUploadableFile, resolveImageType, kindOfMime,
+};

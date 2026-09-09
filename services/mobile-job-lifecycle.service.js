@@ -8,13 +8,20 @@ const gallabox = require('./gallabox.whatsapp.service');
 /*
  * The approved Gallabox template that carries the job-closing PIN.
  *
- * Deliberately NOT defaulted to a guess. Gallabox answers 200 for a template
- * name it does not recognise and the handset simply never receives anything —
- * so a wrong name here is a SILENT non-delivery that no delivery check can
- * catch. Unset means "fall back to SMS and say so in the log", which is visibly
- * broken rather than invisibly broken.
+ * 'customer_job_pin' is the name registered in the Gallabox console on
+ * 2026-09-09, confirmed by the product owner. It is a DEFAULT rather than a
+ * literal so the name can be corrected without a deploy — Gallabox answers 200
+ * for a template name it does not recognise and the handset simply never
+ * receives anything, so a wrong name here is a SILENT non-delivery that no
+ * delivery check can catch, and being able to fix it from config matters more
+ * than saving one indirection.
+ *
+ * Setting it to an empty string is meaningful: it disables the WhatsApp path
+ * and falls back to SMS with a loud log line.
  */
-const CLOSING_PIN_TEMPLATE = String(process.env.GALLABOX_CLOSING_PIN_TEMPLATE || '').trim();
+const CLOSING_PIN_TEMPLATE = String(
+  process.env.GALLABOX_CLOSING_PIN_TEMPLATE ?? 'customer_job_pin',
+).trim();
 
 /*
  * Mobile Job Lifecycle — the technician-app order flow that sits on top

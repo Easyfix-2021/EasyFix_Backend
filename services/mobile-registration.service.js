@@ -836,6 +836,16 @@ async function setLanguage(efrId, language, runner = pool) {
 
 module.exports = {
   getStatus,
+  /*
+   * Exported 2026-09-09. tbl_easyfixer.efr_profile_img holds an S3 KEY
+   * ("EFRDoc20260818161335.jpg"), not a URL, and this is the only function that
+   * turns one into something an <Image> can load. It was reachable from exactly
+   * ONE endpoint (/registration/status), so the two endpoints the Identity and
+   * Profile screens actually call handed the raw key straight to the client and
+   * the selfie rendered as an empty tile. Same column, two representations,
+   * depending on which endpoint you asked.
+   */
+  resolveProfileImageUrl,
   getRemaining,
   savePersonalDetails,
   saveWorkArea,

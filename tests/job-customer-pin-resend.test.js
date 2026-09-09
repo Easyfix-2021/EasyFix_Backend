@@ -142,10 +142,11 @@ test('happy path passes the job\'s own technician through and never returns the 
   await withSendStub(
     async (jobId, efrId) => {
       seen.push({ jobId, efrId });
-      // Deliberately hostile double: the real service returns { sent: true },
-      // but this route must stay PIN-free even if that file later widens its
+      // Deliberately hostile double. The real service returns
+      // { sent, channel, delivered }; this adds the PIN under two plausible
+      // names because the route must stay PIN-FREE however that file widens its
       // return value — the route owns its own payload, not the service.
-      return { sent: true, otp: '9137', pin: '9137' };
+      return { sent: true, channel: 'whatsapp', delivered: true, otp: '9137', pin: '9137' };
     },
     async () => {
       const res = responseDouble();
@@ -160,7 +161,16 @@ test('happy path passes the job\'s own technician through and never returns the 
       assert.deepEqual(seen, [{ jobId: 4321, efrId: 88 }],
         'must call the shared service with the job id and the job\'s assigned technician');
       assert.equal(res.statusCode, 200);
-      assert.deepEqual(res.body.data, { sent: true });
+      /*
+       * The payload widened on 2026-09-09, deliberately. It used to be the
+       * literal { sent: true } whatever happened, because the service discarded
+       * the provider's answer — and every one of these messages was being
+       * REJECTED by DLT while this endpoint reported success, which is how a
+       * technician ended up unable to close a job the CRM said had been
+       * PIN-ed. It now reports the channel that carried it and whether the
+       * provider accepted it.
+       */
+      assert.deepEqual(res.body.data, { sent: true, channel: 'whatsapp', delivered: true });
       assert.equal(JSON.stringify(res.body).includes('9137'), false,
         'the response must never carry the customer PIN');
     },
@@ -198,7 +208,7 @@ test('a dead job history does not 500 an SMS that already went out', async () =>
   let sent = 0;
 
   await withSendStub(
-    async () => { sent += 1; return { sent: true }; },
+    async () => { sent += 1; return { sent: true, channel: 'whatsapp', delivered: true }; },
     async () => {
       const res = responseDouble();
       let nextErr = null;
@@ -210,7 +220,7 @@ test('a dead job history does not 500 an SMS that already went out', async () =>
       assert.equal(sent, 1, 'the SMS still went out');
       assert.equal(nextErr, null, 'a history failure must not reach the 500 handler');
       assert.equal(res.statusCode, 200);
-      assert.deepEqual(res.body.data, { sent: true });
+      assert.deepEqual(res.body.data, { sent: true, channel: 'whatsapp', delivered: true });
     },
     async () => { throw new Error('Table \'tbl_job_logs\' doesn\'t exist'); },
   );

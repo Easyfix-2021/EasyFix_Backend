@@ -4,6 +4,7 @@ const dashboardService = require('./mobile-dashboard.service');
 const performanceService = require('./performance.service');
 const jobService = require('./job.service');
 const { resolveServiceCategories } = require('./easyfixer-profile-update-link.service');
+const { resolveProfileImageUrl } = require('./mobile-registration.service');
 
 /*
  * Mobile profile-details orchestrator — backs `GET /api/mobile/profile/details`.
@@ -158,6 +159,18 @@ async function getProfileDetails(efrId) {
   const completedJobs =
     Number(counts.byStatus?.['3'] ?? 0) + Number(counts.byStatus?.['5'] ?? 0);
 
+  /*
+   * efr_profile_img is an S3 KEY, not a URL — e.g. "EFRDoc20260818161335.jpg".
+   * Handing it straight to the client, which is what this projection used to
+   * do, gives expo-image something it cannot load: the selfie tile renders in
+   * its EMPTY state while the screen still offers to Remove the photo it is
+   * denying it has. Verified on prod efr 11448.
+   *
+   * Awaited rather than folded into the Promise.all above because it depends on
+   * `ident`, which that batch produces.
+   */
+  const photoUrl = (await resolveProfileImageUrl(ident?.efr_profile_img)) || null;
+
   logger.info('Returning profile-details · completedJobs=' + completedJobs
     + ' skillCount=' + skillCounts.skillCount
     + ' categoryCount=' + skillCounts.categoryCount);
@@ -170,7 +183,7 @@ async function getProfileDetails(efrId) {
     // tbl_easyfixer read (fetchIdentity doesn't project efr_email).
     email:          ident?.efr_email ?? extra?.efr_email ?? null,
     city:           ident?.city_name ?? null,
-    photoUrl:       ident?.efr_profile_img || null,
+    photoUrl:       photoUrl,
     rating:         performance.rating ?? 0,
     grade:          performance.grade ?? null,
     completedJobs,

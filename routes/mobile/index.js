@@ -8,6 +8,9 @@ const requireTechAuth = require('../../middleware/tech-auth');
 const { pool } = require('../../db');
 const techAuth = require('../../services/tech-auth.service');
 const registrationProfile = require('../../services/technician-registration-profile.service');
+// Only for resolveProfileImageUrl — efr_profile_img is an S3 key, and this is
+// the one function that turns it into something the app can render.
+const mobileRegistrationService = require('../../services/mobile-registration.service');
 const jobService = require('../../services/job.service');
 const addressService = require('../../services/address.service');
 const jobCommentService = require('../../services/job-comment.service');
@@ -1062,6 +1065,23 @@ router.get('/profile', async (req, res, next) => {
   try {
     logger.info('Load raw technician profile');
     const [[tech]] = await pool.query('SELECT * FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)', [req.tech.efr_id]);
+    /*
+     * efr_profile_img holds an S3 KEY ("EFRDoc20260818161335.jpg"), not a URL,
+     * and this handler reads the whole row, so it went out raw. The app maps
+     * its photoUrl out of "efr_profile_img" BEFORE "photoUrl" —
+     * and hands the result to expo-image, which cannot load a bare key. Result:
+     * the selfie tile paints its EMPTY state while the screen still offers to
+     * Remove the photo it is denying it has (verified on prod efr 11448).
+     *
+     * Resolved IN PLACE rather than added alongside, precisely because the app
+     * prefers this field: a second, correct field would have been ignored.
+     * Legacy rows that are not resolvable S3 keys come back verbatim, which is
+     * what resolveProfileImageUrl already guarantees.
+     */
+    if (tech) {
+      tech.efr_profile_img = await mobileRegistrationService.resolveProfileImageUrl(tech.efr_profile_img);
+      tech.photoUrl = tech.efr_profile_img;
+    }
     modernOk(res, tech);
   } catch (e) { next(e); }
 });
