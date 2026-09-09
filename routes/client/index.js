@@ -1191,6 +1191,36 @@ const permissionDocUpload = multerClientImg({
   limits: { fileSize: 10 * 1024 * 1024, files: 1 },
 });
 
+/*
+ * GET /api/client/permission-requests — every open request across this client's
+ * jobs. The portal's "Pending on you" panel; the per-job route below cannot
+ * serve it, because the client does not know which jobs are waiting.
+ *
+ * Scoped through the SAME two checks loadJobInScope applies to a single job —
+ * tenancy plus the reporting_contact_id hierarchy — so a SPOC cannot widen
+ * their view by asking the list instead of asking for a job. The service owns
+ * both the SQL and the emptiness rule for a caller scoped to nothing.
+ */
+router.get('/permission-requests', async (req, res, next) => {
+  try {
+    const hier = await resolveClientHierarchy(req);
+    const contactIds = hierarchyFilter(hier, req);   // undefined = whole client
+    const status = String(req.query.status || '').trim() || permissionRequests.STATUS.REQUESTED;
+    if (!Object.values(permissionRequests.STATUS).includes(status)) {
+      return modernError(res, 400, 'unknown status');
+    }
+    const items = await permissionRequests.listForClient({
+      clientId: req.spoc.client_id,
+      contactIds,
+      status,
+      limit: req.query.limit,
+    });
+    logger.info('Permission requests listed (client-wide) · clientId=' + req.spoc.client_id
+      + ' · status=' + status + ' · n=' + items.length);
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
 // GET the requests on one job. Same item shape as the technician's list.
 router.get('/jobs/:id/permission-requests', async (req, res, next) => {
   try {

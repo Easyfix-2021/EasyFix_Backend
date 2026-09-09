@@ -110,11 +110,21 @@ function normaliseKind(raw) {
  * nothing useful. Null when the technician row is gone; the card then omits the
  * clause rather than printing a hollow "Raised by —".
  */
-const ROW_COLS = `id, job_id, requested_by_efr_id, kind, note, status,
-                  document_image_id, fulfilled_by_contact_id, decline_reason,
-                  requested_on, resolved_on,
-                  (SELECT e.efr_name FROM tbl_easyfixer e
-                    WHERE e.efr_id = requested_by_efr_id) AS requested_by_name`;
+/*
+ * One column list, optionally qualified. The client-wide list joins tbl_job,
+ * where bare `id` / `status` / `note` would be ambiguous — and a second
+ * hand-copied list is how two queries drift into disagreeing about the shape
+ * they both claim to produce.
+ */
+const rowCols = (alias = '') => {
+  const p = alias ? `${alias}.` : '';
+  return `${p}id, ${p}job_id, ${p}requested_by_efr_id, ${p}kind, ${p}note, ${p}status,
+          ${p}document_image_id, ${p}fulfilled_by_contact_id, ${p}decline_reason,
+          ${p}requested_on, ${p}resolved_on,
+          (SELECT e.efr_name FROM tbl_easyfixer e
+            WHERE e.efr_id = ${p}requested_by_efr_id) AS requested_by_name`;
+};
+const ROW_COLS = rowCols();
 
 async function rowById(id, db = pool) {
   const [[row]] = await db.query(
@@ -177,6 +187,60 @@ async function listForJob(jobId) {
     `SELECT ${ROW_COLS} FROM tbl_job_permission_request
       WHERE job_id = ? ORDER BY id DESC`, [Number(jobId)]);
   return Promise.all(rows.map(toItem));
+}
+
+/*
+ * Every open request across a CLIENT's jobs — what the portal's "Pending on
+ * you" panel reads. The per-job list above cannot serve it: the client does not
+ * know which jobs are waiting, which is the entire question.
+ *
+ * SCOPED EXACTLY AS loadJobInScope SCOPES ONE JOB, and that is not decoration.
+ * Tenancy (fk_client_id) is necessary but NOT sufficient — a SPOC low in the
+ * hierarchy must not see requests on a sibling's jobs. `contactIds` is what
+ * hierarchyFilter() returns: an array to restrict to, or undefined for a
+ * top-level / allStores caller who legitimately sees the whole client. Passing
+ * an empty array means "restricted to nothing" and must return nothing, which
+ * `IN ()` cannot express — hence the explicit guard rather than a clever SQL
+ * fragment.
+ *
+ * The job context (reference, city, category) rides along so a row is
+ * actionable without opening the job; it is merged ON TOP of toItem() rather
+ * than inside it, so the wire shape stays decided in exactly one place.
+ */
+async function listForClient({ clientId, contactIds, status = STATUS.REQUESTED, limit = 100 }) {
+  const scoped = Array.isArray(contactIds);
+  if (scoped && contactIds.length === 0) return [];
+  const bounded = Math.min(Math.max(Number(limit) || 100, 1), 200);
+
+  const [rows] = await pool.query(
+    `SELECT ${rowCols('pr')},
+            j.job_reference_id, j.client_ref_id,
+            COALESCE(city.city_name, 'Unknown') AS city_name,
+            COALESCE(tsc.service_catg_name, 'Uncategorised') AS category_name
+       FROM tbl_job_permission_request pr
+       JOIN tbl_job j ON j.job_id = pr.job_id
+       LEFT JOIN tbl_address a
+              ON a.customer_id = j.fk_customer_id AND a.address_id = j.fk_address_id
+       LEFT JOIN tbl_city city ON city.city_id = a.city_id
+       LEFT JOIN tbl_service_catg tsc ON tsc.service_catg_id = j.fk_service_catg_id
+      WHERE pr.status = ?
+        AND j.fk_client_id = ?
+        ${scoped ? 'AND j.reporting_contact_id IN (?)' : ''}
+      ORDER BY pr.requested_on ASC
+      LIMIT ?`,
+    scoped
+      ? [status, Number(clientId), contactIds, bounded]
+      : [status, Number(clientId), bounded],
+  );
+
+  // Oldest first: the panel's claim is "someone is waiting", so the longest
+  // wait belongs at the top rather than the newest arrival.
+  return Promise.all(rows.map(async (row) => ({
+    ...(await toItem(row)),
+    reference: row.job_reference_id || row.client_ref_id || null,
+    city: row.city_name,
+    category: row.category_name,
+  })));
 }
 
 /** The still-open request for this job+kind, if any. */
@@ -380,6 +444,7 @@ module.exports = {
   normaliseKind,
   toItem,
   listForJob,
+  listForClient,
   findOpen,
   create,
   fulfil,
