@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const { serviceChargeMap } = require('./job-service-breakdown.service');
 
 /*
  * Billing & Charges — job-workspace service backing the CRM "Billing & Charges"
@@ -94,6 +95,62 @@ async function getCharges(jobId) {
       ORDER BY js.job_service_id ASC`,
     [id]
   );
+
+  /*
+   * client_charge + tx_charge per service line (2026-09-09).
+   *
+   * WHAT THIS REPLACES. The CRM's Job Summary matrix rendered the Services row
+   * as `{ client: Σ js.total_charge, tx: 0 }` — a hardcoded zero, with a
+   * comment saying the contract offered nothing better. It was wrong twice
+   * over, and the second one is easy to miss:
+   *
+   *   tx     — always 0, so every service looked like pure margin.
+   *   client — js.total_charge is a PER-UNIT column despite its name (the
+   *            writers store Math.round(unitPrice) into it), and the matrix
+   *            never multiplied by quantity. A qty-3 line was billed once.
+   *            The column is also "usually 0" on older rows, which is why
+   *            job.service.js and the breakdown route both refuse to read it
+   *            raw. Same figure, three readers, three answers.
+   *
+   * FROM THE SAME CODE THE SERVICES TAB USES, not a second implementation that
+   * happens to agree today: two tabs of one modal quoting different money is
+   * the defect this is fixing, so they now share one function. The stored
+   * columns on tbl_job_services are deliberately NOT used — see the docblock in
+   * job-service-breakdown.service.js for why (a different cascade, a snapshot,
+   * and empty on pre-June rows).
+   *
+   * FAIL-SOFT. The breakdown needs a tbl_client_service row; a service whose
+   * rate card has been deleted resolves to no entry, and that line keeps
+   * total_charge alone with nulls for the two new fields. A tab that renders
+   * without a number is recoverable; one that 500s is not, and this endpoint
+   * also carries the documents and penalty/travel/incentive rows.
+   *
+   * NO NEGATIVE MARGIN IS POSSIBLE on these rows, and that is structural rather
+   * than checked: `remainder` is what is LEFT after the cascade subtracts its
+   * three layers from `totalCharge`, so tx <= client by construction. The
+   * client_charge >= tx_charge guard this file enforces on job_material rows
+   * exists because those two are operator-entered and independent; these two
+   * are not.
+   *
+   * COST: one extra query for the whole job, not one per service.
+   */
+  let chargeMap = new Map();
+  try {
+    chargeMap = await serviceChargeMap(id);
+  } catch (e) {
+    // Genuinely soft: the two new fields go null and the tab still renders its
+    // materials, documents and approval controls. Logged at warn because a
+    // persistent failure here means every Services row silently reads as
+    // unpriced, which looks like a data problem rather than a broken query.
+    logger.warn({ err: e.message, jobId: id }, 'Service charge breakdown failed — charges omitted');
+  }
+  for (const row of services) {
+    const c = chargeMap.get(Number(row.job_service_id));
+    // A missing entry is null, never 0. Zero is a price; null is "not known",
+    // and the FE renders them differently on purpose.
+    row.client_charge = c ? c.client_charge : null;
+    row.tx_charge     = c ? c.tx_charge : null;
+  }
 
   const [docRows] = await pool.query(
     `SELECT image_id, image_category

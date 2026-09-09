@@ -2012,79 +2012,17 @@ router.get('/:id/estimate/preview', validate(idParam, 'params'), scopedJob, asyn
  */
 router.get('/:id/service-breakdown', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
-    const { calculateCharges } = require('../../services/client-rate-cards.service');
+    /*
+     * The computation moved to services/job-service-breakdown.service.js on
+     * 2026-09-09 so the Billing & Charges tab can render the SAME numbers.
+     * It used to live here, which made it reachable by this route alone — and
+     * the Billing tab, needing a per-service technician charge it could not
+     * get, hardcoded zero. The response shape is unchanged.
+     */
+    const { breakdownForJob } = require('../../services/job-service-breakdown.service');
     const jobId = Number(req.params.id);
     logger.info('Compute service breakdown · jobId=' + jobId);
-    const [rows] = await pool.query(
-      `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge,
-              cs.total_amount,
-              cs.easyfix_direct_fixed, cs.easyfix_direct_variable,
-              cs.overhead_fixed, cs.overhead_variable,
-              cs.client_fixed, cs.client_variable,
-              st.service_type_name,
-              sc.service_catg_name
-         FROM tbl_job_services js
-         LEFT JOIN tbl_client_service cs ON cs.client_service_id = js.service_id
-         LEFT JOIN tbl_service_type   st ON st.service_type_id   = js.service_type_id
-         LEFT JOIN tbl_service_catg   sc ON sc.service_catg_id   = js.service_category_id
-        WHERE js.job_id = ?
-          AND (js.job_service_status IS NULL OR js.job_service_status <> 0)
-        ORDER BY js.job_service_id ASC`,
-      [jobId],
-    );
-
-    const lineItems = rows.map((r) => {
-      const qty = Number(r.quantity) || 1;
-      // Per-unit cascade — uses tbl_client_service.total_amount as the
-      // single-unit total. Falls back to js.total_charge/qty if the
-      // client_service row is missing the cost cols (legacy rows).
-      const perUnitTotal = Number(r.total_amount)
-        || (Number(r.total_charge) / qty)
-        || 0;
-      const perUnit = calculateCharges({
-        totalCharge:           perUnitTotal,
-        easyfixDirectFixed:    r.easyfix_direct_fixed,
-        easyfixDirectVariable: r.easyfix_direct_variable,
-        overheadFixed:         r.overhead_fixed,
-        overheadVariable:      r.overhead_variable,
-        clientFixed:           r.client_fixed,
-        clientVariable:        r.client_variable,
-      });
-      const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
-      const scale = (b) => ({
-        variableAmt: round2(b.variableAmt * qty),
-        fixedAmt:    round2(b.fixedAmt * qty),
-        total:       round2(b.total * qty),
-      });
-      return {
-        job_service_id: r.job_service_id,
-        service_id: r.service_id,
-        service_type_name: r.service_type_name,
-        service_category_name: r.service_catg_name,
-        quantity: qty,
-        perUnit,
-        lineTotal: {
-          totalCharge:   round2(perUnit.totalCharge * qty),
-          easyfixDirect: scale(perUnit.easyfixDirect),
-          overhead:      scale(perUnit.overhead),
-          clientShare:   scale(perUnit.clientShare),
-          remainder:     round2(perUnit.remainder * qty),
-        },
-      };
-    });
-
-    // Aggregate totals across all line items.
-    const totals = lineItems.reduce((acc, li) => {
-      acc.totalCharge += li.lineTotal.totalCharge;
-      acc.easyfixDirect += li.lineTotal.easyfixDirect.total;
-      acc.overhead      += li.lineTotal.overhead.total;
-      acc.clientShare   += li.lineTotal.clientShare.total;
-      acc.remainder     += li.lineTotal.remainder;
-      return acc;
-    }, { totalCharge: 0, easyfixDirect: 0, overhead: 0, clientShare: 0, remainder: 0 });
-    const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
-    for (const k of Object.keys(totals)) totals[k] = round2(totals[k]);
-
+    const { lineItems, totals } = await breakdownForJob(jobId);
     logger.info('Returning service breakdown · jobId=' + jobId + ' lineItems=' + lineItems.length);
     modernOk(res, { job_id: jobId, lineItems, totals });
   } catch (e) { next(e); }
