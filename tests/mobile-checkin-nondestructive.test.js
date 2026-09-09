@@ -29,6 +29,15 @@ const { installFakePool } = require('./helpers/fake-pool');
 // services it pulls in) capture their `pool` reference.
 const fake = installFakePool([]);
 
+/*
+ * The authenticated technician. MUTABLE so a test can present one who has no
+ * tbl_user row — roughly a third of tbl_easyfixer does not (see
+ * services/job-log.service.js), and that is the branch fk_checkin_by turns on.
+ * efr_id and user_id are deliberately far apart: an assertion that passes for
+ * either would prove nothing about which namespace was written.
+ */
+const TECH = { efr_id: 7, user_id: 9001 };
+
 // The router mounts requireTechAuth + the lifecycle capability guard + the
 // idempotency layer at the top. None of them are under test here, so seed
 // require.cache with pass-throughs before requiring the router. Resolved paths
@@ -37,7 +46,7 @@ require.cache[require.resolve('../middleware/tech-auth')] = {
   id: require.resolve('../middleware/tech-auth'),
   filename: require.resolve('../middleware/tech-auth'),
   loaded: true,
-  exports: (req, _res, next) => { req.tech = { efr_id: 7 }; next(); },
+  exports: (req, _res, next) => { req.tech = { ...TECH }; next(); },
 };
 require.cache[require.resolve('../middleware/require-tech-lifecycle-capability')] = {
   id: require.resolve('../middleware/require-tech-lifecycle-capability'),
@@ -112,7 +121,7 @@ test('check-in with NO location omits the stamps entirely — nothing is nulled'
   for (const col of ['checkin_gps_location', 'checkin_address', 'checkin_pincode']) {
     assert.ok(!cols.includes(col), `${col} must be absent, not null — presence would erase the stored value`);
   }
-  assert.equal(captured.extras.fk_checkin_by, 7, 'fk_checkin_by is unconditional');
+  assert.equal(captured.extras.fk_checkin_by, TECH.user_id, 'the check-in actor rides along');
   assert.equal(captured.status, 2, 'transition to IN_PROGRESS is unchanged');
 });
 
@@ -140,7 +149,7 @@ test('a full check-in still stamps every supplied location column', async () => 
   const { checkin_date_time: stamp, ...rest } = captured.extras;
   assert.ok(stamp instanceof Date, 'the Segment 1 anchor rides along');
   assert.deepEqual(rest, {
-    fk_checkin_by: 7,
+    fk_checkin_by: 9001,
     checkin_gps_location: '12.9716,77.5946',
     checkin_address: '4th Block, Koramangala',
     checkin_pincode: '560034',
@@ -150,6 +159,59 @@ test('a full check-in still stamps every supplied location column', async () => 
 test('supplied values are trimmed before they are stamped', async () => {
   await checkin({ address: '  Indiranagar  ' });
   assert.equal(captured.extras.checkin_address, 'Indiranagar');
+});
+
+// ─── fk_checkin_by is a tbl_user id, not an efr_id (2026-09-09) ──────
+//
+// This handler wrote `req.tech.efr_id` into a column the legacy CRM joins
+// straight to tbl_user:
+//   EasyFix_CRM/.../Jobs/dao/JobDaoImpl.java:1712
+//     LEFT JOIN tbl_user checkIn_by ON checkIn_by.user_id = J.`fk_checkin_by`
+//   :1684  checkIn_by.`user_name` AS checkIn_by
+// so an efr_id there resolves to a DIFFERENT PERSON, or to nobody. Nothing had
+// forked: this route has never executed against production (the RN app is not
+// live and the old Flutter app cannot reach /api/mobile/*), so the first write
+// decides.
+
+test('the check-in actor is the technician\'s tbl_user id, never their efr_id', async () => {
+  await checkin({});
+  assert.equal(captured.extras.fk_checkin_by, 9001, 'the tbl_user id must be written');
+  assert.notEqual(captured.extras.fk_checkin_by, 7,
+    'writing the efr_id resolves to a different person wherever the column is joined to tbl_user');
+  /*
+   * The two ids are distinct in this fixture ON PURPOSE. If they were equal —
+   * as they easily can be on a live row, the ranges overlap — every assertion
+   * here would pass for the defective code too. Asserted rather than assumed,
+   * so a future edit to TECH cannot quietly disarm the file.
+   */
+  assert.notEqual(TECH.efr_id, TECH.user_id, 'positive control: the fixture must be able to tell them apart');
+});
+
+test('a technician with no tbl_user row is not blocked, and nothing is nulled', async () => {
+  /*
+   * tbl_easyfixer.user_id is populated for roughly two thirds of technicians.
+   * The column is OMITTED rather than set to NULL for the rest: an explicit
+   * null would erase whatever a legacy check-in had correctly stored — the same
+   * erasure the location stamps in this file were rewritten to stop — and the
+   * technician is already named by tbl_job.fk_easyfixter_id on the same row, so
+   * omitting loses nothing. Blocking the check-in over an audit id would be the
+   * worst of the three: a technician standing at a door, unable to start.
+   */
+  const saved = TECH.user_id;
+  try {
+    for (const missing of [null, undefined, 0]) {
+      TECH.user_id = missing;
+      const res = await checkin({ gps: '12.9,77.5' });
+      assert.equal(res.status, 200, `user_id=${JSON.stringify(missing)} must still check in`);
+      assert.ok(
+        !Object.keys(captured.extras).includes('fk_checkin_by'),
+        `user_id=${JSON.stringify(missing)} must OMIT the column — null would clobber a stored value`,
+      );
+      assert.equal(captured.status, 2, 'and the transition still runs');
+      assert.equal(captured.extras.checkin_gps_location, '12.9,77.5',
+        'the rest of the stamps are unaffected');
+    }
+  } finally { TECH.user_id = saved; }
 });
 
 // ─── The PIN no longer gates check-in (2026-09-07) ───────────────────

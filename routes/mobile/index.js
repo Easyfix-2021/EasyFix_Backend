@@ -801,8 +801,37 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
      * the same shape the /checkout handler below already uses for its own
      * optional stamps.
      *
-     * fk_checkin_by stays unconditional: it always has a value (the
-     * authenticated tech) and SHOULD track the most recent check-in.
+     * fk_checkin_by follows the same rule, for a different reason (2026-09-09).
+     *
+     * It is a tbl_user.user_id, not an efr_id. Proven from the READER: the
+     * legacy CRM's job-detail query joins it straight to tbl_user and prints a
+     * user_name —
+     *   EasyFix_CRM/.../Jobs/dao/JobDaoImpl.java:1712
+     *     LEFT JOIN tbl_user checkIn_by ON checkIn_by.user_id = J.`fk_checkin_by`
+     *   :1684  checkIn_by.`user_name` AS checkIn_by
+     * and Jobs.java types the wire field as a User. This handler was writing
+     * req.tech.efr_id into it, which resolves to a DIFFERENT PERSON wherever
+     * that join runs, or to nobody.
+     *
+     * Nothing has forked yet: this route has never executed against production.
+     * The only holder of an /api/mobile/* token is the RN app, which is not yet
+     * live; the old Flutter app authenticates against the legacy secret and
+     * cannot reach this router at all. So the first write decides, and it is
+     * free to be the right one.
+     *
+     * OMITTED, never NULL, when the technician has no tbl_user row.
+     * tbl_easyfixer.user_id is populated for roughly two thirds of technicians
+     * (see services/job-log.service.js), so a NULL here would erase whatever a
+     * legacy check-in had correctly stored — the same erasure the location
+     * stamps above were changed to stop. `undefined` makes setStatus skip the
+     * column entirely (job.service.js: `if (val === undefined) continue`).
+     *
+     * Nothing is lost by omitting it. tbl_job.fk_easyfixter_id, on this very
+     * row and checked 60 lines above, already names the technician; this column
+     * only ever answered "which tbl_user performed the check-in".
+     *
+     * No extra query: findById already projects user_id, and tech-auth assigns
+     * the whole row to req.tech.
      */
     /*
      * The check-in TIMESTAMP — the anchor for TAT Segment 1 (ticket created →
@@ -818,7 +847,9 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
      * `eventTimeStamp` when present, which makes an SLA anchor forgeable by the
      * device being measured.
      */
-    const extras = { fk_checkin_by: req.tech.efr_id, checkin_date_time: new Date() };
+    const extras = { checkin_date_time: new Date() };
+    // Truthy, not != null: a 0 in user_id is not a legal tbl_user PK either.
+    if (req.tech.user_id) extras.fk_checkin_by = Number(req.tech.user_id);
     const stampIfPresent = (col, raw) => {
       const v = typeof raw === 'string' ? raw.trim() : raw;
       if (v !== null && v !== undefined && v !== '') extras[col] = v;
