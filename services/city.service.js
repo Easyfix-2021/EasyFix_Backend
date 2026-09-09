@@ -81,7 +81,7 @@ async function hasCityCreatorCol() {
 
 /*
  * Approval-audit columns (approved_by / approved_at / approval_decision /
- * merged_into_city_id) ship in migrations/2026-09-09-city-approval-flow.sql
+ * merged_into_city_id) ship in migrations/executed/2026-09-09-city-approval-flow.sql
  * and are NOT on QA. Same probe-once-and-guard shape as hasCityCreatorCol()
  * above: approve/reject must work on a database where the migration has not
  * run — minus the audit stamp — rather than throwing ER_BAD_FIELD_ERROR.

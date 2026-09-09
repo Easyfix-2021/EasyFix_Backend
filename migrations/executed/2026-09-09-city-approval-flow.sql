@@ -57,7 +57,10 @@
 --
 -- APPLIED
 --   QA (10.30.2.30 / easyfix): 2026-09-09. menu_action id 103 under menu_id 14
---   (Manage Cities), granted to roles 2 / 13 / 15. Prod: not applied.
+--   (Manage Cities), granted to roles 2 / 13 / 15.
+--   Production: 2026-09-09, applied by Harshit. This file then moved to
+--   migrations/executed/ and is FROZEN — any further change to these columns
+--   or grants goes in a NEW dated migration, never here.
 -- ─────────────────────────────────────────────────────────────────────
 
 

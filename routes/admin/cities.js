@@ -17,7 +17,7 @@ const logger   = require('../../logger');
  * to Admin / Project Manager / Admin Supply — the grants were being made
  * and then ignored.
  *
- * isCityApprove is seeded by migrations/2026-09-09-city-approval-flow.sql.
+ * isCityApprove is seeded by migrations/executed/2026-09-09-city-approval-flow.sql.
  * Until that migration runs, approve/reject answer 403 for everyone, which
  * is the correct fail-closed direction for a brand-new privileged action.
  *

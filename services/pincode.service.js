@@ -686,7 +686,7 @@ async function hasPincodeCreatorCol() {
 // records created_by (efr_id when a technician minted it, else the CRM user_id)
 /*
  * Are the approval-audit columns present? Ships in
- * migrations/2026-09-09-city-approval-flow.sql, so every environment that has
+ * migrations/executed/2026-09-09-city-approval-flow.sql, so every environment that has
  * not run it must behave exactly as before.
  *
  * A THROW IS NOT AN ANSWER. Only a successful probe is cached: a transient
@@ -793,7 +793,7 @@ async function findOrCreateCityByName(cityName, stateId, { district = null, crea
    * The caller is deliberately NOT blocked — the booking or profile update
    * still succeeds and the pincode still attaches to this city. The city simply
    * does not appear on any SELECTION surface until Manage Cities approves it.
-   * See migrations/2026-09-09-city-approval-flow.sql for the sentinel and for
+   * See migrations/executed/2026-09-09-city-approval-flow.sql for the sentinel and for
    * which reads do and do not filter on it.
    */
   const [r] = await pool.query(
