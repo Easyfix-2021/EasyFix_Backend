@@ -235,9 +235,34 @@ router.post('/invoices/generate', validate(Joi.object({
     // RBAC: caller can only generate invoices for clients in their scope.
     const guard = assertEntityInScope(req, { client_id: clientId });
     if (!guard.ok) return modernError(res, 403, 'client outside your scope');
-    // Sum of completed jobs in range — simplified; real legacy pulls job_services totals
+    /*
+     * The invoice header total. It MUST equal the sum of the lines the invoice
+     * itself prints, and until 2026-09-09 it did not.
+     *
+     * loadInvoiceArtifactData above builds every line as
+     *   line_total: charge * qty + mat        (finance.js, the `lines.push` above)
+     * while this header summed `total_charge * quantity` and dropped the
+     * material charge entirely. So a client invoiced for jobs carrying material
+     * received a document whose printed lines added up to more than the amount
+     * it billed — and the shortfall was invisible, because nothing on the PDF
+     * shows the two being compared.
+     *
+     * It was not only a display fault. The payment reconciliation below
+     * (`fullyPaid = (newPaid + newTds) >= total_invoice_amount`) gates on THIS
+     * number, so an invoice was marked fully paid while the client still owed
+     * the material component of every line on it.
+     *
+     * COALESCE per column, not around the SUM: material_charge is NULL on most
+     * rows, and `x * y + NULL` is NULL in MySQL — which would have zeroed the
+     * whole line rather than the missing term, converting an under-count into
+     * a much larger one.
+     */
     const [[sum]] = await pool.query(
-      `SELECT COALESCE(SUM(js.total_charge * js.quantity), 0) AS total, COUNT(DISTINCT j.job_id) AS jobCount
+      `SELECT COALESCE(SUM(
+                COALESCE(js.total_charge, 0) * COALESCE(js.quantity, 1)
+                + COALESCE(js.material_charge, 0)
+              ), 0) AS total,
+              COUNT(DISTINCT j.job_id) AS jobCount
          FROM tbl_job j LEFT JOIN tbl_job_services js ON js.job_id = j.job_id
         WHERE j.fk_client_id = ? AND j.job_status IN (3,5)
           AND j.checkout_date_time BETWEEN ? AND ?`,
