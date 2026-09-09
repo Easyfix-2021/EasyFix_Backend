@@ -158,6 +158,45 @@ router.post(
   },
 );
 
+// ─── Delete ONE before/after photo ─────────────────────────────────────
+// DELETE /:id/images/:imageId → { ok: true, imageId, category }
+// POST   /:id/images/:imageId → same handler (see below)
+//
+// The technician took the wrong photo. Both guards live in the service:
+// the job must be the caller's AND still in progress, and the row must be a
+// before/after PROOF image — a Purchase Order, Job Sheet, feedback PDF or
+// customer signature can never be removed through this route, because the
+// category allowlist is derived from utils/job-image-buckets.js.
+//
+// TWO METHODS, ONE HANDLER, and the POST is not laziness: the RN app's HTTP
+// client has no `delete()` (src/lib/api.ts exposes get/head/post/patch/put),
+// so it posts with `_method: 'DELETE'` — exactly what the quotation-line
+// delete above already does. DELETE stays the real verb for curl and the CRM.
+//
+// The path is one segment deeper than `POST /:id/images` (record), so the two
+// cannot shadow each other.
+const imageDeleteParams = Joi.object({
+  id:      Joi.number().integer().positive().required(),
+  imageId: Joi.number().integer().positive().required(),
+});
+
+async function handleDeleteImage(req, res, next) {
+  try {
+    logger.info('Delete job image · jobId=' + req.params.id + ' · imageId=' + req.params.imageId);
+    const out = await estimateService.deleteImage(
+      Number(req.params.id), req.tech.efr_id, Number(req.params.imageId),
+    );
+    logger.info('Job image deleted · jobId=' + req.params.id + ' · imageId=' + req.params.imageId);
+    modernOk(res, out);
+  } catch (e) {
+    logger.warn('Delete job image failed · jobId=' + req.params.id + ' · imageId=' + req.params.imageId + ' · ' + e.message);
+    fail(res, next, e);
+  }
+}
+
+router.delete('/:id/images/:imageId', validate(imageDeleteParams, 'params'), handleDeleteImage);
+router.post('/:id/images/:imageId', validate(imageDeleteParams, 'params'), handleDeleteImage);
+
 // ─── Questionnaire ─────────────────────────────────────────────────────
 // GET  /:id/questionnaire → { questions: [...] }
 router.get('/:id/questionnaire', validate(idParam, 'params'), async (req, res, next) => {

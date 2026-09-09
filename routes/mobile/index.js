@@ -1452,19 +1452,43 @@ router.post('/profile/contact-info', validate(Joi.object({
     // common builder would mean accepting an arbitrary column→value map, i.e.
     // `UPDATE ... SET` with extra steps, and would put the customer columns one
     // typo away from a technician row.
-    const candidates = {
-      house_no:                   b.houseNo ?? null,
-      locality:                   b.areaOrLocation ?? null,
-      landmark:                   b.landMark ?? null,
-      pin_code:                   b.pinCode ?? null,
-      district:                   b.district ?? null,
-      state:                      b.state ?? null,
-      city_id:                    b.cityId ?? null,
-      city1:                      b.city ?? null,
-      city:                       b.city ?? null,
-      is_address_details_filled:  1,
-    };
-    const present = Object.entries(candidates).filter(([c]) => cols.has(c));
+    /*
+     * ── ONLY WRITE WHAT THE CALLER ACTUALLY SENT ──────────────────────────
+     *
+     * This map used to be `b.houseNo ?? null` for every column, and `present`
+     * filtered on "does this column EXIST on the table" — never on "did the
+     * caller send this field". Joi allows `.min(1)`, so a body carrying one
+     * field is valid, and the UPDATE then wrote every other column as NULL.
+     *
+     * POST { pinCode } alone therefore erased house_no, locality, landmark,
+     * district, state, city_id, city1 and city in a single statement. That is
+     * strictly worse than the empty-string trap this codebase already knows
+     * about: it needs no blank input at all, only an OMITTED field — which is
+     * exactly what a screen that renders a subset of the address sends.
+     *
+     * `sent` is hasOwnProperty, not a truthiness test, so an EXPLICIT null
+     * still clears the column: "the technician deleted their landmark" and
+     * "this screen does not show landmark" are different requests and must not
+     * collapse into one.
+     */
+    const sent = (key) => Object.prototype.hasOwnProperty.call(b, key);
+    const candidates = [
+      ['house_no', b.houseNo ?? null, sent('houseNo')],
+      ['locality', b.areaOrLocation ?? null, sent('areaOrLocation')],
+      ['landmark', b.landMark ?? null, sent('landMark')],
+      ['pin_code', b.pinCode ?? null, sent('pinCode')],
+      ['district', b.district ?? null, sent('district')],
+      ['state', b.state ?? null, sent('state')],
+      ['city_id', b.cityId ?? null, sent('cityId')],
+      // Both spellings carry the SAME field, so they share its sent-ness.
+      ['city1', b.city ?? null, sent('city')],
+      ['city', b.city ?? null, sent('city')],
+      // Derived, never supplied by the caller — always written.
+      ['is_address_details_filled', 1, true],
+    ];
+    const present = candidates
+      .filter(([c, , wasSent]) => wasSent && cols.has(c))
+      .map(([c, v]) => [c, v]);
     if (!present.length) {
       logger.warn('Contact-info save skipped · no matching address columns');
       return modernOk(res, { updated: false });
@@ -1722,18 +1746,44 @@ router.get('/training-videos', async (req, res, next) => {
     // (NOT tbl_document_type, where 2 = Ration Card). Kept in the JOIN ON clause
     // so it's a guard, not a row filter — a training_videos row whose doc is
     // missing/mistyped still returns (with url=''), rather than vanishing.
+    /*
+     * WATCHED-% RIDES ALONG. This response carried no progress at all, so every
+     * consumer that does not separately call
+     * `GET /training-videos/percentage` read 0 for every video — including the
+     * dashboard's training card, which picks the first row under 100% and
+     * therefore offered video #1 forever, however many times it had been
+     * finished.
+     *
+     * One row per (easyfixer_id, video_id) is guaranteed by
+     * migrations/executed/2026-08-11-02-training-progress-uniqueness.sql (it
+     * consolidates the duplicates and adds the UNIQUE key), so this LEFT JOIN
+     * cannot fan a video out into several rows.
+     *
+     * NO DURATION. `training_videos` has no duration column and neither does
+     * `easyfixer_watched_video` — the percentage IS the progress here, and
+     * inventing a seconds figure for the client to divide by would be a fiction
+     * that reads as data.
+     */
     const [rows] = await pool.query(
       `SELECT tv.id, tv.title, tv.description, tv.sub_title, tv.sub_description,
-              d.url AS doc_url
+              d.url AS doc_url,
+              COALESCE(wv.watched_percentage, 0) AS watched_percentage
          FROM training_videos tv
          LEFT JOIN document d
            ON d.id = tv.training_video_id AND d.document_type_id = 2
+         LEFT JOIN easyfixer_watched_video wv
+           ON wv.video_id = tv.id AND wv.easyfixer_id = ?
         WHERE tv.id IN (${await visibleVideoIdsSql()})
         ORDER BY tv.id DESC`,
-      // visibleVideoIdsSql() binds the technician TWICE: once for the mandatory
-      // half, once for the assigned half. One bind leaves the second `?`
-      // unsubstituted and MySQL rejects the whole statement.
-      [req.tech.efr_id, req.tech.efr_id],
+      // THREE binds, in STATEMENT order — mysql2 substitutes `?` positionally,
+      // so the progress join's placeholder comes FIRST because it is written
+      // first, ahead of the two visibleVideoIdsSql() contributes (one for the
+      // mandatory half, one for the assigned half). Every one of them is the
+      // same technician; get the COUNT wrong and a literal `?` survives into
+      // the statement and MySQL rejects the lot, which is what emptied every
+      // technician's training list on 2026-08-31. Guarded by
+      // tests/mobile-query-bind-arity.test.js.
+      [req.tech.efr_id, req.tech.efr_id, req.tech.efr_id],
     );
     const items = rows.map((r) => ({
       id: r.id,
@@ -1753,6 +1803,9 @@ router.get('/training-videos', async (req, res, next) => {
         const yt = parseTrainingVideoYouTubeUrl(r.doc_url);
         return yt ? `https://img.youtube.com/vi/${yt.id}/hqdefault.jpg` : null;
       })(),
+      // Same name and same 0–100 integer the percentage endpoint returns, so a
+      // client can merge the two without knowing which one it got a figure from.
+      watchedPercentage: Number(r.watched_percentage ?? 0),
     }));
     logger.info('Returning ' + items.length + ' training videos');
     modernOk(res, items);

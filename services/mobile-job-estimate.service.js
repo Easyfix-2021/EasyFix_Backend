@@ -49,7 +49,12 @@
 
 const { pool } = require('../db');
 const logger = require('../logger');
-const { persistedCategory } = require('../utils/job-image-buckets');
+const {
+  persistedCategory,
+  PROOF_BEFORE_CATEGORIES,
+  PROOF_AFTER_CATEGORIES,
+} = require('../utils/job-image-buckets');
+const { deleteJobImage } = require('./job-image.service');
 
 // Job status codes (mirror services/job.service.js STATUS — duplicated as a
 // local const so this service has no circular dependency on job.service.js,
@@ -316,6 +321,88 @@ async function recordImages(jobId, efrId, { category, refs }) {
   }
 }
 
+/* ─── Delete one before/after photo ─────────────────────────────────────
+ * The technician took the wrong photo. Until now that was permanent from the
+ * app: the only deletes in the estate were the two admin routes on
+ * routes/admin/job-documents.js, and nothing mobile.
+ *
+ * TWO GUARDS, and neither is optional.
+ *
+ * 1. CATEGORY. Delegates to the shared job-image.service deleteJobImage() with
+ *    an explicit `categories` allowlist — the before/after PROOF buckets from
+ *    utils/job-image-buckets.js and nothing else. tbl_job_image is one table
+ *    holding several unrelated kinds of evidence (Purchase Order, Job Sheet,
+ *    the customer's feedback PDF, the customer's signature), and an image_id is
+ *    just an integer: without the allowlist, "delete my photo" is
+ *    "delete any row on this job" and a mistyped id removes a signed document.
+ *    The allowlist is DERIVED from the same constants the readers bucket on, so
+ *    a category added there cannot silently fall outside this guard — and a
+ *    category added to DOCUMENT_CATEGORIES stays undeletable by construction.
+ *
+ * 2. STATUS — `DELETABLE_STATUSES` below. A CLOSED ALLOWLIST, deliberately, not
+ *    "anything that is not completed": a status this backend gains later is
+ *    refused until somebody decides it should be allowed, which is the safe
+ *    direction when the mistake is irreversible.
+ *
+ *      2  IN_PROGRESS                — the technician is on site working
+ *      15 ESTIMATE_PENDING_APPROVAL  — still on site, waiting on the client
+ *
+ *    Those are EXACTLY the two statuses in which the app lets a proof photo be
+ *    ADDED (the order page gates its Work sections on status 2 or 15), so
+ *    delete gets precisely the same window as create: there is no state in
+ *    which a photo can be taken and not un-taken. Everything else is refused
+ *    because the evidence has left the technician's hands — 20
+ *    PENDING_TO_CLOSE means the checkout was submitted and billing is reading
+ *    it, 3/5 are completed, 10 is a closed visit, 6 is cancelled, and 0/1
+ *    precede any work photo existing at all. Deleting proof off a completed or
+ *    invoiced job is the one mistake nothing downstream can undo.
+ *
+ * Ownership is checked first (jobForTech), so a tech can never address another
+ * technician's job, and the image must belong to THIS job (jobId guard) so an
+ * id from one job cannot delete a row on another.
+ *
+ * Returns { ok: true, imageId, category }.
+ */
+const DELETABLE_STATUSES = new Set([2, STATUS_ESTIMATE_PENDING_APPROVAL]);
+
+/** The proof buckets, and only those — never a document, signature or PDF. */
+const DELETABLE_IMAGE_CATEGORIES = [
+  ...PROOF_BEFORE_CATEGORIES,
+  ...PROOF_AFTER_CATEGORIES,
+];
+
+async function deleteImage(jobId, efrId, imageId) {
+  logger.info('Delete job image · jobId=' + jobId + ' · imageId=' + imageId);
+  const job = await jobForTech(jobId, efrId);
+  if (!job) {
+    logger.warn('Delete job image failed · job not found or not owned · jobId=' + jobId);
+    const e = new Error('job not found'); e.status = 404; throw e;
+  }
+  if (!DELETABLE_STATUSES.has(Number(job.job_status))) {
+    logger.warn('Delete job image rejected · status not deletable · jobId=' + jobId
+      + ' · status=' + job.job_status);
+    const e = new Error('photos can only be removed while the job is in progress');
+    e.status = 409; throw e;
+  }
+
+  const removed = await deleteJobImage({
+    imageId: Number(imageId),
+    jobId: Number(jobId),
+    categories: DELETABLE_IMAGE_CATEGORIES,
+  });
+  if (!removed) {
+    // Either the row is not on this job, or it is not a before/after work photo.
+    // ONE 404 for both: telling a caller which of the two it was would confirm
+    // that a document row with that id exists on the job.
+    logger.warn('Delete job image failed · no matching work photo · jobId=' + jobId
+      + ' · imageId=' + imageId);
+    const e = new Error('photo not found'); e.status = 404; throw e;
+  }
+  logger.info('Job image deleted · jobId=' + jobId + ' · imageId=' + imageId
+    + ' · category=' + removed.image_category);
+  return { ok: true, imageId: removed.image_id, category: removed.image_category };
+}
+
 /* ─── Questionnaire ─────────────────────────────────────────────────────
  * Fetch the client questionnaire (the legacy "client report" questions) for
  * this job's client, with any already-submitted answers merged in.
@@ -509,6 +596,9 @@ module.exports = {
   deleteQuotationLine,
   sendForApproval,
   recordImages,
+  deleteImage,
+  DELETABLE_STATUSES,
+  DELETABLE_IMAGE_CATEGORIES,
   getQuestionnaire,
   submitQuestionnaire,
   getWorkProgress,
