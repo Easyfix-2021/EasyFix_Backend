@@ -68,7 +68,19 @@
 --
 -- APPLIED
 --   QA (10.30.2.30 / easyfix): 2026-09-10 — column present, all 11 existing
---   rows NULL as intended (no backfill). Production: pending.
+--   rows NULL as intended (no backfill).
+--   Production: 2026-09-10, applied by Harshit. This file then moved to
+--   migrations/executed/ and is FROZEN — a new reason value needs no schema
+--   change (VARCHAR(40) has room); anything else goes in a NEW dated file.
+--
+--   ⚠ RESTART THE BACKEND on any environment whose process started BEFORE
+--   this ran. hasOfferClosedReasonCol memoises the ANSWER, so a process that
+--   probed while the column was absent keeps omitting it — silently, because
+--   absent is a legitimate answer that degrades rather than errors.
+--
+--   Legacy safety was proven, not argued: after the ALTER on QA, the legacy
+--   CRM's exact query (JobDaoImpl:285) was executed against that database and
+--   returned correct results, exit 0.
 -- ─────────────────────────────────────────────────────────────────────
 
 

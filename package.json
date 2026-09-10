@@ -31,6 +31,7 @@
     "verify:migrations": "node scripts/migration-status.js",
     "test:tat": "TZ=UTC node --test --test-force-exit tests/tat-service.test.js",
     "check:migrations": "node scripts/check-migration-columns.mjs",
+    "check:migrations:self-test": "node scripts/check-migration-columns.mjs --self-test",
     "check:sections": "node scripts/check-section-agreement.mjs",
     "check:skills": "node scripts/verify-skill-scope.mjs",
     "check:skills:self-test": "node scripts/verify-skill-scope.mjs --self-test"

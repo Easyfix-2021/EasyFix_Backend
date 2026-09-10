@@ -104,6 +104,18 @@ jobs:
       # nothing too. The fixtures include every false positive this tool has had
       # (bare filenames, require specifiers, package names, git refs, timezones),
       # so relaxing the rule to make a file pass turns them red.
+      # MIGRATION-COLUMN CHECKER. --self-test first, for the third time on this
+      # page and the same reason: the census exits 0 when it finds no INSERT,
+      # which is what a scanner that can no longer parse SQL also reports.
+      #
+      # Its fixtures encode the false positive it actually had: on 2026-09-10 it
+      # read a `--` comment describing a legacy INSERT as a real one, so a
+      # migration could not document a write without tripping the check that
+      # looks for writes. They also pin the regression that fix introduced —
+      # blanking backtick identifiers made `INSERT INTO `t`` stop being found
+      # at all — which the fixtures caught on their first run.
+      - name: Migration-column checker self-test (the tool must be able to fail)
+        run: npm run check:migrations:self-test
       - name: Skill-scope checker self-test (the tool must be able to fail)
         run: npm run check:skills:self-test
       - name: Scoped skills describe THIS repository
