@@ -22,7 +22,7 @@ const {
 
 test('STAGE_KEYS is the pinned set of 9 keys', () => {
   assert.deepEqual([...STAGE_KEYS].sort(), [
-    'audit-complete', 'cancelled', 'estimate-pending', 'onhold',
+    'audit-complete', 'cancelled', 'completed', 'estimate-pending', 'onhold',
     'pending-close', 'pending-feedback', 'pending-scheduling',
     'pending-start', 'unconfirmed',
   ]);
@@ -34,9 +34,12 @@ test('stageOfStatus maps statuses to their single stage; unknowns → null', () 
   assert.equal(stageOfStatus(1), 'pending-start');
   assert.equal(stageOfStatus(2), 'pending-close');
   assert.equal(stageOfStatus(20), 'pending-close');
-  assert.equal(stageOfStatus(3), 'audit-complete');
-  assert.equal(stageOfStatus(5), 'audit-complete');
-  assert.equal(stageOfStatus(10), 'pending-feedback');
+  // 2026-09-10 realignment: 10 = Under Audit, 3 = Pending for Feedback,
+  // 5 = Completed. 3 and 10 were previously the wrong way round, versus both
+  // the legacy CRM's AppConstant and this platform's own dashboard counts.
+  assert.equal(stageOfStatus(10), 'audit-complete');
+  assert.equal(stageOfStatus(3), 'pending-feedback');
+  assert.equal(stageOfStatus(5), 'completed');
   assert.equal(stageOfStatus(21), 'onhold');
   assert.equal(stageOfStatus(15), 'estimate-pending');
   assert.equal(stageOfStatus(6), 'cancelled');
@@ -48,7 +51,7 @@ test('stageVisibleStatuses unions visible statuses across keys', () => {
   assert.deepEqual([...stageVisibleStatuses(['pending-close'])].sort((a, b) => a - b), [2, 20]);
   assert.deepEqual(
     [...stageVisibleStatuses(['unconfirmed', 'audit-complete'])].sort((a, b) => a - b),
-    [3, 5, 9],
+    [9, 10],
   );
   assert.equal(stageVisibleStatuses([]).size, 0);
   assert.equal(stageVisibleStatuses(['not-a-stage']).size, 0);
@@ -132,7 +135,7 @@ test('transitionAllowed: mode all is always permitted', () => {
 test('transitionAllowed: restricted user may only move OUT OF a stage they own', () => {
   const allowed = { mode: 'list', stages: ['pending-close'] };
   // Source 2/20 IS pending-close (owned) and the target is declared → allowed.
-  assert.equal(transitionAllowed(allowed, 2, 3), true);   // complete
+  assert.equal(transitionAllowed(allowed, 2, 10), true);  // send for audit
   assert.equal(transitionAllowed(allowed, 2, 6), true);   // cancel
   assert.equal(transitionAllowed(allowed, 20, 21), true); // hold
   // Source 1 is pending-start — NOT their stage, so they cannot act on it at
@@ -158,7 +161,9 @@ test('transitionAllowed: the canonical Booking grant can confirm 9 → 0', () =>
 test('transitionAllowed: same-stage no-op permitted within an owned stage', () => {
   const allowed = { mode: 'list', stages: ['pending-close', 'audit-complete'] };
   assert.equal(transitionAllowed(allowed, 2, 20), true); // pending-close internal
-  assert.equal(transitionAllowed(allowed, 3, 5), true);  // audit-complete internal
+  // 3 -> 5 is no longer a within-stage move (feedback -> completed), so the
+  // internal-move case is asserted with the reverse pending-close hop.
+  assert.equal(transitionAllowed(allowed, 20, 2), true); // pending-close internal
   // A within-stage move in a stage they do NOT own is still blocked.
   const other = { mode: 'list', stages: ['audit-complete'] };
   assert.equal(transitionAllowed(other, 2, 20), false);
