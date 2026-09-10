@@ -40,7 +40,7 @@ const STRANGER = 88;   // another CRM user, holds no key
 const MANAGER  = 99;   // holds isIssueManage
 
 // Mutable per-test fixture the fake pool's routes read.
-const scenario = { issueStatus: 'open', screenshotKey: null };
+const scenario = { issueStatus: 'open', imageKeys: [] };
 
 function issueRow() {
   return {
@@ -48,7 +48,6 @@ function issueRow() {
     title: 'Jobs list crashes on page 2',
     description: 'Clicking page 2 shows a white screen.',
     page_path: '/jobs',
-    screenshot_key: scenario.screenshotKey,
     status: scenario.issueStatus,
     reported_by: REPORTER,
     created_on: '2026-09-10 11:04:00',
@@ -84,7 +83,7 @@ const routes = [
     reported_by: REPORTER,
     created_on: '2026-09-10 11:04:00',
     closed_on: null,
-    has_screenshot: 1,       // MySQL returns 1/0 for `(col IS NOT NULL)`
+    screenshot_count: 2,     // MySQL returns the COUNT as a number
     comment_count: 2,
   }]],
   /*
@@ -99,6 +98,17 @@ const routes = [
   [/FROM tbl_crm_issue_comment c\b[\s\S]*WHERE c\.issue_id = \?/, () => [
     { id: 1, comment_text: 'Looking at it.', commented_by: MANAGER, created_on: '2026-09-10 11:30:00' },
   ]],
+  /*
+   * Pinned on `SELECT issue_id, s3_key` AND the table. The LIST query also
+   * names tbl_crm_issue_image — in its `(SELECT COUNT(*) …)` screenshot_count
+   * subselect — so a route pinned on the table alone would swallow the list and
+   * hand it an image-shaped row. Same class of error as the comment_count note
+   * above, and the same fix: pin what cannot change without the query MEANING
+   * something else.
+   */
+  [/SELECT issue_id, s3_key[\s\S]*FROM tbl_crm_issue_image/, () =>
+    scenario.imageKeys.map((k) => ({ issue_id: 7, s3_key: k }))],
+  [/INSERT INTO tbl_crm_issue_image/, () => ({ insertId: 900, affectedRows: scenario.imageKeys.length })],
   [/INSERT INTO tbl_crm_issue_comment/, () => ({ insertId: 501 })],
   [/UPDATE tbl_crm_issue SET status/, () => ({ affectedRows: 1 })],
   [/INSERT INTO tbl_crm_issue /, () => ({ insertId: 7 })],
@@ -179,13 +189,28 @@ test('manager with the key reads an issue they did not report', async () => {
   assert.notEqual(issue.reported_by, MANAGER);
 });
 
-test('the detail response never carries the raw S3 key', async () => {
-  scenario.screenshotKey = 'Issues/1757500000000_a4b9c0d2';
+test('the detail response never carries a raw S3 key', async () => {
+  scenario.imageKeys = ['Issues/1757500000000_a4b9c0d2', 'Issues/1757500000001_ff31aa02'];
   const issue = await svc.getIssueDetail(7, { userId: REPORTER, canManage: false });
   assert.equal(issue.screenshot_key, undefined);
+  assert.equal(issue.screenshot_count, 2);
   assert.equal(issue.has_screenshot, true);
-  // S3 is unconfigured in tests, so no URL is minted and null is the contract.
-  assert.equal(issue.screenshot_url, null);
+  // S3 is unconfigured in tests, so nothing is minted and an EMPTY ARRAY — not
+  // null, and not a list of nulls — is the contract.
+  assert.deepEqual(issue.screenshot_urls, []);
+  // The keys themselves must not ride out on any field.
+  assert.ok(
+    !JSON.stringify(issue).includes('Issues/1757500000000_a4b9c0d2'),
+    'no S3 key may appear anywhere in the detail response',
+  );
+});
+
+test('an issue with no screenshots reports zero, not null', async () => {
+  scenario.imageKeys = [];
+  const issue = await svc.getIssueDetail(7, { userId: REPORTER, canManage: false });
+  assert.equal(issue.screenshot_count, 0);
+  assert.equal(issue.has_screenshot, false);
+  assert.deepEqual(issue.screenshot_urls, []);
 });
 
 // ─── COMMENT ─────────────────────────────────────────────────────────────
@@ -231,15 +256,23 @@ test('scope=mine filters by the caller and needs no key', async () => {
   assert.equal(listSql.params[0], REPORTER);
 });
 
-test('the LIST never returns a screenshot key or URL — only has_screenshot', async () => {
+test('the LIST never returns a screenshot key or URL — only a count', async () => {
   const page = await svc.listIssues({ scope: 'mine', limit: 50, offset: 0 }, { userId: REPORTER, canManage: false });
   const row = page.items[0];
   assert.equal(row.screenshot_key, undefined);
   assert.equal(row.screenshot_url, undefined);
-  assert.equal(row.has_screenshot, true, 'MySQL 1/0 must surface as a boolean');
-  // Structural, not incidental: the key must not be in the projection at all.
+  assert.equal(row.screenshot_urls, undefined);
+  assert.equal(row.screenshot_count, 2);
+  assert.equal(row.has_screenshot, true, 'derived from the count, as a boolean');
+  /*
+   * Structural, not incidental: no key may be in the projection at all. The
+   * list may NAME tbl_crm_issue_image — it counts rows in it — but it must
+   * never select s3_key, because a key in the result set is one refactor away
+   * from a key in the response.
+   */
   const listSql = listQueryCall();
-  assert.ok(!/i\.screenshot_key,/.test(listSql.sql), 'list must not select screenshot_key');
+  assert.ok(!/s3_key/.test(listSql.sql), 'list must not select s3_key');
+  assert.ok(!/screenshot_key/.test(listSql.sql), 'list must not select the frozen legacy column');
 });
 
 // ─── CLOSE ───────────────────────────────────────────────────────────────
@@ -274,10 +307,47 @@ test('double close returns 409', async () => {
 // ─── CREATE ──────────────────────────────────────────────────────────────
 test('create writes created_on as a JS Date, never NOW()', async () => {
   await svc.createIssue({
-    title: 'x', description: 'y', pagePath: '/jobs', screenshotKey: null, userId: REPORTER,
+    title: 'x', description: 'y', pagePath: '/jobs', screenshotKeys: [], userId: REPORTER,
   });
   const ins = fake.calls.find((c) => /INSERT INTO tbl_crm_issue /.test(c.sql));
   assert.ok(ins, 'expected the INSERT to have been issued');
   assert.ok(!/NOW\(\)/.test(ins.sql), 'created_on must not be NOW() — the pool TZ stores IST verbatim');
-  assert.ok(ins.params[6] instanceof Date, 'created_on must be a JS Date');
+  /*
+   * The index is DERIVED from the statement's own column list, not written as
+   * a literal. It used to be params[6]; dropping screenshot_key from the
+   * INSERT moved created_on to 5 and the assertion began reading a different
+   * column while still describing this one. A position is not the invariant —
+   * "the value bound to created_on" is.
+   */
+  const cols = ins.sql.match(/\(([^)]*)\)\s*VALUES/)[1].split(',').map((c) => c.trim());
+  const idx = cols.indexOf('created_on');
+  assert.ok(idx >= 0, 'created_on must be in the INSERT column list');
+  assert.ok(ins.params[idx] instanceof Date, 'created_on must be a JS Date');
+});
+
+test('N screenshots become N image rows, in the order attached, in ONE statement', async () => {
+  fake.calls.length = 0;
+  const keys = ['Issues/aaa', 'Issues/bbb', 'Issues/ccc'];
+  await svc.createIssue({
+    title: 'x', description: 'y', pagePath: '/jobs', screenshotKeys: keys, userId: REPORTER,
+  });
+  const imgIns = fake.calls.filter((c) => /INSERT INTO tbl_crm_issue_image/.test(c.sql));
+  assert.equal(imgIns.length, 1, 'one multi-row INSERT, not one per screenshot');
+  const rows = imgIns[0].params[0];
+  assert.equal(rows.length, 3);
+  assert.deepEqual(rows.map((r) => r[1]), keys, 'keys keep the order they were attached in');
+  assert.deepEqual(rows.map((r) => r[2]), [0, 1, 2], 'sort_order is the attach order');
+  assert.ok(rows.every((r) => r[0] === 7), 'every row points at the new issue');
+  assert.ok(rows.every((r) => r[3] instanceof Date), 'created_on is a JS Date here too');
+  // The frozen legacy column must not be written any more.
+  const parentIns = fake.calls.find((c) => /INSERT INTO tbl_crm_issue /.test(c.sql));
+  assert.ok(!/screenshot_key/.test(parentIns.sql), 'screenshot_key is frozen and must not be written');
+});
+
+test('no screenshots issues NO image INSERT at all', async () => {
+  fake.calls.length = 0;
+  await svc.createIssue({
+    title: 'x', description: 'y', pagePath: '/jobs', screenshotKeys: [], userId: REPORTER,
+  });
+  assert.equal(fake.calls.filter((c) => /INSERT INTO tbl_crm_issue_image/.test(c.sql)).length, 0);
 });

@@ -52,13 +52,22 @@ const {
  */
 
 /*
- * 5 MB cap — a full-page screenshot at 2× DPI is comfortably under it, and it
- * is well below the 10 MB used for notice images because an issue can be
- * raised by any user of the CRM, not only by an author holding a manage key.
+ * 5 MB cap PER FILE — a full-page screenshot at 2× DPI is comfortably under
+ * it, and it is well below the 10 MB used for notice images because an issue
+ * can be raised by any user of the CRM, not only by an author holding a manage
+ * key.
+ *
+ * MAX_SCREENSHOTS is a real limit, not a formality: multer buffers every file
+ * in memory (memoryStorage), so N × 5 MB is resident per concurrent report.
+ * Five is what a person actually attaches — the broken screen, the console,
+ * the network tab — and 25 MB of transient buffer is affordable on this
+ * container. Raise the count and the memory ceiling moves with it.
  */
+const MAX_SCREENSHOTS = 5;
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  limits: { fileSize: 5 * 1024 * 1024, files: MAX_SCREENSHOTS },
 });
 
 /*
@@ -79,38 +88,56 @@ const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'
  *     page_path   optional — stored as a PATHNAME, query string stripped
  *     screenshot  optional file
  *
- * The screenshot is uploaded BEFORE the row is written, so a failed PutObject
+ * The screenshots are uploaded BEFORE the row is written, so a failed PutObject
  * fails the whole request rather than leaving an issue pointing at a key that
  * does not exist. The reverse order would produce a row whose screenshot never
  * loads and no way to tell that from a presign error.
  */
 router.post(
   '/',
-  upload.single('screenshot'),
+  /*
+   * .array on the SAME field name 'screenshot', not a new 'screenshots'
+   * field. A CRM tab that was open across the deploy still posts a single
+   * file under 'screenshot', and multer's .array accepts one file under that
+   * name exactly as .single did — so the old client keeps working instead of
+   * failing MulterError: Unexpected field, which would have surfaced to the
+   * user as "could not report the issue" on the one screen whose whole job is
+   * reporting that something does not work.
+   */
+  upload.array('screenshot', MAX_SCREENSHOTS),
   validate(issueCreate),
   async (req, res, next) => {
     try {
       const actor = await svc.resolveActor(req);
 
-      let screenshotKey = null;
-      if (req.file) {
-        if (!IMAGE_MIME.has(req.file.mimetype)) {
-          logger.warn('Issue screenshot rejected · disallowed mime=' + req.file.mimetype);
-          return modernError(res, 400, `mimetype "${req.file.mimetype}" is not allowed; use PNG/JPEG/WEBP/GIF`);
-        }
-        if (!s3.isEnabled()) {
-          // No local-disk fallback on purpose. A screenshot is the one part of
-          // an issue that is genuinely optional, so dropping it beats failing
-          // the report — and writing it to the container filesystem would put
-          // it somewhere nothing ever serves or cleans up.
-          logger.warn('Issue screenshot discarded · S3 is not configured');
-        } else {
-          screenshotKey = await s3.putAtKey({
+      const files = req.files || [];
+      /*
+       * MIME is checked for EVERY file BEFORE any upload starts. Rejecting
+       * mid-loop would leave the accepted ones as orphaned S3 objects that no
+       * row points at and nothing ever cleans up — the report fails and the
+       * bucket keeps the bytes.
+       */
+      const bad = files.find((f) => !IMAGE_MIME.has(f.mimetype));
+      if (bad) {
+        logger.warn('Issue screenshot rejected · disallowed mime=' + bad.mimetype);
+        return modernError(res, 400, `mimetype "${bad.mimetype}" is not allowed; use PNG/JPEG/WEBP/GIF`);
+      }
+
+      const screenshotKeys = [];
+      if (files.length && !s3.isEnabled()) {
+        // No local-disk fallback on purpose. A screenshot is the one part of
+        // an issue that is genuinely optional, so dropping it beats failing
+        // the report — and writing it to the container filesystem would put
+        // it somewhere nothing ever serves or cleans up.
+        logger.warn('Issue screenshots discarded · S3 is not configured · count=' + files.length);
+      } else {
+        for (const f of files) {
+          screenshotKeys.push(await s3.putAtKey({
             key:          svc.buildScreenshotKey(),
-            buffer:       req.file.buffer,
-            contentType:  req.file.mimetype,
-            originalName: req.file.originalname,
-          });
+            buffer:       f.buffer,
+            contentType:  f.mimetype,
+            originalName: f.originalname,
+          }));
         }
       }
 
@@ -118,7 +145,7 @@ router.post(
         title:       req.body.title,
         description: req.body.description,
         pagePath:    req.body.page_path || null,
-        screenshotKey,
+        screenshotKeys,
         userId:      actor.userId,
       });
       res.status(201);
@@ -127,6 +154,13 @@ router.post(
       if (e.code === 'LIMIT_FILE_SIZE') {
         logger.warn('Issue screenshot upload failed · file exceeds 5MB');
         return modernError(res, 400, 'screenshot exceeds 5MB');
+      }
+      if (e.code === 'LIMIT_FILE_COUNT' || e.code === 'LIMIT_UNEXPECTED_FILE') {
+        // multer's own message names neither the limit nor the field, and this
+        // is the one screen whose user is already telling us something is
+        // broken — it should not answer with "Unexpected field".
+        logger.warn('Issue screenshot upload failed · ' + e.code);
+        return modernError(res, 400, `attach at most ${MAX_SCREENSHOTS} screenshots`);
       }
       if (e.status) return modernError(res, e.status, e.message);
       next(e);

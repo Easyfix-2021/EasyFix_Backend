@@ -2,6 +2,7 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const s3Storage = require('../utils/s3-storage');
 const { getEffectivePermissions } = require('./role.service');
+const { FEATURES, emailAllowed } = require('./feature-access.service');
 
 /*
  * ─── IN-APP ISSUE REPORTER ─────────────────────────────────────────────────
@@ -22,7 +23,8 @@ const { getEffectivePermissions } = require('./role.service');
  *   CLOSE it, or LIST with scope=all, only if
  *       actor.canManage
  *
- * `canManage` is "holds the isIssueManage action key", resolved by
+ * `canManage` is "holds the isIssueManage action key AND is on the
+ * access.issues.emails allowlist" — BOTH locks, see resolveActor. Resolved by
  * resolveActor() below.
  *
  * ── WHY THE CHECK IS ON THE FETCHED ROW, NOT IN THE WHERE CLAUSE ─────────
@@ -53,12 +55,12 @@ const { getEffectivePermissions } = require('./role.service');
  * file or in routes/admin/issues.js, and there should not be one.
  *
  * ── THE SCREENSHOT IS PRESIGNED IN EXACTLY ONE PLACE ────────────────────
- * getIssueDetail() mints a 900-second presigned GET URL, AFTER assertCanRead
- * has passed, and it is the only function in this module that calls
- * getPresignedUrl. The list deliberately cannot: listIssues() never selects
- * screenshot_key at all — it projects `screenshot_key IS NOT NULL AS
- * has_screenshot`, so the key does not exist in the result set to be leaked by
- * a later refactor that forgets to delete it. A presigned URL is a bearer
+ * getIssueDetail() mints a 900-second presigned GET URL PER SCREENSHOT, AFTER
+ * loadIssueForActor has passed, and it is the only function in this module that
+ * calls getPresignedUrl. The list deliberately cannot: listIssues() never
+ * selects a key at all — it projects `COUNT(*) … AS screenshot_count` from
+ * tbl_crm_issue_image, so no key exists in the result set to be leaked by a
+ * later refactor that forgets to delete it. A presigned URL is a bearer
  * credential in a query string: anyone holding it can fetch the object for 15
  * minutes with no auth at all, so it must never be minted for a caller who has
  * not already passed the per-row check.
@@ -69,6 +71,19 @@ const STATUS = { OPEN: 'open', CLOSED: 'closed' };
 
 /** The single action key that means "issue manager". */
 const MANAGE_ACTION = 'isIssueManage';
+
+/*
+ * ...AND the email allowlist that narrows it. RBAC says the screen exists;
+ * easyfix_properties['access.issues.emails'] says who may reach it. Both must
+ * pass — see the canManageIssues note in services/feature-access.service.js
+ * for why an issue queue is a per-PERSON grant and not a per-role one.
+ *
+ * Named through FEATURES rather than repeated as a literal so the key cannot
+ * drift from the one GET /api/admin/access/features reports to the frontend:
+ * the two answering differently is invisible until a user sees a button that
+ * 403s.
+ */
+const MANAGE_PROPERTY = FEATURES.canManageIssues;
 
 /** S3 prefix for screenshots. No extension on the key — MIME rides on
  *  Content-Type, per the ops convention in utils/s3-storage.js. */
@@ -105,7 +120,21 @@ async function resolveActor(req) {
     req.user.permissions = await getEffectivePermissions(userId);
   }
   const perms = (req.user.permissions && req.user.permissions.actionPermissions) || [];
-  return { userId: Number(userId), canManage: perms.includes(MANAGE_ACTION) };
+  /*
+   * BOTH locks, and the AND is the whole point. The action key alone would
+   * make the queue grantable from Manage Role to anyone given the Admin role
+   * next; the allowlist alone would ignore RBAC entirely. A caller who holds
+   * the key but is not on the list is treated exactly like an ordinary
+   * reporter — they keep their own issues and see nobody else's — rather than
+   * being refused outright, because that is the honest description of what
+   * they now are.
+   *
+   * emailAllowed() fails CLOSED on a missing property, an empty CSV, or a user
+   * row with no official_email.
+   */
+  const canManage = perms.includes(MANAGE_ACTION)
+    && emailAllowed(MANAGE_PROPERTY, req.user.official_email);
+  return { userId: Number(userId), canManage };
 }
 
 /** The rule, in one place. Returns true / false; callers turn it into a 403. */
@@ -125,7 +154,7 @@ function canRead(issue, actor) {
  */
 async function loadIssueForActor(issueId, actor) {
   const [rows] = await pool.query(
-    `SELECT i.id, i.title, i.description, i.page_path, i.screenshot_key, i.status,
+    `SELECT i.id, i.title, i.description, i.page_path, i.status,
             i.reported_by, i.created_on, i.closed_by, i.closed_on, i.close_note,
             ru.user_name AS reported_by_name,
             cu.user_name AS closed_by_name
@@ -145,30 +174,71 @@ async function loadIssueForActor(issueId, actor) {
 }
 
 /*
- * Create an issue. `screenshotKey` is the S3 key the route stored, or null —
- * the route owns the upload because that is where multer put the buffer, and
- * this function owns the row.
+ * Create an issue. `screenshotKeys` are the S3 keys the route already stored,
+ * in the order the reporter attached them — the route owns the upload because
+ * that is where multer put the buffers, and this function owns the rows.
+ *
+ * The images go to tbl_crm_issue_image, NOT to tbl_crm_issue.screenshot_key,
+ * which is frozen at its last value and read by nothing from here on
+ * (migrations/2026-09-10-crm-issue-reporter-v2.sql backfilled the old ones).
+ *
+ * The image inserts are ONE multi-row statement, so a five-screenshot report
+ * costs two round trips rather than six, and either every image lands or none
+ * does. They are not in a transaction with the parent insert on purpose: an
+ * issue whose images failed is still a bug report worth having, and losing the
+ * whole report because the second screenshot's row failed would be a strictly
+ * worse outcome for the person trying to tell us something is broken.
  *
  * created_on is `new Date()`, never NOW(): the pool's +05:30 session timezone
  * (db.js) stores the IST wall clock verbatim, whereas NOW() would read the
  * container clock and mix two timezones into one column.
  */
-async function createIssue({ title, description, pagePath, screenshotKey, userId }) {
+async function createIssue({ title, description, pagePath, screenshotKeys, userId }) {
+  const keys = (screenshotKeys || []).filter(Boolean);
+  const now = new Date();
   const [r] = await pool.query(
-    'INSERT INTO tbl_crm_issue (title, description, page_path, screenshot_key, status, reported_by, created_on) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [title, description, pagePath || null, screenshotKey || null, STATUS.OPEN, userId, new Date()],
+    'INSERT INTO tbl_crm_issue (title, description, page_path, status, reported_by, created_on) VALUES (?, ?, ?, ?, ?, ?)',
+    [title, description, pagePath || null, STATUS.OPEN, userId, now],
   );
-  logger.info('Issue reported · id=' + r.insertId + ' by=' + userId + (screenshotKey ? ' withScreenshot' : ''));
+  if (keys.length) {
+    await pool.query(
+      'INSERT INTO tbl_crm_issue_image (issue_id, s3_key, sort_order, created_on) VALUES ?',
+      [keys.map((k, i) => [r.insertId, k, i, now])],
+    );
+  }
+  logger.info('Issue reported · id=' + r.insertId + ' by=' + userId + ' screenshots=' + keys.length);
   return { id: r.insertId };
+}
+
+/*
+ * The screenshots for a set of issues, as issueId → [key, …] in sort_order.
+ * One query for N issues rather than N queries — the detail route needs one
+ * issue's keys and nothing today needs more, but the list route's
+ * screenshot_count is computed the same way and a per-row subquery there would
+ * be the exact shape services/job.service.js:1447 warns against.
+ */
+async function imageKeysByIssue(issueIds) {
+  const ids = (issueIds || []).map(Number).filter((n) => Number.isFinite(n));
+  const out = new Map();
+  if (!ids.length) return out;
+  const [rows] = await pool.query(
+    'SELECT issue_id, s3_key FROM tbl_crm_issue_image WHERE issue_id IN (?) ORDER BY issue_id, sort_order, id',
+    [ids],
+  );
+  for (const row of rows) {
+    if (!out.has(row.issue_id)) out.set(row.issue_id, []);
+    out.get(row.issue_id).push(row.s3_key);
+  }
+  return out;
 }
 
 /*
  * The queue. `scope=all` is a manager-only view; `scope=mine` is every
  * caller's own issues and needs no grant.
  *
- * has_screenshot is computed IN SQL rather than derived from a selected key —
- * see the presign note in the header. screenshot_key is not in this projection
- * and must never be added to it.
+ * screenshot_count is computed IN SQL rather than derived from selected keys —
+ * see the presign note in the header. No key and no URL is in this projection,
+ * and neither must ever be added to it.
  */
 async function listIssues({ scope, status, limit, offset }, actor) {
   if (scope === 'all' && !actor.canManage) {
@@ -204,7 +274,7 @@ async function listIssues({ scope, status, limit, offset }, actor) {
      */
     `SELECT i.id, i.title, i.page_path, i.status, i.reported_by, i.created_on, i.closed_on,
             ru.user_name AS reported_by_name,
-            (i.screenshot_key IS NOT NULL) AS has_screenshot,
+            (SELECT COUNT(*) FROM tbl_crm_issue_image  m WHERE m.issue_id = i.id) AS screenshot_count,
             (SELECT COUNT(*) FROM tbl_crm_issue_comment c WHERE c.issue_id = i.id) AS comment_count
        FROM tbl_crm_issue i
        LEFT JOIN tbl_user ru ON ru.user_id = i.reported_by
@@ -219,7 +289,11 @@ async function listIssues({ scope, status, limit, offset }, actor) {
   );
 
   return {
-    items: rows.map((r) => ({ ...r, has_screenshot: !!r.has_screenshot })),
+    items: rows.map((r) => ({
+      ...r,
+      screenshot_count: Number(r.screenshot_count) || 0,
+      has_screenshot: Number(r.screenshot_count) > 0,
+    })),
     total: (countRows[0] && countRows[0].total) || 0,
     limit,
     offset,
@@ -230,11 +304,16 @@ async function listIssues({ scope, status, limit, offset }, actor) {
  * Detail + comments. The ONE place a screenshot URL is minted, and only after
  * loadIssueForActor has passed.
  *
- * screenshot_url is null when there is no screenshot, when S3 is unconfigured
- * (local dev), and when signing fails — the frontend must treat null as
- * "nothing to show", not as an error. The raw key is not returned: a key is
- * useless to the browser and returning it only widens what a logged response
- * body exposes.
+ * screenshot_urls is an ARRAY, empty when there are no screenshots, when S3 is
+ * unconfigured (local dev), and when every signature failed — the frontend must
+ * treat empty as "nothing to show", not as an error. A key that fails to sign
+ * is DROPPED rather than returned as a null hole, so the array's length is
+ * always the number of images the reader can actually open; screenshot_count
+ * on the row is what they were told to expect, and the two differing is the
+ * only honest way to show a partial failure.
+ *
+ * Raw keys are never returned: a key is useless to the browser and returning it
+ * only widens what a logged response body exposes.
  */
 async function getIssueDetail(issueId, actor) {
   const issue = await loadIssueForActor(issueId, actor);
@@ -248,22 +327,26 @@ async function getIssueDetail(issueId, actor) {
     [issueId],
   );
 
-  let screenshotUrl = null;
-  if (issue.screenshot_key && s3Storage.isEnabled()) {
-    try {
-      screenshotUrl = await s3Storage.getPresignedUrl(issue.screenshot_key, SCREENSHOT_PRESIGN_TTL_SEC);
-    } catch (e) {
-      // A signing failure must not take the whole issue down — the reporter
-      // still needs to read the description and the thread.
-      logger.warn('Issue screenshot presign failed · issueId=' + issueId + ' err=' + (e && e.message));
+  const keys = (await imageKeysByIssue([issueId])).get(Number(issueId)) || [];
+  const screenshotUrls = [];
+  if (keys.length && s3Storage.isEnabled()) {
+    for (const key of keys) {
+      try {
+        screenshotUrls.push(await s3Storage.getPresignedUrl(key, SCREENSHOT_PRESIGN_TTL_SEC));
+      } catch (e) {
+        // A signing failure must not take the whole issue down — the reporter
+        // still needs to read the description and the thread — nor the other
+        // screenshots down with it.
+        logger.warn('Issue screenshot presign failed · issueId=' + issueId + ' err=' + (e && e.message));
+      }
     }
   }
 
-  const { screenshot_key: _key, ...rest } = issue;
   return {
-    ...rest,
-    has_screenshot: !!issue.screenshot_key,
-    screenshot_url: screenshotUrl,
+    ...issue,
+    screenshot_count: keys.length,
+    has_screenshot: keys.length > 0,
+    screenshot_urls: screenshotUrls,
     comments,
   };
 }

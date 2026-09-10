@@ -50,6 +50,23 @@ const FEATURES = {
    * or empty property is deny-all, so a fresh environment grants nobody.
    */
   canManageSecrets: 'secrets.manager.emails',
+  /*
+   * Triage the Reported Issues queue — read any issue, comment on any
+   * issue, close any issue. Two locks, like canManageSecrets: the RBAC key
+   * isIssueManage says the screen exists, this allowlist says who may reach
+   * it, and BOTH must pass (services/issue.service.js resolveActor).
+   *
+   * Outside RBAC alone because the queue carries SCREENSHOTS taken from
+   * other people's CRM sessions — job pages, client pages, customer
+   * numbers. That reach should follow a person, not a role that propagates
+   * to whoever is given it next. Seeded with the triage team in
+   * migrations/2026-09-10-crm-issue-reporter-v2.sql; an absent or empty
+   * property is deny-all, so a fresh environment grants nobody.
+   *
+   * Reporting an issue, and reading or commenting on your OWN, needs
+   * neither lock — every CRM user may raise a bug.
+   */
+  canManageIssues: 'access.issues.emails',
   // (Re)provision a CRM user's Microsoft 365 mailbox — it CREATES an Entra
   // directory account and spends a licence seat, so it stays outside RBAC and
   // is granted per person. Seeded EMPTY = deny-all
