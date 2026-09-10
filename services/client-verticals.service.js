@@ -273,8 +273,9 @@ async function upsertPrimarySecondarySpoc(clientId, primaryUserId, secondaryUser
  * Cached set per process to avoid round-trip per row in bulk uploads.
  *
  * Refresh: the cache self-expires after 60s, so user create/edit is
- * picked up automatically with bounded staleness. `clearActiveUserCache()`
- * remains available for explicit invalidation.
+ * picked up automatically with bounded staleness. An explicit-invalidation
+ * helper was removed on 2026-09-10 — it had no caller, and the 60s expiry is
+ * the only invalidation this cache has ever actually used.
  */
 const ACTIVE_USERS_CACHE_TTL_MS = 60 * 1000; // 60s — bounded staleness for bulk SPOC validation
 let _activeUsersCache = null; // { promise, expiresAt }
@@ -296,15 +297,10 @@ async function activeInternalUserIds() {
   return _activeUsersCache.promise;
 }
 
-function clearActiveUserCache() {
-  _activeUsersCache = null;
-}
-
 module.exports = {
   listForClient,
   replaceForClient,
   hasUserTypeColumn,
   upsertPrimarySecondarySpoc,
   activeInternalUserIds,
-  clearActiveUserCache,
 };

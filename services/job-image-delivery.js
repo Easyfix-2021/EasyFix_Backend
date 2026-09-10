@@ -207,8 +207,7 @@ async function resolve(storedRaw, { logger } = {}) {
     if (logger) logger.warn({ stored }, 'bare filename not found in any legacy directory');
   }
 
-
   return { kind: 'none', reason: 'not in S3, no local file, no absolute FILE_BASE_URL' };
 }
 
-module.exports = { resolve, legacyUrlHasImage, probeHasFile, legacyDirsFor, _LEGACY_HOSTS: LEGACY_HOSTS };
+module.exports = { resolve, legacyUrlHasImage, probeHasFile, legacyDirsFor,  };

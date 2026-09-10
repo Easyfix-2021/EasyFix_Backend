@@ -601,12 +601,6 @@ async function createTranscription({ recordingId }) {
 // must NEVER reach the browser — the FE dials an OPAQUE one-time id; the public
 // answer route (/api/public/plivo/web-answer) resolves it back to the real
 // number server-side and returns the Dial XML.
-function webEndpoint() {
-  const username = (process.env.PLIVO_ENDPOINT_USERNAME || '').trim();
-  const password = process.env.PLIVO_ENDPOINT_PASSWORD || '';
-  if (!username || !password) return null;
-  return { username, password, appId: (process.env.PLIVO_WEB_APP_ID || '').trim() || null };
-}
 
 /*
  * Per-operator Plivo access token (replaces handing the endpoint password to the
@@ -708,7 +702,6 @@ module.exports = {
   buildAnswerXml,
   callingEnabled,
   maskForDisplay,
-  webEndpoint,
   webAccessToken,
   stashWebDial,
   resolveWebDial,

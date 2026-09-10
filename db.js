@@ -242,4 +242,4 @@ async function closePool() {
   logger.db('Database connection pool closed');
 }
 
-module.exports = { pool, testConnection, closePool, getPoolStats, poolSaturation, _readLiveGauges: readLiveGauges, _classifySaturation: classifySaturation, _poolLimit: poolLimit, _poolQueueMax: poolQueueMax };
+module.exports = { pool, testConnection, closePool, getPoolStats, poolSaturation, _readLiveGauges: readLiveGauges, _classifySaturation: classifySaturation,  };

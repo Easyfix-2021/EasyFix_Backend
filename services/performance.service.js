@@ -52,7 +52,10 @@ const { OFFER_STATUS } = require('./offer-status');
  *
  * Consumers:
  *   - Mobile App dashboard → `getForTech(efrId)` per home-screen load.
- *   - Future CRM "Top Technicians" report → `getForTechs([…])` bulk.
+ *
+ * A bulk `getForTechs([…])` was written for a "Top Technicians" report that was
+ * never built, and sat unused since. Removed 2026-09-10 — write it again with
+ * the report, against what the report actually needs.
  */
 
 const COMPLETED_STATUSES = [3, 5];
@@ -205,20 +208,5 @@ async function computeRating(efrId) {
  * out a per-tech call when bulk is requested — acceptable up to
  * ~50 techs. For a hundred-tech report, pre-aggregate via cron.
  */
-async function getForTechs(efrIds) {
-  logger.info('Get bulk tech performance · count=' + (Array.isArray(efrIds) ? efrIds.length : 0));
-  const map = new Map();
-  if (!Array.isArray(efrIds) || efrIds.length === 0) return map;
-  // Parallel fan-out, capped at 25 concurrent. Small batch keeps the
-  // pool happy.
-  const CONCURRENCY = 25;
-  for (let i = 0; i < efrIds.length; i += CONCURRENCY) {
-    const slice = efrIds.slice(i, i + CONCURRENCY);
-    const results = await Promise.all(slice.map((id) => getForTech(id)));
-    slice.forEach((id, idx) => map.set(Number(id), results[idx]));
-  }
-  logger.info('Returning ' + map.size + ' tech performance records');
-  return map;
-}
 
-module.exports = { getForTech, getForTechs, computeAcceptance };
+module.exports = { getForTech, computeAcceptance };

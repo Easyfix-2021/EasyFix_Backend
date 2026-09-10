@@ -97,7 +97,4 @@ async function pushNoticeToTechnicians(notice) {
 
 module.exports = {
   pushNoticeToTechnicians,
-  // Back-compat shim: preserves the historical string[] return shape.
-  resolveRecipientTokens: async () =>
-    (await pushDelivery.resolveVerifiedTechnicianTokens({ limit: MAX_RECIPIENTS })).map((r) => r.token),
 };

@@ -34,7 +34,8 @@
     "check:migrations:self-test": "node scripts/check-migration-columns.mjs --self-test",
     "check:sections": "node scripts/check-section-agreement.mjs",
     "check:skills": "node scripts/verify-skill-scope.mjs",
-    "check:skills:self-test": "node scripts/verify-skill-scope.mjs --self-test"
+    "check:skills:self-test": "node scripts/verify-skill-scope.mjs --self-test",
+    "sweep:exports": "node scripts/dead-exports.js ."
   },
   "engines": {
     "node": ">=18.0.0"

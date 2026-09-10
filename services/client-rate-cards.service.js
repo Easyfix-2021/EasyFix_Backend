@@ -51,12 +51,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 
-const COST_COLS = [
-  'easyfix_direct_fixed', 'easyfix_direct_variable',
-  'overhead_fixed',       'overhead_variable',
-  'client_fixed',         'client_variable',
-];
-
 /* ─── Probe: composite unique key presence ────────────────────────── */
 
 let _hasCompositeKeyPromise = null;
@@ -349,6 +343,5 @@ module.exports = {
   listForClient,
   bulkUpsert,
   hasCompositeUniqueKey,
-  COST_COLS,
   calculateCharges,
 };

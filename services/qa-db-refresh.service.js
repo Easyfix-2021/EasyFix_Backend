@@ -206,22 +206,6 @@ function setPhase(phase) {
  * `bytes` is read from the file on disk rather than counted in memory, so it
  * stays accurate even though the dump streams straight through gzip to disk.
  */
-function getProgress() {
-  if (!_run) return { running: false, phase: 'idle', label: PHASES.idle };
-  let bytes = null;
-  try { bytes = fssync.statSync(_run.file).size; } catch { /* not created yet */ }
-  return {
-    running: true,
-    dryRun: _run.dryRun,
-    phase: _run.phase,
-    label: PHASES[_run.phase] || _run.phase,
-    startedAt: new Date(_run.startedAt).toISOString(),
-    elapsedMs: Date.now() - _run.startedAt,
-    bytes,
-    cancelled: _run.cancelled,
-    file: path.basename(_run.file),
-  };
-}
 
 /*
  * Operator-requested stop. Kills the in-flight mysqldump/mysql child, which
@@ -731,5 +715,5 @@ async function runQaDbRefresh({ dryRun = false } = {}) {
 
 module.exports = {
   runQaDbRefresh, assertSafeToRun,
-  getProgress, cancelRun,
+  cancelRun,
 };

@@ -77,11 +77,6 @@ const noticeListQuery = Joi.object({
   offset:      Joi.number().integer().min(0).default(0),
 });
 
-const noticeActiveQuery = Joi.object({
-  surface: Joi.string().valid(...SURFACES).required(),
-  limit:   Joi.number().integer().min(1).max(50).default(20),
-});
-
 // Image attachments — array of public URLs returned by the existing
 // /api/shared/upload endpoint. Capped at 5 to keep the modal layout
 // + payload size reasonable. Accept both absolute URLs and the relative
@@ -168,7 +163,6 @@ module.exports = {
   categoryIdParam,
   noticeIdParam,
   noticeListQuery,
-  noticeActiveQuery,
   noticeCreate,
   noticeUpdate,
   noticePublishBody,

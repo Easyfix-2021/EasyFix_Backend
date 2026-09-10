@@ -346,10 +346,4 @@ module.exports = {
   buildStyledWorkbook,
   streamWorkbook,
   streamStyledXlsx,
-  // Re-export the palette so siblings can stay visually consistent
-  // when they need custom styling.
-  PALETTE: {
-    BRAND_DEEP, BRAND_PRIMARY, BRAND_LIGHT, STRIPE, BORDER_GREY,
-    TEXT_INDIGO, TEXT_DARK, TEXT_MUTED, WHITE, KPI_ACCENTS,
-  },
 };

@@ -129,17 +129,12 @@ const submitBody = Joi.object({
   services: Joi.array().items(serviceLine).max(50).optional(),
 });
 
-const tokenParam = Joi.object({
-  token: Joi.string().min(10).required(),
-}).unknown(true);
-
 const imageIdParam = Joi.object({
   imageId: intId.required(),
 }).unknown(true);
 
 module.exports = {
   submitBody,
-  tokenParam,
   imageIdParam,
   cancelRequestBody,
   rescheduleRequestBody,

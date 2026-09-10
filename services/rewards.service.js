@@ -55,7 +55,7 @@ const REASON = Object.freeze({
 
 const CLAIM_STATUSES = Object.freeze(['ORDERED', 'PACKED', 'SENT', 'DELIVERED', 'REJECTED']);
 /* The forward pipeline the technician sees. REJECTED is an exit, not a step. */
-const CLAIM_PIPELINE = Object.freeze(['ORDERED', 'PACKED', 'SENT', 'DELIVERED']);
+
 const REWARD_IMAGE_RESOLUTION_CONCURRENCY = 5;
 const MOBILE_REWARD_SHOP_LIMIT = 50;
 
@@ -1727,7 +1727,6 @@ module.exports = {
   REASON,
   awardCourseCompletions,
   CLAIM_STATUSES,
-  CLAIM_PIPELINE,
   pointsConfig,
   balanceFor,
   award,

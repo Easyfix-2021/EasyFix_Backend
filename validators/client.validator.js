@@ -41,10 +41,6 @@ const mobile = Joi.string()
 
 /* ─── Path params ─────────────────────────────────────────────────── */
 
-const clientIdParam = Joi.object({
-  clientId: Joi.number().integer().positive().required(),
-});
-
 // Generic `:id` param — used for contact/billing/custom-prop targets
 // where the route already includes :clientId for scope checks.
 const idParam = Joi.object({
@@ -52,14 +48,6 @@ const idParam = Joi.object({
 });
 
 // Composite for nested resources where both ids matter.
-const clientNestedIdParam = Joi.object({
-  clientId: Joi.number().integer().positive().required(),
-  id:       Joi.number().integer().positive().required(),
-});
-
-const clientOnlyIdParam = Joi.object({
-  id: Joi.number().integer().positive().required(),
-});
 
 /* ─── List query ──────────────────────────────────────────────────── */
 
@@ -515,11 +503,7 @@ const replaceVerticalsBody = Joi.object({
 module.exports = {
   clientTargetsBody,
   // params
-  clientIdParam,
-  clientOnlyIdParam,
   idParam,
-  clientNestedIdParam,
-  // queries
   listClientsQuery,
   contactDuplicateCheckQuery,
   // bodies

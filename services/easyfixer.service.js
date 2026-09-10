@@ -516,15 +516,6 @@ async function getById(id) {
 }
 
 // ─── Create ─────────────────────────────────────────────────────────
-async function findActiveByMobile(efrNo) {
-  logger.info('Lookup active easyfixer by mobile');
-  const [[row]] = await pool.query(
-    `SELECT efr_id, efr_name FROM tbl_easyfixer
-      WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
-    [efrNo]
-  );
-  return row || null;
-}
 
 const MUTABLE_COLUMNS = [
   'efr_name', 'efr_first_name', 'efr_last_name',
@@ -600,8 +591,9 @@ async function create(input, actor) {
       throw err;
     }
 
-    // Duplicate check — same logic as findActiveByMobile, but on the pinned
-    // connection so it runs under the lock.
+    // Duplicate check — the same active-technician-by-mobile lookup, but on
+    // the pinned connection so it runs under the lock. (A standalone helper
+    // for this existed and had no caller; removed 2026-09-10.)
     const [[existing]] = await conn.query(
       `SELECT efr_id, efr_name FROM tbl_easyfixer
         WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
@@ -1839,7 +1831,6 @@ module.exports = {
   create,
   update,
   setStatus,
-  findActiveByMobile,
   listTransactions,
   listMappedClients,
   aggregates,

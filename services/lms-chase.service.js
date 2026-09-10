@@ -58,11 +58,7 @@ const CHANNELS = Object.freeze([
  * header. 'noted' is an off-platform contact the operator is recording. */
 const OUTCOMES = Object.freeze(['sent', 'failed', 'skipped', 'queued', 'noted']);
 
-const TARGET_TYPES = Object.freeze(['course', 'assignment', 'session', 'technician']);
-
 const SOURCE_CRM = 'crm';
-const SOURCE_CRON = 'cron';
-const SOURCE_SYSTEM = 'system';
 
 const DEFAULT_COOLDOWN_HOURS = 20;
 
@@ -83,14 +79,6 @@ function cooldownHours() {
   if (raw == null || String(raw).trim() === '') return DEFAULT_COOLDOWN_HOURS;
   const n = Number(String(raw).trim());
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_COOLDOWN_HOURS;
-}
-
-/** Maximum technicians one bulk chase may touch. Mirrors the 500 ceiling the assign endpoint already enforces. */
-function bulkMax() {
-  const raw = properties.getProperty('lms.chase.bulk.max');
-  if (raw == null || String(raw).trim() === '') return 500;
-  const n = Number(String(raw).trim());
-  return Number.isFinite(n) && n > 0 ? n : 500;
 }
 
 /** A batch id shared by every row of one bulk action, so it can be read back as one event. */
@@ -340,54 +328,19 @@ async function withinCooldown(efrIds = [], channel) {
   return skip;
 }
 
-/**
- * Chase history, newest first. Powers the per-technician panel and the export.
- */
-async function listChases({ efrId, courseId, actorUserId, channel, batchId, limit = 100, offset = 0 } = {}) {
-  const clauses = [];
-  const params = [];
-  if (efrId) { clauses.push('efr_id = ?'); params.push(Number(efrId)); }
-  if (courseId) { clauses.push('course_id = ?'); params.push(Number(courseId)); }
-  if (actorUserId) { clauses.push('actor_user_id = ?'); params.push(Number(actorUserId)); }
-  if (channel) { clauses.push('channel = ?'); params.push(channel); }
-  if (batchId) { clauses.push('batch_id = ?'); params.push(batchId); }
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-
-  const [rows] = await pool.query(
-    `SELECT id, efr_id, channel, outcome, outcome_detail, target_type, course_id,
-            detector_key, batch_id, actor_user_id, actor_role_name, actor_source,
-            recipient_masked, template_name, language_code, created_at
-       FROM lms_chase_log
-       ${where}
-      ORDER BY created_at DESC, id DESC
-      LIMIT ? OFFSET ?`,
-    [...params, Number(limit), Number(offset)],
-  );
-  const [[{ total }]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM lms_chase_log ${where}`,
-    params,
-  );
-  return { rows, total: Number(total) };
-}
-
 module.exports = {
   CHANNELS,
   OUTCOMES,
-  TARGET_TYPES,
   CHANNEL_WHATSAPP,
   CHANNEL_CALL,
   CHANNEL_NUDGE,
   CHANNEL_MARK_CHASED,
   CHANNEL_HANDOFF,
   SOURCE_CRM,
-  SOURCE_CRON,
-  SOURCE_SYSTEM,
   cooldownHours,
-  bulkMax,
   newBatchId,
   recordChase,
   recordChaseBatch,
   chaseSummaryFor,
   withinCooldown,
-  listChases,
 };
