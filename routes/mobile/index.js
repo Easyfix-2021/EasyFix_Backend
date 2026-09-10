@@ -14,7 +14,7 @@ const mobileRegistrationService = require('../../services/mobile-registration.se
 const jobService = require('../../services/job.service');
 const addressService = require('../../services/address.service');
 const jobCommentService = require('../../services/job-comment.service');
-const shareService = require('../../services/job-share.service');
+const delegation = require('../../services/job-share-delegation.service');
 const voice = require('../../services/voice.service');
 const easyfixerLifecycle = require('../../services/easyfixer-lifecycle.service');
 const { dailyBridgeCapReached, persistBridgeCall, CALL_FAILED_PUBLIC_MSG } = require('../public/_public-call');
@@ -345,6 +345,13 @@ router.use('/jobs', require('./jobs-estimate'));
 // two routers above: literal segments must win over `:id`.
 router.use('/jobs', require('./permission-requests'));
 
+// Job DELEGATION — /jobs/:id/share{,/accept,/reject}. Two-segment-plus paths,
+// so nothing here collides with the `GET /jobs/:id` param route below; same
+// mount reason as the routers above (literal segments must win over `:id`).
+// These are the routes the delegation lock deliberately does NOT gate — see
+// middleware/require-tech-lifecycle-capability.js.
+router.use('/jobs', require('./job-share'));
+
 router.get('/me', (req, res) => modernOk(res, { tech: req.tech }));
 
 // Technician-initiated re-application. The protected-router idempotency layer
@@ -412,6 +419,13 @@ router.get('/jobs', async (req, res, next) => {
     logger.info('List my jobs · status=' + (req.query.status != null ? req.query.status : 'any') + ' · limit=' + (req.query.limit != null ? req.query.limit : 50));
     const { rows, total } = await jobService.list({
       easyfixerId: req.tech.efr_id,
+      // …plus every job DELEGATED to him. A delegate never appears on
+      // tbl_job.fk_easyfixter_id (the job stays with the original technician),
+      // so without this his own list would not contain the job he is expected
+      // to go and do. Separate option, not a widening of `easyfixerId`: that
+      // filter is also the CRM export's technician filter, which must keep
+      // meaning "assigned to".
+      delegatedToEfrId: req.tech.efr_id,
       status: req.query.status != null ? Number(req.query.status) : undefined,
       limit: Math.min(Number(req.query.limit) || 50, 200),
     });
@@ -493,8 +507,14 @@ router.get('/jobs/:id', async (req, res, next) => {
     // may view it — under the offer-pool model an offered job stays
     // fk_easyfixter_id=NULL until accepted, so the offered tech must be allowed
     // to open it to review + Accept/Reject.
+    // …OR a technician holding an accepted/started DELEGATION of it. The lock
+    // middleware has already rewritten req.tech.efr_id to the owner's id for
+    // that case, so this comparison passes without a third clause; the
+    // fall-back below covers the `pending` delegate, who must be able to open
+    // the job to decide whether to accept it.
     const canView = job.fk_easyfixter_id === req.tech.efr_id
-      || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
+      || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id))
+      || Boolean(await delegation.getShareForViewer(job.job_id, req.tech.efr_id));
     if (!canView) return modernError(res, 404, 'job not found');
     // Defence-in-depth (2026-07-08): the app never shows or dials the customer
     // number — it uses the masked /customer-call bridge — so the raw number
@@ -507,25 +527,12 @@ router.get('/jobs/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Mint a public "share job" link + ready-to-share message for a job the
-// technician OWNS (is assigned to). The link opens a NON-CONFIDENTIAL public
-// page (service, address + Navigate, masked Call to the customer). Non-owners
-// get 404 (no existence disclosure). buildShareBundle throws 410 for a
-// finished/cancelled job so the app can tell the tech it can't be shared.
-router.get('/jobs/:id/share-link', async (req, res, next) => {
-  try {
-    const jobId = Number(req.params.id);
-    logger.info('Mint job share link · id=' + jobId + ' · efr=' + req.tech.efr_id);
-    const job = await jobService.getById(jobId);
-    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) {
-      return modernError(res, 404, 'job not found');
-    }
-    const bundle = await shareService.buildShareBundle(jobId, pool, { sharedByEfrId: req.tech.efr_id });
-    return modernOk(res, bundle);
-  } catch (e) {
-    return e && typeof e.status === 'number' ? modernError(res, e.status, e.message) : next(e);
-  }
-});
+// RETIRED 2026-09-10: GET /jobs/:id/share-link minted a 72-hour read-only
+// PUBLIC page for a job. "Share" now means DELEGATION — routes/mobile/job-share
+// .js — and the owner's decision was to replace the old link rather than keep
+// two contradictory meanings of the word in one codebase. The service
+// (job-share.service.js), the `job_share` JWT type and the public
+// /api/public/shared-job/* surface went with it.
 
 // ─── Masked click-to-call: bridge the technician ⇄ customer ──────────
 // The app NEVER shows or dials the customer's number. from = the tech's on-file
@@ -974,6 +981,19 @@ router.post('/jobs/:id/checkout',
       { user_id: req.tech.efr_id, efr_id: req.tech.efr_id },
     );
     logger.info('Checked out · id=' + job.job_id + ' · status->' + (isRevisit ? 'REVISIT' : 'COMPLETED'));
+
+    // A live DELEGATION ends with the visit it was created for. This is the one
+    // place that knows WHICH of the two endings happened — isNextVisit is the
+    // app's "Can't Complete Today", everything else is a completion — so the
+    // share is closed here rather than inferred from job_status later.
+    // Best-effort: the transition already committed and must not be undone by a
+    // bookkeeping failure. `closeForJobOutcome` is a no-op unless a `started`
+    // share exists.
+    try {
+      await delegation.closeForJobOutcome(job.job_id, isRevisit ? 'handed_back' : 'completed');
+    } catch (se) {
+      logger.warn('Closing job share failed · id=' + job.job_id + ' · ' + se.message);
+    }
 
     // otherRemark has no tbl_job column — persist it as a check-out job comment
     // (comment_on=3; addComment also mirrors it onto tbl_job.remarks). Best-effort:

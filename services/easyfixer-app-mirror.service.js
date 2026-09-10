@@ -49,8 +49,8 @@ const MIRROR_TOKEN_TTL = '30s';
  * GET allowlist — anchored patterns, not prefixes.
  *
  * Prefixes were the obvious choice and are wrong: `/jobs` as a prefix would
- * silently admit `GET /jobs/:id/share-link`, which MINTS a public share link
- * and records the technician as its sharer. An anchored list fails closed —
+ * silently admit `GET /jobs/:id/share`, which discloses who a job has been
+ * delegated to and their phone number. An anchored list fails closed —
  * a new mobile screen is invisible to the mirror until someone adds it here,
  * which is the review step this list exists to force.
  *
@@ -59,7 +59,8 @@ const MIRROR_TOKEN_TTL = '30s';
  *   /kyc/*, /email/*             — identity verification flows with vendor
  *                                  calls and state transitions behind GETs
  *   /uploads/*                   — S3 upload primitives
- *   /jobs/:id/share-link         — mints a credential-ish public link
+ *   /jobs/:id/share              — job delegation: names the other
+ *                                  technician and their number
  */
 const ALLOWED_GET_PATHS = [
   /^\/me$/,

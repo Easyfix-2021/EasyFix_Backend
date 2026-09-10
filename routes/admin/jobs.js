@@ -14,6 +14,9 @@ const {
 const { assertEntityInScope } = require('../../lib/scope');
 const requireStageForTransition = require('../../middleware/require-stage');
 const requireAction = require('../../middleware/require-action');
+// Job delegation (technician shares a job with another technician). Ops-side
+// force-release only — see POST /:id/share/release at the bottom of this file.
+const jobShareDelegation = require('../../services/job-share-delegation.service');
 const { rateLimit } = require('../../middleware/rate-limit');
 // Reused (NOT re-implemented) for POST /:id/resend-customer-pin — see that route.
 const mobileLifecycle = require('../../services/mobile-job-lifecycle.service');
@@ -3271,6 +3274,44 @@ router.delete(
       return modernOk(res, { image_id: imageId, deleted: true }, 'image deleted');
     } catch (e) { next(e); }
   }
+);
+
+/*
+ * ─── POST /:id/share/release — ops force-ends a job DELEGATION ────────
+ *
+ * A technician can share a job with another technician; while that share is
+ * live the original is read-only on the app. Before the delegate starts, the
+ * original can cancel it himself and the TTL sweep expires it if nobody acts.
+ * ONCE THE DELEGATE HAS STARTED there is no self-service exit — by the owner's
+ * decision — so this is the only way out, and it exists for the case ops gets
+ * the phone call about: the delegate went dark mid-job.
+ *
+ * Gated on `isJobStatusChange`, the same action as ops check-in and the status
+ * change beside it, rather than a new key: this decides who may act on a job,
+ * which is what that grant already governs, and a new menu_action nobody seeds
+ * denies everyone (see migrations/2026-09-09-job-charges-rbac-action.sql for
+ * how that goes). scopedJob keeps it inside the operator's client/city/vertical
+ * scope like every other /:id route here.
+ */
+router.post('/:id/share/release',
+  validate(idParam, 'params'),
+  scopedJob,
+  requireAction('isJobShareRelease'),
+  // Its OWN key, seeded by migrations/2026-09-10-job-share-release-action.sql.
+  // Borrowing isJobStatusChange would let anyone who can move a status seize a
+  // job another technician delegated — and this is the only way to break a
+  // share after the delegate has started work.
+  async (req, res, next) => {
+    try {
+      const jobId = Number(req.params.id);
+      logger.info('Ops release job share · jobId=' + jobId + ' by userId=' + (req.user?.user_id ?? '-'));
+      const share = await jobShareDelegation.releaseShare(jobId, { userId: req.user?.user_id ?? null });
+      return modernOk(res, { share }, 'share released');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message, e.details);
+      return next(e);
+    }
+  },
 );
 
 module.exports = router;
