@@ -186,12 +186,15 @@ async function applyShareLock(req, res, next) {
  * Now ASYNC (the lock needs one indexed read). Wrapped in asyncMiddleware so a
  * pool fault returns a 500 instead of exiting the process — see
  * utils/async-middleware.js.
+ *
+ * The wrapper takes applyShareLock BY NAME, and that is not a style choice:
+ * scripts/scan-unguarded-await.js recognises a guard as wrapped only when an
+ * Identifier is handed to asyncMiddleware. An inline function that merely
+ * CALLS applyShareLock leaves the async function looking unguarded to the
+ * gate, which is how this file failed CI on 2026-09-10 despite being safe at
+ * runtime. Keep the identifier form.
  */
-const requireTechJobMutationCapability = asyncMiddleware(
-  function requireTechJobMutationCapability(req, res, next) {
-    return applyShareLock(req, res, next);
-  },
-);
+const requireTechJobMutationCapability = asyncMiddleware(applyShareLock);
 
 module.exports = {
   requireTechCapability,
