@@ -3109,11 +3109,58 @@ router.get('/images/:imageId/file', async (req, res, next) => {
       try { parsed = new URL(stored); } catch { parsed = null; }
       if (parsed && LEGACY_FILE_HOSTS.includes(parsed.hostname.toLowerCase())) {
         parsed.protocol = 'https:';
-        uploadLogger.info(
-          { imageId, jobId: row.job_id, host: parsed.hostname },
-          'job image served from the legacy file host',
-        );
-        return res.redirect(parsed.toString());
+
+        /*
+         * VERIFY THE TARGET BEFORE HANDING IT TO THE BROWSER.
+         *
+         * A redirect that cannot fail is not a resolution — the same defect as
+         * presigning an S3 key without checking the object exists (fixed on the
+         * selfie tile, 2026-09-09). This branch used to redirect on the strength
+         * of the stored string alone.
+         *
+         * When the file is NOT on the legacy host, that host answers with a
+         * 236-byte `text/html` error page (measured: 404 text/html for a missing
+         * name, 403 text/html for a directory). The browser is fetching this as
+         * an <img> no-cors subresource, so Chrome's Opaque Response Blocking
+         * refuses the HTML and reports `net::ERR_BLOCKED_BY_ORB` with no status
+         * and zero bytes — an opaque browser error where the operator should
+         * have seen our own "Image not found · Re-upload to restore" state.
+         *
+         * REFUSE ONLY ON POSITIVE EVIDENCE. A HEAD that errors, times out, or
+         * answers anything other than a definite non-image still redirects, so a
+         * transient network blip cannot hide a file that is really there. Only a
+         * clear "this is not an image" downgrades to the 404 path below.
+         */
+        let legacyVerdict = 'assumed-ok';
+        try {
+          const head = await fetch(parsed.toString(), {
+            method: 'HEAD',
+            redirect: 'follow',
+            signal: AbortSignal.timeout(Number(process.env.LEGACY_FILE_HEAD_TIMEOUT_MS || 2500)),
+          });
+          const ctype = String(head.headers.get('content-type') || '').toLowerCase();
+          if (!head.ok || (ctype && !ctype.startsWith('image/') && !ctype.startsWith('application/pdf'))) {
+            legacyVerdict = `not-an-image (status ${head.status}, content-type ${ctype || 'none'})`;
+          } else {
+            legacyVerdict = 'ok';
+          }
+        } catch (err) {
+          // Network/timeout — NOT evidence of absence. Fall through and redirect.
+          legacyVerdict = `unverified (${err && err.name ? err.name : 'error'})`;
+        }
+
+        if (legacyVerdict.startsWith('not-an-image')) {
+          uploadLogger.warn(
+            { imageId, jobId: row.job_id, host: parsed.hostname, stored, verdict: legacyVerdict },
+            'legacy file host has no image at this URL — 404ing instead of redirecting to an HTML error page',
+          );
+        } else {
+          uploadLogger.info(
+            { imageId, jobId: row.job_id, host: parsed.hostname, verdict: legacyVerdict },
+            'job image served from the legacy file host',
+          );
+          return res.redirect(parsed.toString());
+        }
       }
       uploadLogger.warn(
         { imageId, jobId: row.job_id, stored, host: parsed && parsed.hostname },
