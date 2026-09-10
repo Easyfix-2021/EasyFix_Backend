@@ -1723,7 +1723,22 @@ router.get('/:id/offers', validate(idParam, 'params'), scopedJob, async (req, re
     const sweep = !['0', 'false', 'no'].includes(String(req.query.sweep || '').toLowerCase());
     const items = await job.listOffers(Number(req.params.id), { sweep });
     logger.info('Returning ' + items.length + ' job offers · jobId=' + req.params.id);
-    modernOk(res, { items });
+    /*
+     * `offer_expiry_enabled` tells the CRM which regime is in force, because
+     * the modal's caption used to assert "open offers expire after 30 minutes"
+     * unconditionally — and in production that flag is 'false', so nothing
+     * times an offer out at all.
+     *
+     * The caption mattered more than it looks. EXPIRED is written by NINE code
+     * paths and only ONE (expireStaleOffers) honours the flag; the rest close
+     * an offer because the job was assigned, rescheduled, released, withdrawn,
+     * or superseded by a sibling accepting. An operator reading "expired" next
+     * to a 23-hour-old offer reasonably concludes the technician ignored it —
+     * which is a fairness claim about a person, and it was wrong. Reported
+     * 2026-09-10 for job 538177, where two offers closed in the same second a
+     * re-offer went out.
+     */
+    modernOk(res, { items, offer_expiry_enabled: job.offerExpiryEnabled() });
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
