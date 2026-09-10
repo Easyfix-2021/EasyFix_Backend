@@ -42,7 +42,8 @@ plivo.fetchTranscription = async () => ({ ok: true, text: FRESH });
 function baseRoutes({ callerUserId = 7, jciCallerId = 7 } = {}) {
   return [
     [/SHOW COLUMNS FROM tbl_plivo_call_log/i, [{ Field: 'x' }]],
-    [/SELECT caller_id\s+FROM tbl_job_caller_info/i, [{ caller_id: jciCallerId }]],
+    // Table, not projection — see the note in call-analysis-mode.test.js.
+    [/FROM tbl_job_caller_info/i, [{ caller_id: jciCallerId, call_type: 'OUT', job_id: null }]],
     [/SELECT call_uuid, caller_user_id/i, [{ call_uuid: 'uuid-1', caller_user_id: callerUserId }]],
     // caller-scorecard.service.rollupForCaller's two reads
     [/SELECT call_analysis, ended_on/i, [{ call_analysis: JSON.stringify(ANALYSIS), ended_on: null, initiated_on: null }]],
@@ -53,7 +54,18 @@ function baseRoutes({ callerUserId = 7, jciCallerId = 7 } = {}) {
 // Minimal req/res good enough for this router's handlers.
 function drive(router, { id, user }) {
   return new Promise((resolve, reject) => {
-    const req = { method: 'POST', url: `/${id}/reanalyse`, user, body: {}, query: {}, headers: {} };
+    const req = {
+      method: 'POST', url: `/${id}/reanalyse`, user, body: {}, query: {}, headers: {},
+      /*
+       * userRole, not just user (2026-09-10). Production sets this at
+       * middleware/role.js:59 via role(['admin']); these tests hand-build req
+       * and never did, so once the guard started asking bypassesScope() for a
+       * ROLE NAME, Admin stopped bypassing and every admin case 403'd. A
+       * hand-built request only carries what the test remembers to add, and
+       * what the middleware chain contributes is easy to forget.
+       */
+      userRole: { role_id: user.user_role, role_name: user.user_role === 2 ? 'Admin' : 'Executive Supply', role_status: 1 },
+    };
     const res = {
       statusCode: 200,
       body: null,
