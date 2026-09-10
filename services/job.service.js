@@ -315,6 +315,60 @@ const OFFER_WITHDRAWAL_STATES = new Set([...NON_ASSIGNABLE_STATES, STATUS.CLOSED
 // Dedicated endpoints own every state after SCHEDULED.
 const DIRECT_REJECTABLE_STATES = new Set([STATUS.BOOKED, STATUS.SCHEDULED]);
 
+/*
+ * ─── OFFERABILITY: ONE PREDICATE, THREE ANSWERS ────────────────────────────
+ *
+ * "Can this job be offered?" used to be answered in two places that did not
+ * agree. offerToTechnicians refused on `job_status !== BOOKED ||
+ * fk_easyfixter_id != null`; the CRM's Schedule & Assign modal gated its commit
+ * button on `job_status !== 0` ALONE. A gate reading a SUBSET of a guard's
+ * inputs is not a weaker gate, it is a different one — and the difference is
+ * exactly the set of states in which the UI promises an action the server will
+ * refuse. Production job 534947 sat in that set (BOOKED, but still owned by a
+ * legacy direct assignment) and absorbed 16 consecutive 409s from two
+ * operators. So the rule lives HERE, once, and both the guard and
+ * GET /:id/candidates read it.
+ *
+ * Three named outputs, one consumer each:
+ *
+ *   offerable      may the UI offer the commit at all? State-level, computed
+ *                  from an UNLOCKED read — this is what the CRM renders on.
+ *   releasesOwner  offering will first RELEASE a standing owner, so the
+ *                  operator has to be told before they commit.
+ *   claimableNow   the WRITE-TIME requirement, under the row lock: BOOKED and
+ *                  ownerless. `!claimableNow` is the old guard condition
+ *                  unchanged (`status !== BOOKED || fk != null`), kept as the
+ *                  race check against anything that claims the job between the
+ *                  release's own commit and this transaction's lock.
+ *
+ * Pure and SYNCHRONOUS on purpose. A predicate needing a query could not be
+ * evaluated both inside the locked transaction and on a route without either
+ * two implementations or an extra round trip — and two implementations is the
+ * failure being removed.
+ *
+ * Deliberately NOT folded in: the past-appointment gate and the job-stage
+ * transition check. Both are route-layer, both apply to /offer but NOT to
+ * /assign (routes/admin/jobs.js), so a job-state predicate that swallowed them
+ * would start refusing legitimate late-job recoveries on the assign path.
+ */
+function jobOfferability(jobRow) {
+  /*
+   * ⚠ Number(null) is 0, and 0 IS STATUS.BOOKED. So `Number(jobRow &&
+   * jobRow.job_status)` reads a MISSING row as a booked one and fails OPEN —
+   * written that way first, and caught by this file's own "fails closed" case.
+   * Absence has to be mapped to NaN explicitly; NaN then fails every comparison
+   * below. (Number('BOOKED') is already NaN, so a label instead of a code also
+   * fails closed.)
+   */
+  const raw = jobRow == null ? null : jobRow.job_status;
+  const status = raw == null ? NaN : Number(raw);
+  const owned = !!jobRow && jobRow.fk_easyfixter_id != null;
+  if (status !== STATUS.BOOKED) {
+    return { offerable: false, reason: 'not_booked', releasesOwner: false, claimableNow: false };
+  }
+  return { offerable: true, reason: null, releasesOwner: owned, claimableNow: !owned };
+}
+
 // ─── Job Age ────────────────────────────────────────────────────────
 /*
  * JOB AGE — elapsed time from ticket creation to the job's TERMINAL event, or
@@ -5099,7 +5153,7 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
    * assignment. Deliberately BOOKED-only: a SCHEDULED reassign keeps going
    * through assign(), which carries the reschedule reason.
    */
-  if (Number(existing.job_status) === STATUS.BOOKED && existing.fk_easyfixter_id != null) {
+  if (jobOfferability(existing).releasesOwner) {
     // Eligibility BEFORE the release, exactly as assign() sequences it: an
     // ineligible incoming technician must not leave the job ownerless as the
     // side effect of a request that then 400s.
@@ -5156,7 +5210,10 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
     if (!lockedJob) {
       const err = new Error('job not found'); err.status = 404; throw err;
     }
-    if (Number(lockedJob.job_status) !== STATUS.BOOKED || lockedJob.fk_easyfixter_id != null) {
+    // Same predicate GET /:id/candidates answers with, so the button the
+    // operator saw and this guard cannot disagree. claimableNow is BOOKED AND
+    // ownerless, i.e. `!claimableNow` is this guard's original condition.
+    if (!jobOfferability(lockedJob).claimableNow) {
       const err = new Error('job must be BOOKED and unassigned before it can be offered');
       err.status = 409;
       err.code = 'JOB_NOT_OFFERABLE';
@@ -6800,6 +6857,9 @@ module.exports = {
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
   isOfferFlowActive, expireStaleOffers, withdrawOffersForClosedJob,
+  // The ONE offerability predicate. Exported so GET /:id/candidates answers
+  // with the same rule offerToTechnicians enforces — see its comment.
+  jobOfferability,
   // The 30-min offer window. Exported so the offer-REMINDER cron can bound its
   // re-push window by the same constant instead of re-declaring it and drifting.
   OFFER_TTL_MINUTES,

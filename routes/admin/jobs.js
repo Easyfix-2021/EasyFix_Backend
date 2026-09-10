@@ -255,8 +255,27 @@ router.get('/:id/candidates',
       // the UI never lies about what the commit will do. The candidate LIST is
       // unchanged — this only flags the commit mode.
       const offerFlowEnabled = await job.isOfferFlowActive();
-      logger.info('Returning ' + (result?.candidates?.length || 0) + ' ranked candidates · jobId=' + req.params.id + ' offerFlow=' + offerFlowEnabled + (result?.note ? ' note=' + result.note : ''));
-      modernOk(res, { ...result, offerFlowEnabled });
+      /*
+       * OFFERABILITY — answered by the SAME predicate the offer guard enforces
+       * (job.jobOfferability), off the row scopedJob already loaded, so it costs
+       * no extra query. The modal used to re-derive this from job_status alone
+       * and therefore rendered a commit button that could only 409 for a BOOKED
+       * job that still carried an owner; see the helper's own comment.
+       *
+       * Sent as two flat fields beside offerFlowEnabled, matching that
+       * neighbour rather than introducing a nested shape on this payload.
+       * releasesOwner is NOT sent: the CRM needs the outgoing technician's NAME
+       * to say anything useful, and that only exists on the job-detail probe it
+       * already issues for the header.
+       */
+      const offerability = job.jobOfferability(req.scopedJob);
+      logger.info('Returning ' + (result?.candidates?.length || 0) + ' ranked candidates · jobId=' + req.params.id + ' offerFlow=' + offerFlowEnabled + ' offerable=' + offerability.offerable + (result?.note ? ' note=' + result.note : ''));
+      modernOk(res, {
+        ...result,
+        offerFlowEnabled,
+        offerable: offerability.offerable,
+        offerBlockReason: offerability.reason,
+      });
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
