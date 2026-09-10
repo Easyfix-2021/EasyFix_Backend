@@ -19,7 +19,13 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
-const { artifactsOf } = require('../scripts/migration-status');
+const { artifactsOf, dropsOf, isTransient } = require('../scripts/migration-status');
+
+/* The filter the executed/ scan applies: an artifact the file itself removes. */
+const survives = (sql) => {
+  const drops = dropsOf(sql);
+  return artifactsOf(sql).filter((a) => !isTransient(a, drops));
+};
 
 const kinds = (sql) => artifactsOf(sql).map((a) => a.kind);
 const find = (sql, kind) => artifactsOf(sql).filter((a) => a.kind === kind);
@@ -146,4 +152,78 @@ test('kinds are limited to the five probe-able types', () => {
       assert.ok(allowed.has(k), `${f}: unexpected artifact kind ${k}`);
     }
   }
+});
+
+// ─── TRANSIENT ARTIFACTS (the executed/ scan's false-positive guard) ──────
+/*
+ * WHY THIS EXISTS. executed/ files are now probed too, so a migration that
+ * builds a scratch table and drops it in the same file would report DRIFT
+ * forever — the artifact is absent because the migration ITSELF removed it,
+ * which is the opposite of "this environment is missing the migration".
+ *
+ * The filter reads the file's own DROP statements, so a file declares what is
+ * temporary; there is no allowlist to keep in step.
+ */
+
+test('a table created and dropped in the SAME file is transient', () => {
+  const sql = `
+    DROP TABLE IF EXISTS location_keep;
+    CREATE TABLE location_keep (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=MyISAM;
+    DROP TABLE IF EXISTS location_keep;
+  `;
+  // The extractor still SEES it — the filter is a separate, visible decision.
+  assert.deepEqual(artifactsOf(sql).map((a) => a.table), ['location_keep']);
+  assert.deepEqual(survives(sql), [], 'a scratch table must not be probed');
+});
+
+test('a table the file does NOT drop still survives the filter', () => {
+  // The positive control for the test above: without this, a filter that
+  // discarded EVERY table would pass the transient case and be undetectable.
+  const sql = 'CREATE TABLE IF NOT EXISTS tbl_keeper (id INT);';
+  assert.deepEqual(survives(sql).map((a) => a.table), ['tbl_keeper']);
+});
+
+test('DROP INDEX ... ON t cancels only that index, not the table', () => {
+  const sql = `
+    CREATE TABLE IF NOT EXISTS tbl_thing (id INT);
+    CREATE INDEX idx_tmp ON tbl_thing (id);
+    DROP INDEX idx_tmp ON tbl_thing;
+  `;
+  const kept = survives(sql);
+  assert.ok(kept.some((a) => a.kind === 'table' && a.table === 'tbl_thing'),
+    'the table outlives the scratch index and must still be probed');
+  assert.ok(!kept.some((a) => a.kind === 'index' && a.index === 'idx_tmp'),
+    'the dropped index must not be probed');
+});
+
+test('a DROP inside a COMMENT does not cancel anything', () => {
+  // dropsOf strips comments first. Without that, prose describing a rollback
+  // ("-- to undo: DROP TABLE tbl_real;") would silence a real probe — the same
+  // class of bug the extractor's own comment-stripping guards against.
+  const sql = `
+    -- to roll back: DROP TABLE tbl_real;
+    CREATE TABLE IF NOT EXISTS tbl_real (id INT);
+  `;
+  assert.deepEqual(survives(sql).map((a) => a.table), ['tbl_real']);
+});
+
+test('the transient filter is not swallowing the executed corpus', () => {
+  /*
+   * DENOMINATOR CHECK. A filter that quietly discarded most artifacts would
+   * make the executed/ scan pass by having nothing left to probe — silence
+   * that looks exactly like success. Measured when written: 380 artifacts
+   * across 208 files, of which 2 are transient.
+   */
+  const dir = path.join(__dirname, '..', 'migrations', 'executed');
+  let total = 0;
+  let dropped = 0;
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.sql'))) {
+    const sql = fs.readFileSync(path.join(dir, f), 'utf8');
+    const all = artifactsOf(sql);
+    total += all.length;
+    dropped += all.length - survives(sql).length;
+  }
+  assert.ok(total > 100, `expected a real corpus; found only ${total} artifacts`);
+  assert.ok(dropped < total * 0.05,
+    `the transient filter discarded ${dropped} of ${total} artifacts — that is a redesign signal, not a filter`);
 });

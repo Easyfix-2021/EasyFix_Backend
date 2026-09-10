@@ -35,9 +35,40 @@
  * Silently passing them would be worse than not checking at all: it would let a
  * genuinely-unapplied data fix look verified.
  *
+ * ── executed/ IS SCANNED TOO, AND THAT IS THE POINT (2026-09-10) ────────
+ * This script used to read ONLY `migrations/`. That made it structurally
+ * blind to the failure it is most needed for: a file moved to
+ * `migrations/executed/` before EVERY environment had applied it. The
+ * convention says executed/ means "applied everywhere", so a file there is
+ * never probed again — and the environment that missed it reports GREEN
+ * forever. That is exactly how QA sat without
+ * 2026-09-10-crm-issue-reporter-v2.sql while the check said everything was
+ * fine and the issue-reporter endpoints 500'd.
+ *
+ * So executed/ files are probed as well, under a DIFFERENT question:
+ *   migrations/  — "has this been applied YET?"      absent ⇒ PENDING
+ *   executed/    — "is this environment MISSING one   absent ⇒ DRIFT
+ *                   everybody believes is done?"
+ * Drift is the louder finding of the two: pending is work not started,
+ * drift is a belief that is false.
+ *
+ * TRANSIENT ARTIFACTS ARE EXCLUDED, BY MECHANISM AND NOT BY ALLOWLIST. A
+ * migration that CREATEs a scratch table and DROPs it again in the same file
+ * (executed/2026-08-25-location-dedupe-and-upsert.sql builds `location_keep`
+ * at line 91 and drops it at line 131) leaves no artifact by design, and
+ * probing for one reports permanent drift on a file that is perfectly
+ * applied. `dropsOf()` reads the file's own DROP statements, so the file
+ * itself declares what is temporary.
+ *
+ * MEASURED BEFORE SHIPPING, because a checker that flags nearly everything
+ * needs redesigning rather than an allowlist: against QA, 208 executed files
+ * → 155 applied, 41 data-only, 12 flagged (~7%). One of the 12 was the real
+ * defect this was written for.
+ *
  * EXIT CODES (this runs inside `npm run verify:all`):
  *   0  everything with a detectable artifact is applied
- *   1  at least one migration is PENDING or PARTIALLY applied
+ *   1  at least one migration is PENDING or PARTIALLY applied, OR an
+ *      executed/ migration is MISSING from this environment (drift)
  *   2  the check itself failed (no DB, bad credentials)
  * UNKNOWN files alone never fail the run — they are listed for a human.
  */
@@ -57,6 +88,7 @@ function db() {
 }
 
 const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
+const EXECUTED_DIR = path.join(MIGRATIONS_DIR, 'executed');
 
 /*
  * Strip comments before pattern-matching. Without this, a migration that
@@ -177,15 +209,56 @@ async function probe(a) {
   }
 }
 
-async function checkMigrations() {
-  const files = fs.readdirSync(MIGRATIONS_DIR)
+/*
+ * The artifacts a file DROPS. Used to exclude scratch objects a migration
+ * creates and removes within itself — probing those reports permanent drift on
+ * a file that applied perfectly.
+ *
+ * Deliberately narrow: only DROP TABLE and DROP INDEX, the two shapes that can
+ * cancel an artifact `artifactsOf` extracts. It is NOT a general "was this
+ * later removed" check — a DROP in a LATER migration is real drift information
+ * and must keep reporting, because the artifact genuinely is not there and a
+ * reader deserves to see why.
+ */
+function dropsOf(sql) {
+  const clean = stripComments(sql);
+  const out = { tables: new Set(), indexes: new Set() };
+  for (const m of clean.matchAll(/\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`?([A-Za-z0-9_]+)`?/gi)) {
+    out.tables.add(m[1].toLowerCase());
+  }
+  for (const m of clean.matchAll(/\bDROP\s+INDEX\s+`?([A-Za-z0-9_]+)`?\s+ON\s+`?([A-Za-z0-9_]+)`?/gi)) {
+    out.indexes.add(`${m[2].toLowerCase()}.${m[1].toLowerCase()}`);
+  }
+  return out;
+}
+
+/** True when the file itself removes this artifact — i.e. it was scratch. */
+function isTransient(artifact, drops) {
+  if (artifact.kind === 'table') return drops.tables.has(String(artifact.table).toLowerCase());
+  if (artifact.kind === 'column') return drops.tables.has(String(artifact.table).toLowerCase());
+  if (artifact.kind === 'index') {
+    return drops.tables.has(String(artifact.table).toLowerCase())
+      || drops.indexes.has(`${String(artifact.table).toLowerCase()}.${String(artifact.index).toLowerCase()}`);
+  }
+  return false;
+}
+
+/*
+ * Probe every .sql in one directory. Shared by both scans so the two answers
+ * are produced by ONE piece of code — the pending set and the executed set
+ * differing only in what an absent artifact MEANS, never in how it is detected.
+ */
+async function checkDir(dir) {
+  if (!fs.existsSync(dir)) return [];
+  const files = fs.readdirSync(dir)
     .filter((f) => f.endsWith('.sql'))
     .sort();
 
   const results = [];
   for (const file of files) {
-    const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
-    const artifacts = artifactsOf(sql);
+    const sql = fs.readFileSync(path.join(dir, file), 'utf8');
+    const drops = dropsOf(sql);
+    const artifacts = artifactsOf(sql).filter((a) => !isTransient(a, drops));
     if (artifacts.length === 0) {
       results.push({ file, status: 'unknown', artifacts: [] });
       continue;
@@ -197,6 +270,19 @@ async function checkMigrations() {
     results.push({ file, status, artifacts: probed });
   }
   return results;
+}
+
+async function checkMigrations() {
+  return checkDir(MIGRATIONS_DIR);
+}
+
+/*
+ * The executed/ set. Same probing, opposite meaning: these are supposed to be
+ * applied EVERYWHERE, so anything absent here is this environment silently
+ * lacking a migration the repo considers finished.
+ */
+async function checkExecuted() {
+  return checkDir(EXECUTED_DIR);
 }
 
 async function cliMain() {
@@ -232,15 +318,53 @@ async function cliMain() {
     console.log('  Then move the file to migrations/executed/ to keep the convention honest.');
     process.exitCode = 1;
   } else {
-    console.log('✓ Every migration with a detectable artifact is applied.');
+    console.log('✓ Every migration in migrations/ with a detectable artifact is applied.');
   }
   if (by('unknown').length) {
     console.log(`ℹ ${by('unknown').length} data-only migration(s) could not be verified automatically (listed above).`);
   }
+
+  /*
+   * ── The executed/ set ────────────────────────────────────────────────
+   *
+   * Reported as a COUNT when clean and a LIST when not. Printing 155 "✓
+   * APPLIED" lines would bury the two that matter — the whole reason this
+   * scan exists is that a missing executed migration is currently invisible,
+   * and a wall of green is the next best way to keep it that way.
+   *
+   * The DENOMINATOR is always printed beside the finding: "3 of 208" is a
+   * statement about coverage, "3 drifted" is not.
+   */
+  const ex = await checkExecuted();
+  const exBy = (st) => ex.filter((r) => r.status === st);
+  const drifted = [...exBy('pending'), ...exBy('partial')];
+
+  console.log('');
+  console.log(`── migrations/executed/ — ${ex.length} file(s), the set this repo believes is applied EVERYWHERE`);
+  console.log(`   ${exBy('applied').length} verified present · ${exBy('unknown').length} data-only (no artifact to probe) `
+    + `· ${drifted.length} MISSING HERE`);
+
+  if (drifted.length) {
+    console.log('');
+    console.log(`✗ DRIFT — ${drifted.length} of ${ex.length} executed migration(s) are NOT applied to this database.`);
+    console.log('  These sit in migrations/executed/, which means the repo considers them done');
+    console.log('  everywhere. This environment does not have them, and nothing else would say so.');
+    for (const r of drifted) {
+      console.log(`    ${r.status === 'partial' ? '⚠ PARTIAL' : '✗ ABSENT '}  ${r.file}`);
+      for (const a of r.artifacts) if (!a.present) console.log(`                 ✗ ${a.label}`);
+    }
+    console.log('');
+    console.log('  Apply with:');
+    console.log('    mysql -h "$DB_HOST" -u "$DB_USER" -p "$DB_NAME" < migrations/executed/<file>.sql');
+    console.log('  Every migration in this repo is IF NOT EXISTS / NOT EXISTS-guarded, so re-running');
+    console.log('  one that IS applied is a no-op — when in doubt, run it.');
+    process.exitCode = 1;
+  }
+
   await db().end();
 }
 
-module.exports = { checkMigrations, artifactsOf };
+module.exports = { checkMigrations, checkExecuted, artifactsOf, dropsOf, isTransient };
 
 // CLI only when invoked directly (mirrors scripts/schema-verify.js).
 if (require.main === module) {

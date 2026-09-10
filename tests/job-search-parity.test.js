@@ -78,14 +78,19 @@ function resolveFeFile() {
 function resolveFeFileOrFail(t) {
   const fe = resolveFeFile();
   if (fe) return fe;
-  if (process.env.CI) {
-    assert.fail('Easyfix_CRM_UI is missing in CI. The "Fetch Easyfix_CRM_UI for cross-repo '
-      + 'parity" workflow step must clone it into "$RUNNER_TEMP" and set EASYFIX_CRM_UI_DIR. '
-      + 'This must never degrade to a silent skip here — that is how a guard ends up '
-      + `committed, green, and never run. Looked in: ${CRM_ROOTS.filter(Boolean).join(', ')}`);
-  }
-  t.skip(`CRM UI not checked out beside this repo (looked in ${CRM_ROOTS.filter(Boolean).join(', ')}) `
-    + '— cross-repo parity NOT verified');
+  /*
+   * FAIL, NEVER SKIP — no longer conditional on CI (2026-09-10). A guard whose
+   * strength depends on an env var nobody sets locally is a guard that reports
+   * nothing exactly where the change is being made. See the same note in
+   * tests/wire-contract.test.js.
+   */
+  assert.fail('Easyfix_CRM_UI was not found, so cross-repo search parity was NOT verified. '
+    + 'That must never degrade to a silent skip — it is how a guard ends up committed, green, '
+    + `and never run. Looked in: ${CRM_ROOTS.filter(Boolean).join(', ')}`
+    + '\n  FIX IT ONE OF TWO WAYS:'
+    + '\n    git clone --depth 1 https://github.com/Easyfix-2021/Easyfix_CRM_UI.git ../Easyfix_CRM_UI'
+    + '\n    …or point EASYFIX_CRM_UI_DIR at an existing checkout.'
+    + '\n  Both repos are public, so the clone needs no token — CI does exactly this.');
   return null;
 }
 

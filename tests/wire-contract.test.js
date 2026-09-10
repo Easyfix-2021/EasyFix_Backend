@@ -111,13 +111,28 @@ function crmRoot() {
 function crmSrcOrFail(t) {
   const src = path.join(crmRoot(), 'src');
   if (fs.existsSync(src)) return src;
-  if (process.env.CI) {
-    assert.fail('Easyfix_CRM_UI is missing in CI. The "Fetch Easyfix_CRM_UI for cross-repo '
-      + 'parity" workflow step must clone it into "$RUNNER_TEMP" and set EASYFIX_CRM_UI_DIR. '
-      + 'The FE sort keys are PARSED from the CRM sources — without them this test verifies '
-      + `nothing, and that must never pass silently. Looked in: ${src}`);
-  }
-  t.skip(`Easyfix_CRM_UI not found beside this repo (looked in ${src}) — FE sort keys NOT verified`);
+  /*
+   * FAIL, NEVER SKIP — and no longer only under CI (2026-09-10).
+   *
+   * This used to fail in CI and skip everywhere else. That made the guard's
+   * strength depend on an environment variable nobody sets locally, and the
+   * local answer was the useless one: on 2026-09-10 a session working from a
+   * tree with no sibling CRM ran this file, got a SKIP, and shipped a jobs-list
+   * sort key the backend had never whitelisted. HotFix went red for everyone
+   * else, off a run that had reported nothing wrong.
+   *
+   * `npm test` already refuses a skipped test (scripts/test-no-skips.js), so a
+   * skip here was never survivable anyway — it just arrived later, as a generic
+   * "N tests SKIPPED" from the wrapper instead of the sentence below. Failing at
+   * the guard is the same verdict with the remediation attached.
+   */
+  assert.fail('Easyfix_CRM_UI was not found, so the FE sort keys could not be parsed and this '
+    + 'test verified NOTHING. That must never pass silently — it is how a guard ends up '
+    + `committed, green, and never run. Looked in: ${src}`
+    + '\n  FIX IT ONE OF TWO WAYS:'
+    + '\n    git clone --depth 1 https://github.com/Easyfix-2021/Easyfix_CRM_UI.git ../Easyfix_CRM_UI'
+    + '\n    …or point EASYFIX_CRM_UI_DIR at an existing checkout.'
+    + '\n  Both repos are public, so the clone needs no token — CI does exactly this.');
   return null;
 }
 
@@ -312,13 +327,13 @@ test('the CRM_UI copy of the contract is byte-identical', (t) => {
      * (see the "Fetch Easyfix_CRM_UI for cross-repo parity" step), so an absence
      * HERE can only mean that step broke — a failure, not a shrug.
      */
-    if (process.env.CI) {
-      assert.fail('Easyfix_CRM_UI is missing in CI. The "Fetch Easyfix_CRM_UI for cross-repo '
-        + 'parity" workflow step must clone it into "$RUNNER_TEMP" and set EASYFIX_CRM_UI_DIR '
-        + '— cross-repo parity must never degrade to a silent skip in the run that gates the '
-        + 'deploy.');
-    }
-    t.skip('Easyfix_CRM_UI not found beside this repo — cross-repo parity NOT verified');
+    // FAIL, NEVER SKIP — see the note on crmSrcOrFail above for why this is no
+    // longer conditional on CI.
+    assert.fail('Easyfix_CRM_UI was not found, so cross-repo parity was NOT verified.'
+      + '\n  FIX IT ONE OF TWO WAYS:'
+      + '\n    git clone --depth 1 https://github.com/Easyfix-2021/Easyfix_CRM_UI.git ../Easyfix_CRM_UI'
+      + '\n    …or point EASYFIX_CRM_UI_DIR at an existing checkout.'
+      + '\n  Both repos are public, so the clone needs no token — CI does exactly this.');
     return;
   }
   const mine = fs.readFileSync(CONTRACT_PATH);
