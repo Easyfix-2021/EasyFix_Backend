@@ -475,6 +475,11 @@ const SAMPLE = {
   sortDir: 'asc',
   limit: 50,
   offset: 0,
+  // A LIST projection selector, not a filter — the ledger records it as
+  // 'ignored' because the sheet always emits its whole 75-column projection.
+  // Present here because this file's first assertion requires the sample to
+  // exercise every listQuery key, ledger entry or not.
+  view: 'manage',
 };
 
 test('THE LEDGER IS DERIVED, NOT TYPED: every listQuery key is accounted for', () => {

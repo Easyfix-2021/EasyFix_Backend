@@ -179,6 +179,20 @@ const EXPORT_COLUMNS = Object.freeze([
   { header: 'Is Escalated',               key: 'isEscalated',               type: 'number' },
   { header: 'First Escalated On',         key: 'firstEscalatedOnDate',      type: 'date'   },
   { header: 'Escalation TAT',             key: 'escalationTAT',             type: 'number' },
+  /*
+   * Remark = THE LATEST COMMENT on the job (2026-09-10), matching the new
+   * Manage Jobs grid column so the sheet and the screen agree.
+   *
+   * Distinct from 'Pending Remarks' above, which is legacy's
+   * `remarks_date_time + " : " + remarks` off tbl_job — a column that is also
+   * composeRemarks()' serialisation format and the dueTo LIKE filter's target,
+   * and which only ONE of the platform's comment writers mirrors into.
+   *
+   * APPENDED, not inserted. Every other column's position is load-bearing —
+   * confirmationAction is kept as a hardcoded null purely so the sheet's column
+   * count and downstream cell references do not shift.
+   */
+  { header: 'Remark',                     key: 'lastComment',               type: 'string' },
 ].map(Object.freeze));
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -697,6 +711,14 @@ const FILTER_COVERAGE = Object.freeze({
   // is the one thing it must not inherit; that is not a dropped filter.
   limit:            ['ignored',  'the export is not paged'],
   offset:           ['ignored',  'the export is not paged'],
+  /*
+   * `view` selects the LIST's projection (the Manage Jobs grid's extra
+   * columns); the sheet has its own 75-column projection and always emits all
+   * of it, so there is nothing here to select. Recorded rather than omitted
+   * because this ledger is what stops a new listQuery key being dropped in
+   * silence — the sheet's own Remark and Rating columns are unconditional.
+   */
+  view:             ['ignored',  'a LIST projection selector; the sheet emits every column always'],
 });
 
 /*
@@ -1516,7 +1538,17 @@ const EXPORT_SELECT = `
     cancelBy.user_name       AS cancel_by_user,
     TBU.user_name            AS firstScheduleBY,
     JO.offer_total, JO.offer_pending, JO.offer_accepted,
-    JO.offer_rejected, JO.offer_expired, JO.accepted_tx
+    JO.offer_rejected, JO.offer_expired, JO.accepted_tx,
+    /*
+     * The latest comment — byte-identical ORDER BY to the Manage Jobs list
+     * projection and to job-comment.service.js' own listing, so the sheet cell,
+     * the grid cell and the job's comment thread can never disagree about which
+     * comment is newest. Id order alone would not do: addComment lets created_on
+     * default while two raw INSERTs pass NOW() explicitly.
+     */
+    (SELECT LEFT(jc.comments, 300) FROM tbl_job_comment jc
+      WHERE jc.job_id = J.job_id
+      ORDER BY jc.created_on DESC, jc.comment_id DESC LIMIT 1) AS last_comment
   FROM tbl_job J
   LEFT JOIN tbl_customer  C   ON C.customer_id   = J.fk_customer_id
   LEFT JOIN tbl_client    CL  ON CL.client_id    = J.fk_client_id
@@ -2370,6 +2402,8 @@ function mapExportRow(r, seqNumber) {
     pendingDueTo: r.due_to_type ?? null,
     pendingReason: r.pending_reason_desc ?? null,
     pendingRemarks,
+    // The newest comment, or blank when the job has none.
+    lastComment: r.last_comment ?? null,
     readyForBilling: r.ready_for_billing ?? null,
     /*
      * Hard-coded null. `confirmationAction` is never populated by the legacy
@@ -2396,6 +2430,16 @@ function mapExportRow(r, seqNumber) {
 
 module.exports = {
   EXPORT_COLUMNS, fetchExportChunk, mapExportRow, buildExportWhere,
+  /*
+   * The two legacy BUCKET derivations — ports of
+   * UtilityFunctions.getHomeJobStatusbyStatusId and .getJobCurrentStatusNew.
+   * Exported (2026-09-10) so the Manage Jobs LIST renders the same labels this
+   * sheet does instead of carrying a second port of a 43-label state machine.
+   * They are pure functions of one row; homeJobStatus takes the three scalars,
+   * jobCurrentStatus reads ~24 fields off the row (the list's `view=manage`
+   * projection supplies exactly those).
+   */
+  homeJobStatus, jobCurrentStatus,
   /*
    * The listQuery coverage ledger and the subset of it the route logs.
    * Exported so tests/job-export-filters.test.js can derive its checks from

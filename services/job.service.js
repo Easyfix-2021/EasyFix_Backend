@@ -546,6 +546,15 @@ const SORTABLE_COLUMNS = {
    * cannot diverge.
    */
   age: JOB_AGE_SECS_EXPR,
+  /*
+   * Manage Jobs shows TICKET CREATED, not created_date_time — a distinct
+   * tbl_job column and the one the Age expression anchors on. Sorting the
+   * column an operator can see needs its own key; created_date_time is a
+   * different date and was the only one whitelisted.
+   */
+  ticket_created_date_time: 'j.ticket_created_date_time',
+  // Category, on the alias the projection already emits it from.
+  service_category: 'sc.service_catg_name',
 };
 
 // ─── Projections ────────────────────────────────────────────────────
@@ -776,6 +785,125 @@ const LIST_JOIN = `
  * columns are deterministic rather than whichever row the optimiser reached
  * first.
  */
+/*
+ * ─── MANAGE JOBS VIEW (2026-09-10) ─────────────────────────────────────────
+ *
+ * The /jobs grid was rebuilt to the 20 columns the legacy CRM's Manage Jobs
+ * screen carried (EasyFix_CRM manageJob.vm:778-797, rows bound by jobList.vm).
+ * Eleven of them were already projected; these are the rest.
+ *
+ * OPT-IN, on the escalationColumns pattern, and for the same reason: `list()`
+ * has a dozen callers — the client portal, mobile, exports, QuickSight — and
+ * none of them wants three extra joins and eight scalar subqueries. Requested
+ * by `view=manage` from the one page that renders them.
+ *
+ * SUBQUERIES, NOT JOINS, for everything one-to-many. tbl_job_offer has a row
+ * per (job, technician) and tbl_easyfixer_rating_by_customer's job_id is not
+ * unique, so joining either directly would FAN OUT the list — every job
+ * multiplied by its offer count. The five offer aggregates are the same
+ * COUNT/SUM the export computes in a derived table; it can afford the derived
+ * table because it is keyset-paginated with an explicit `job_id IN (?)`, which
+ * a page-with-offset query cannot supply. Correlated scalar subqueries are what
+ * offerColumns above already does five times over the same table.
+ *
+ * `escalationColumns` supplies escalated_time and escalated_by_name off the
+ * `esc` alias; the Rating column rides the SAME row, so list() forces
+ * wantsEscalation on whenever this view is requested rather than joining
+ * tbl_easyfixer_rating_by_customer a second time.
+ *
+ * Every tbl_job column named here was verified present on the shared database
+ * before being named. That matters: the export reads them via `SELECT J.*`,
+ * which silently omits a column that does not exist, while naming one that does
+ * not exist 500s the whole jobs list.
+ */
+function manageColumns(want, hasJobOffer) {
+  if (!want) return '';
+  /*
+   * The five offer aggregates feed jobCurrentStatus' status-0 arm. NULL-aliased
+   * when tbl_job_offer is not migrated in, mirroring offerColumns' own
+   * un-migrated branch so the row SHAPE never changes between deploys.
+   */
+  const offerAgg = hasJobOffer
+    ? `,
+  (SELECT COUNT(*)                  FROM tbl_job_offer m1 WHERE m1.job_id = j.job_id) AS offer_total,
+  (SELECT SUM(m2.offer_status = 0)  FROM tbl_job_offer m2 WHERE m2.job_id = j.job_id) AS offer_pending,
+  (SELECT SUM(m3.offer_status = 1)  FROM tbl_job_offer m3 WHERE m3.job_id = j.job_id) AS offer_accepted,
+  (SELECT SUM(m4.offer_status = 2)  FROM tbl_job_offer m4 WHERE m4.job_id = j.job_id) AS offer_rejected,
+  (SELECT SUM(m5.offer_status = 3)  FROM tbl_job_offer m5 WHERE m5.job_id = j.job_id) AS offer_expired`
+    : `, NULL AS offer_total, NULL AS offer_pending, NULL AS offer_accepted`
+      + `, NULL AS offer_rejected, NULL AS offer_expired`;
+  return `,
+  ad.pin_code,
+  ef.efr_manager_id,
+  /*
+   * Master / Under Master / Individual. The relationship is tbl_easyfixer's own
+   * SELF-REFERENCE efr_manager_id plus "does anyone report to me", which is the
+   * team count. The "<> efr_id" guard is legacy's: a technician whose manager is
+   * themselves is not their own subordinate.
+   */
+  (SELECT COUNT(*) FROM tbl_easyfixer efm
+    WHERE efm.efr_manager_id = ef.efr_id AND efm.efr_manager_id <> efm.efr_id) AS efr_team_count,
+  /* Easyfix SPOC = job_client_owner, NOT job_owner (which ow already joins
+     and which the Owner column renders). Legacy is unambiguous: the filter
+     builds J.job_client_owner = ? from the same picker. */
+  uo.user_name AS easyfix_spoc,
+  esc.customer_rating,
+  /* "Open Due to" is the accountable PARTY (EasyFix / Technician / Customer /
+     Client), not a reason: user_type.type reached through the reason row. */
+  ut.type AS due_to_type,
+  /*
+   * The Remark column = THE LATEST COMMENT, per the operator's brief. Not
+   * j.remarks, which cannot serve it: of four tbl_job_comment INSERT sites in
+   * this repo only addComment mirrors into that column (and soft-fails when it
+   * does), the still-live Java CRM adds six more that never mirror, and the same
+   * column doubles as composeRemarks()' serialisation format and as the target
+   * of the dueTo LIKE filter.
+   *
+   * ORDER BY created_on then comment_id, byte-identical to
+   * job-comment.service.js' own listing, so this cell and the job's comment
+   * thread can never disagree about which comment is newest. Id order alone is
+   * not enough — addComment lets the column default while two raw INSERTs pass
+   * NOW() explicitly, so id order and time order are not guaranteed to agree.
+   */
+  (SELECT LEFT(jc.comments, 300) FROM tbl_job_comment jc
+    WHERE jc.job_id = j.job_id
+    ORDER BY jc.created_on DESC, jc.comment_id DESC LIMIT 1) AS last_comment,
+  /*
+   * ── Bucket / Bucket Status inputs ──
+   * Not rendered themselves. These are the ~24 fields the two legacy label
+   * derivations read; list() maps them to bucket + bucket_status strings
+   * before the rows leave the service, so the FE never re-derives a 43-label
+   * state machine.
+   */
+  j.sub_job_id, j.tx_selfie_id, j.eta_status, j.requested_time,
+  j.reschedule_reason_id, j.job_cancel_reason_id_by_easyfixer, j.revisit_reason_id,
+  j.approved_on_date_time, j.approval_reject_date_time,
+  j.full_fillment_reason, j.full_fillment_created_time,
+  j.ready_for_billing, j.call_later, j.approved_by_client,
+  contact.approval_by_client AS contact_approval${offerAgg}`;
+}
+
+function manageJoin(want) {
+  if (!want) return '';
+  /*
+   * All three are many-to-ONE on j, so none of them can fan out the list.
+   * The action_taken_reason predicate is legacy's verbatim (JobDaoImpl:263-268):
+   * whichever of cancel_reason_id / enum_reason_id was written more recently,
+   * decided by comparing the two timestamps, and NULL when neither is set.
+   * Remark-the-reason and Open Due to are two projections of this ONE row —
+   * which is why they are blank and non-blank together.
+   */
+  return `
+  LEFT JOIN tbl_user uo ON uo.user_id = j.job_client_owner
+  LEFT JOIN tbl_client_contacts contact ON contact.id = j.reporting_contact_id
+  LEFT JOIN action_taken_reason atr ON atr.id =
+    IF(j.cancel_date_time IS NOT NULL AND j.remarks_date_time IS NOT NULL,
+       IF(TIMEDIFF(j.cancel_date_time, j.remarks_date_time) > 0, j.cancel_reason_id, j.enum_reason_id),
+       IF(j.cancel_date_time IS NOT NULL AND j.remarks_date_time IS NULL, j.cancel_reason_id,
+          IF(j.remarks_date_time IS NOT NULL AND j.cancel_date_time IS NULL, j.enum_reason_id, NULL)))
+  LEFT JOIN user_type ut ON ut.id = atr.user_type`;
+}
+
 function escalationColumns(want) {
   if (!want) return '';
   return `,
@@ -1949,6 +2077,13 @@ async function list({
   allowedStages,             // Job Stage Access — { mode:'all'|'list', stages }
   sortBy, sortDir,           // server-side sort — whitelisted column + asc|desc
   /*
+   * `view` — an opt-in PROJECTION selector, not a filter. 'manage' asks for the
+   * extra Manage Jobs columns (see manageColumns): three more joins, eight more
+   * scalar subqueries, and the two derived bucket labels. Absent for every other
+   * caller, which is the point — list() has a dozen of them.
+   */
+  view,
+  /*
    * `countOnly` (2026-08-26) — return { rows: [], total } and skip the data
    * query. For a caller that wants a TAB COUNT rather than a page: the count
    * then comes from this function's own WHERE, so a badge and the list it sits
@@ -1993,16 +2128,24 @@ async function list({
    * A URL carries booleans as text, so `isEscalated=false` arrives as the
    * STRING 'false', which is truthy — the one coercion worth spelling out.
    */
-  const wantsEscalation = isEscalated !== undefined && isEscalated !== ''
-    && isEscalated !== false && String(isEscalated) !== 'false' && String(isEscalated) !== '0';
+  const wantsManage = String(view || '') === 'manage';
+  /*
+   * The Rating column lives on tbl_easyfixer_rating_by_customer, the SAME row
+   * escalationColumns already resolves through MAX(table_id). Forcing that join
+   * on for this view reuses it instead of joining a table with a non-unique
+   * job_id twice — which would fan the list out.
+   */
+  const wantsEscalation = wantsManage || (isEscalated !== undefined && isEscalated !== ''
+    && isEscalated !== false && String(isEscalated) !== 'false' && String(isEscalated) !== '0');
   const listColumns =
     LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer, offerExpiry)
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
     // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
     // long-standing tbl_job column, so there is nothing to existence-probe.
     + JOB_AGE_COLUMNS
-    + escalationColumns(wantsEscalation);
-  const listJoin = LIST_JOIN + escalationJoin(wantsEscalation);
+    + escalationColumns(wantsEscalation)
+    + manageColumns(wantsManage, hasJobOffer);
+  const listJoin = LIST_JOIN + escalationJoin(wantsEscalation) + manageJoin(wantsManage);
 
   // Apply RBAC scope FIRST so any explicit clientId/cityId filter
   // narrows within the allowed set (caller can't widen scope by passing
@@ -2640,6 +2783,36 @@ async function list({
     ),
   ]);
   logger.info('Found ' + rows.length + ' jobs (total=' + total + ')');
+  /*
+   * Bucket + Bucket Status, derived HERE rather than on the client.
+   *
+   * These are ports of the legacy CRM's getHomeJobStatusbyStatusId (13 labels)
+   * and getJobCurrentStatusNew (~30 labels across six helpers, reading ~24
+   * fields). services/job-export.service.js already carries that port for the
+   * XLSX sheet's own Bucket / Bucket Status columns, so it is REUSED — a second
+   * implementation of a 43-label state machine would drift from the sheet the
+   * first time either changed, and the sheet is the reference operators
+   * reconcile against.
+   *
+   * Required lazily: job-export.service requires THIS module (for
+   * hasClientVerticalIdColumn), so a top-level require would close a cycle.
+   * Same pattern as the job-offer-push require in offerToTechnicians.
+   *
+   * FAIL-SOFT. A label is decoration; a throw here would 500 the whole jobs
+   * list. On failure the two fields come back null and the column renders blank.
+   */
+  if (wantsManage && rows.length) {
+    try {
+      const { homeJobStatus, jobCurrentStatus } = require('./job-export.service');
+      for (const r of rows) {
+        r.bucket = homeJobStatus(r.job_status, r.fk_easyfixter_id, r.sub_job_id);
+        r.bucket_status = jobCurrentStatus(r);
+      }
+    } catch (e) {
+      logger.warn('Bucket label derivation failed (columns render blank) · ' + ((e && e.message) || e));
+      for (const r of rows) { r.bucket = null; r.bucket_status = null; }
+    }
+  }
   return { rows, total };
 }
 

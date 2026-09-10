@@ -242,6 +242,14 @@ const listQuery = Joi.object({
    */
   sortBy: Joi.string().valid(...Object.keys(SORTABLE_COLUMNS)).optional(),
   sortDir: Joi.string().valid('asc', 'desc').optional(),
+  /*
+   * `view` selects a PROJECTION, not a filter — the only value is 'manage',
+   * which asks for the Manage Jobs grid's extra columns (see manageColumns in
+   * services/job.service.js). Declared here because validate() runs with
+   * stripUnknown: true, so an undeclared key would be silently dropped and the
+   * grid would render empty cells with no error anywhere.
+   */
+  view: Joi.string().valid('manage').optional(),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
 });
