@@ -3,7 +3,7 @@ const { pool } = require('../../db');
 const logger = require('../../logger');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
-const { assertEntityInScope } = require('../../lib/scope');
+const { assertEntityInScope, buildRequestScope, bypassesScope } = require('../../lib/scope');
 const kaleyra = require('../../services/kaleyra.service');
 const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
@@ -62,6 +62,76 @@ async function requireClickToCallAction(req, res, next) {
     }
     return next();
   } catch (e) { return next(e); }
+}
+
+/*
+ * ─── WHO MAY HEAR A CALL ──────────────────────────────────────────────
+ *
+ * The READ paths (/:id/status, /:id/recording, /:id/analysis, /:id/reanalyse)
+ * used to be owner-or-Admin, which left a supervisor unable to review the
+ * calls placed on their own jobs. The rule now is: you may hear a call if you
+ * PLACED it, or if its job is one you could already open.
+ *
+ * ⚠ INBOUND ROWS HAVE NO OWNER HERE. `caller_id` is a tbl_user id only on OUT
+ * rows; on IN rows the row records the CUSTOMER as the caller and the column
+ * carries their identifier, so comparing it to a user_id compares two
+ * different namespaces and can match by coincidence. isCallOwner is therefore
+ * false for anything that is not an outbound row, and an inbound call is
+ * reachable only through the job-scope arm below.
+ */
+function isCallOwner(req, row) {
+  if (String(row.call_type || '').toUpperCase() !== 'OUT') return false;
+  return row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
+}
+
+/*
+ * The read gate. Owner → job scope → deny, with TWO explicit deny arms that
+ * assertEntityInScope cannot express, both of which exist because that guard
+ * treats an ABSENT dimension as in-scope:
+ *
+ *   · A WILDCARD CLIENT SCOPE IS NOT A LICENCE TO HEAR EVERYTHING. Measured
+ *     2026-09-10 by the owner: ~31 of ~71 active dialers carry
+ *     manage_clients='0', so passing them to the job-scope arm would hand ~44%
+ *     of them every recording in the company. The counts drift; the rule does
+ *     not depend on them, and one wildcard holder would justify it. They keep
+ *     the owner arm; the scope arm is closed to them. Read from the PRE-FOLD
+ *     dimension (`entityClients`) — the one assertEntityInScope itself reads,
+ *     and the one that measurement counted. Reading the post-fold `clients`
+ *     would let exactly these users back in, since the verticals→clients fold
+ *     rewrites a wildcard into an allow-list.
+ *   · A ROW WITH NO JOB RESOLVES TO NO CLIENT, NO CITY, NO VERTICAL, so every
+ *     dimension is absent and the guard returns ok for everyone. jci.job_id is
+ *     nullable by construction (the customer/efr/spoc dial branches store no
+ *     job) and the legacy writer stores a 0 sentinel — so the job-less row is
+ *     the LEAST scoped, and would have been the most readable.
+ *
+ * Bypass roles (Admin / Finance) short-circuit both, exactly as they do
+ * everywhere else scope is enforced.
+ */
+async function callReadGuard(req, row) {
+  if (isCallOwner(req, row)) return { ok: true };
+  if (bypassesScope(req.userRole?.role_name)) return { ok: true };
+
+  const scope = buildRequestScope(req);
+  const clientsDim = scope && (scope.entityClients || scope.clients);
+  if (!clientsDim || clientsDim.mode === 'all') return { ok: false, reason: 'client scope is unrestricted' };
+
+  // 0 is the legacy sentinel for "no job", and Number(null) is 0 too — one
+  // test covers both.
+  const jobId = Number(row.job_id) || 0;
+  if (!jobId) return { ok: false, reason: 'call is not attached to a job' };
+
+  // Same three dimensions routes/admin/quotations.js resolves for a job.
+  const [[jf]] = await pool.query(
+    `SELECT j.fk_client_id AS client_id, ad.city_id, cl.vertical_id
+       FROM tbl_job j
+       LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+       LEFT JOIN tbl_client  cl ON cl.client_id  = j.fk_client_id
+      WHERE j.job_id = ? LIMIT 1`,
+    [jobId]
+  );
+  if (!jf) return { ok: false, reason: 'job not found' };
+  return assertEntityInScope(req, jf);
 }
 
 // ─── GET /config ─────────────────────────────────────────────────────
@@ -1081,7 +1151,7 @@ router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
     logger.info('Get call status · row=' + id);
 
     const [[row]] = await pool.query(
-      `SELECT job_caller_info AS id, caller_id, caller_status,
+      `SELECT job_caller_info AS id, caller_id, call_type, job_id, caller_status,
               start_time, end_time, duration, provider
          FROM tbl_job_caller_info
         WHERE job_caller_info = ?
@@ -1091,14 +1161,10 @@ router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
     if (!row) logger.warn('Call status · row not found · row=' + id);
     if (!row) return modernError(res, 404, 'call not found');
 
-    // Authorize: the operator who placed it, or an Admin. role group is on the
-    // parent router (role(['admin'])); the Admin role_id is 2. Anyone else may
-    // only read their own call rows.
-    const isOwner = row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
-    const isAdmin = Number(req.user.user_role) === 2; // role_id 2 = Admin (CLAUDE.md role model)
-    if (!isOwner && !isAdmin) {
-      logger.warn('Call status denied · not owner/admin · row=' + id);
-      return modernError(res, 403, 'You can only view the status of calls you placed');
+    const guard = await callReadGuard(req, row);
+    if (!guard.ok) {
+      logger.warn('Call status denied · row=' + id + ' · ' + guard.reason);
+      return modernError(res, 403, 'You do not have access to this call');
     }
 
     const status = row.caller_status || null;
@@ -1355,18 +1421,17 @@ router.get('/:id/recording', requireClickToCallAction, async (req, res, next) =>
     logger.info('Get call recording · row=' + id);
 
     const [[row]] = await pool.query(
-      `SELECT job_caller_info AS id, caller_id, provider, unique_id, recording
+      `SELECT job_caller_info AS id, caller_id, call_type, job_id, provider, unique_id, recording
          FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1`,
       [id]
     );
     if (!row) return modernError(res, 404, 'call not found');
 
-    // Authorize: the operator who placed it, or an Admin (role_id 2). Same rule
-    // as GET /:id/status.
-    const isOwner = row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
-    const isAdmin = Number(req.user.user_role) === 2;
-    if (!isOwner && !isAdmin) {
-      return modernError(res, 403, 'You can only listen to recordings of calls you placed');
+    // Same rule as GET /:id/status — see callReadGuard.
+    const guard = await callReadGuard(req, row);
+    if (!guard.ok) {
+      logger.warn('Call recording denied · row=' + id + ' · ' + guard.reason);
+      return modernError(res, 403, 'You do not have access to this call');
     }
 
     // A Kaleyra row stores an https:// recording URL directly — hand it back.
@@ -1454,6 +1519,25 @@ router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => 
       logger.warn('Get call analysis rejected · invalid mode · row=' + id);
       return modernError(res, 400, "mode must be 'transcript' or 'recording'.");
     }
+
+    /*
+     * This route had NO row gate at all — it served the LLM's prose account of
+     * a private conversation to anyone holding isClickToCall, while the audio
+     * it summarises was owner-gated two routes up. Adding the gate is a
+     * narrowing, and deliberate. It runs before the column probes so a denied
+     * caller learns nothing about the row or the environment.
+     */
+    const [[jci]] = await pool.query(
+      'SELECT caller_id, call_type, job_id FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1',
+      [id]
+    );
+    if (!jci) return modernError(res, 404, 'call not found');
+    const guard = await callReadGuard(req, jci);
+    if (!guard.ok) {
+      logger.warn('Call analysis denied · row=' + id + ' · ' + guard.reason);
+      return modernError(res, 403, 'You do not have access to this call');
+    }
+
     const modeAvailable = analysisMode.modeAvailable();
     const resolved = analysisMode.resolveMode(override);
 
@@ -1557,17 +1641,21 @@ router.post('/:id/reanalyse', requireClickToCallAction, async (req, res, next) =
     }
 
     const [[jci]] = await pool.query(
-      'SELECT caller_id FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1',
+      'SELECT caller_id, call_type, job_id FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1',
       [id]
     );
     if (!jci) return modernError(res, 404, 'call not found');
-    // Stronger gate than the read: this re-requests a PAID transcription, spends
-    // an LLM round-trip and rewrites the caller's rollup score. Same owner-or-admin
-    // rule the other per-call actions (/:id/recording, /:id/hangup) already use.
-    const isOwner = jci.caller_id != null && Number(jci.caller_id) === Number(req.user.user_id);
-    const isAdmin = Number(req.user.user_role) === 2;
-    if (!isOwner && !isAdmin) {
-      return modernError(res, 403, 'You can only re-analyse calls you placed');
+    /*
+     * Same gate as the read it re-runs. It DOES spend a paid transcription and
+     * an LLM round-trip, so it costs more than a read — but what it exposes is
+     * the read's payload, and it rewrites only the analysis the reader would
+     * already be shown. Gating it harder than /:id/analysis would leave the
+     * cheaper route as the wider door.
+     */
+    const guard = await callReadGuard(req, jci);
+    if (!guard.ok) {
+      logger.warn('Re-analyse denied · row=' + id + ' · ' + guard.reason);
+      return modernError(res, 403, 'You do not have access to this call');
     }
 
     const hasAnalysis = await hasAnalysisColumn();
@@ -2090,6 +2178,21 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
       `SELECT COUNT(*) AS total FROM tbl_job_caller_info jci ${plivoJoin} ${whereSql}`,
       params
     );
+    /*
+     * ⚠ has_recording, NEVER jci.recording RAW.
+     *
+     * On a Kaleyra row that column holds a plain https recording URL, so this
+     * list — gated by role alone — was handing every caller a direct, un-gated
+     * link to the audio. That made it a WIDER door than GET /:id/recording,
+     * the route that actually adjudicates who may hear a call (callReadGuard),
+     * and widening one while the other stays open fixes nothing.
+     *
+     * A boolean is all the affordance needs: the list answers "does audio
+     * exist for this row", and "may THIS viewer hear it" stays the recording
+     * route's question, asked on click. Two FE readers took the raw string —
+     * CallHistoryButton (presence test) and ClickToCallTab (renders it as the
+     * Play href) — and both must move to has_recording.
+     */
     const [rows] = await pool.query(
       `SELECT jci.job_caller_info AS id,
               jci.job_id,
@@ -2106,7 +2209,7 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
               jci.duration,
               jci.caller_status,
               jci.reciever_status AS receiver_status,
-              jci.recording,
+              (jci.recording IS NOT NULL AND jci.recording <> '') AS has_recording,
               jci.location,
               jci.provider,
               jci.inserted_time,

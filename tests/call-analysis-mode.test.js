@@ -178,7 +178,17 @@ test('llm_disabled is reported distinctly from a failed generation', async () =>
 function baseRoutes({ cachedAnalysis = null } = {}) {
   return [
     [/SHOW COLUMNS FROM tbl_plivo_call_log/i, [{ Field: 'x' }]],
-    [/SELECT caller_id\s+FROM tbl_job_caller_info/i, [{ caller_id: 7 }]],
+    /*
+     * Matched on the TABLE, not the projection (2026-09-10). The route's
+     * SELECT gained job_id and call_type when the read guard moved from an
+     * inline owner check to callReadGuard, and a regex pinned to the old
+     * column list stopped matching — so the fake pool returned no row and the
+     * handler 404'd where the test expected 403. A fixture that pins a
+     * projection breaks every time a column is added; pinning the table does
+     * not. call_type 'OUT' keeps the owner arm reachable; job_id null makes
+     * these rows job-less, which is what they have always been.
+     */
+    [/FROM tbl_job_caller_info/i, [{ caller_id: 7, call_type: 'OUT', job_id: null }]],
     [/SELECT transcription, transcription_status/i, [{
       transcription: TRANSCRIPT, transcription_status: 'completed',
       call_uuid: 'uuid-1', caller_user_id: 7,
@@ -193,7 +203,18 @@ function baseRoutes({ cachedAnalysis = null } = {}) {
 function drive(router, { method = 'GET', url, user }) {
   return new Promise((resolve, reject) => {
     const q = url.includes('?') ? Object.fromEntries(new URLSearchParams(url.split('?')[1])) : {};
-    const req = { method, url, user, body: {}, query: q, headers: {} };
+    const req = {
+      method, url, user, body: {}, query: q, headers: {},
+      /*
+       * userRole, not just user (2026-09-10). Production sets this at
+       * middleware/role.js:59 via role(['admin']); these tests hand-build req
+       * and never did, so once the guard started asking bypassesScope() for a
+       * ROLE NAME, Admin stopped bypassing and every admin case 403'd. A
+       * hand-built request only carries what the test remembers to add, and
+       * what the middleware chain contributes is easy to forget.
+       */
+      userRole: { role_id: user.user_role, role_name: user.user_role === 2 ? 'Admin' : 'Executive Supply', role_status: 1 },
+    };
     const res = {
       statusCode: 200,
       body: null,
