@@ -155,6 +155,9 @@ router.get('/reschedule-reasons', async (_req, res, next) => {
   try { logger.info('Lookup reschedule-reasons'); modernOk(res, await cached('lookup:reschedule-reasons', TTL_STATIC, () => lookup.rescheduleReasons())); } catch (e) { next(e); }
 });
 
+router.get('/cannot-complete-reasons', async (_req, res, next) => {
+  try { logger.info('Lookup cannot-complete-reasons'); modernOk(res, await cached('lookup:cannot-complete-reasons', TTL_STATIC, () => lookup.cannotCompleteReasons())); } catch (e) { next(e); }
+});
 router.get('/reject-reasons',     async (_req, res, next) => {
   try { logger.info('Lookup reject-reasons'); modernOk(res, await cached('lookup:reject-reasons', TTL_STATIC, () => lookup.rejectReasons())); } catch (e) { next(e); }
 });

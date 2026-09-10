@@ -685,6 +685,43 @@ async function rejectReasons() {
   return rows;
 }
 
+/*
+ * "Can't complete today" — why the technician cannot finish the job on this
+ * visit. action_type 26, user_type 4 (Technician), the app-facing bucket:
+ * "Site is not ready", "Customer not responding", "Product is not delivered",
+ * "I Reached Late" and so on.
+ *
+ * NOT `rescheduleReasons()` above, which serves action_type 8 — a bucket that
+ * deliberately mixes customer/tech/ops perspectives and is written from the
+ * operator's chair ("SM is not available", "Postponed By EASYFix"). A
+ * technician standing in a customer's flat cannot answer that list.
+ *
+ * NOT `revisitReasons()` below either: that is a different four-row table
+ * (revisit_reason_by_app) reached by tbl_job.revisit_reason_id.
+ *
+ * The id is stored on tbl_job.reschedule_reason_id, which already holds ids
+ * from THIS bucket — 245 jobs carry 263 "Customer want a reschedule", 73 carry
+ * 262, 23 carry 264 — so the destination is established and this endpoint only
+ * closes the loop by letting the app offer the same list those rows came from.
+ *
+ * One caution for whoever reads reschedule_reason_id back: it is resolved
+ * against action_taken_reason in some places and against reschedule_reason_app
+ * in others (webhook.service.js:178), and those two id spaces OVERLAP at 1–4.
+ * Every id this endpoint can return is >= 262, so nothing served here can land
+ * in the ambiguous range.
+ */
+async function cannotCompleteReasons() {
+  logger.info('Lookup cannot-complete reasons');
+  const [rows] = await pool.query(
+    `SELECT id, action_desc AS reason
+       FROM action_taken_reason
+      WHERE action_type = 26 AND user_type = 4 AND status = 1 AND is_new = 1
+      ORDER BY action_desc ASC`
+  );
+  logger.info(`Found ${rows.length} cannot-complete reasons`);
+  return rows;
+}
+
 // Checkout-flow reasons each live in their own thin (id, reason) table — no
 // status column, so every row is active. FK targets: tbl_job.problem_reason_id,
 // .collect_cash_reason_id, .revisit_reason_id respectively.
@@ -761,6 +798,7 @@ module.exports = {
   cancelReasons,
   rescheduleReasons,
   rejectReasons,
+  cannotCompleteReasons,
   problemReasons,
   collectCashReasons,
   revisitReasons,
