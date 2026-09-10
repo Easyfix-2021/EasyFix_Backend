@@ -159,8 +159,23 @@ async function createLoginOtp(identifier) {
   // and mobile from the SPOC record, so legacy partial rows can never match
   // a future verify. See auth.service.js for the full rationale.
   const [[existing]] = await pool.query(
+    /*
+     * <=> and not =, for the reason spelled out in services/auth.service.js:
+     * binding NULL to `user_mobile_no = ?` yields a predicate that is never
+     * true, so the lookup misses the row it just wrote — every request appends
+     * another and verification answers "no active code". That locked CRM staff
+     * with no mobile out of the CRM entirely on 2026-09-10.
+     *
+     * LATENT here rather than live: tbl_client_contacts.contact_no is nullable
+     * but 0 of 2,591 QA SPOCs have it NULL, so no client has hit it yet. Fixed
+     * with the CRM path because it is the same defect one row away from being
+     * reachable, and the symptom — a valid code rejected as absent — gives an
+     * operator nothing to go on. services/action-otp.service.js already used
+     * <=>; only these two lookups were missed.
+     */
     `SELECT id FROM otp_details
-      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Client_login'
+      WHERE user_email <=> ? AND user_mobile_no <=> ? AND otp_type = 'Client_login'
+      ORDER BY generated_on DESC, id DESC
       LIMIT 1`,
     [spoc.contact_email, spoc.contact_no]
   );
@@ -211,7 +226,8 @@ async function verifyLoginOtp(identifier, otp) {
   // AND-ing both columns ensures partial legacy rows never get returned.
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired FROM otp_details
-      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Client_login'
+      WHERE user_email <=> ? AND user_mobile_no <=> ? AND otp_type = 'Client_login'
+      ORDER BY generated_on DESC, id DESC
       LIMIT 1`,
     [spoc.contact_email, spoc.contact_no]
   );

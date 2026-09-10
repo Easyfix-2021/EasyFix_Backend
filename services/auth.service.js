@@ -255,17 +255,33 @@ async function createLoginOtp(identifier) {
   const now = new Date();
   const expires = otpExpiryDate(now);
 
-  // Single-row-per-(email, mobile, otp_type) model. We look up by ALL THREE
-  // fields together so:
-  //   • a mobile reassigned to a different email gets its own row (no false reuse),
-  //   • legacy partial rows that have only email OR only mobile (set during the
-  //     old per-request-INSERT regime, or imported from prior tools) cannot match
-  //     and therefore can never collide with new auth flows.
-  // Always write BOTH email AND mobile from the user record on every UPSERT —
-  // never just one — so the (email, mobile, otp_type) tuple stays meaningful.
+  /*
+   * Single-row-per-(email, mobile, otp_type) model, matched with <=> and NOT =.
+   *
+   * `=` LOCKED OUT EVERY USER WITH NO MOBILE NUMBER (2026-09-10). tbl_user
+   * .mobile_no is nullable and 7 active QA users / at least one production user
+   * have it NULL. Binding NULL to `user_mobile_no = ?` renders the predicate
+   * `user_mobile_no = NULL`, which is NULL — never true — so:
+   *   • this lookup missed the row it had itself just written, and every
+   *     login-otp request INSERTed another one (the tell: `count` stayed 1 on
+   *     every row, because the UPDATE branch below never ran, and `created_on`
+   *     stayed NULL because only the INSERT omits it);
+   *   • verifyLoginOtp's identical lookup missed too, so the user was told
+   *     "no active OTP — request one first" while staring at a valid, unexpired
+   *     code. They could not log in at all, and never would have.
+   *
+   * <=> is null-safe equality: NULL <=> NULL is true, NULL <=> '9810…' is
+   * false. So it fixes the NULL case while PRESERVING the original intent —
+   * a legacy partial row (email set, mobile NULL) still cannot match a user
+   * who has a mobile, and vice versa. The protection was never in the `=`.
+   *
+   * Still write BOTH email and mobile from the user record on every upsert, so
+   * the tuple stays meaningful.
+   */
   const [[existing]] = await pool.query(
     `SELECT id FROM otp_details
-      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'crm_login'
+      WHERE user_email <=> ? AND user_mobile_no <=> ? AND otp_type = 'crm_login'
+      ORDER BY generated_on DESC, id DESC
       LIMIT 1`,
     [user.official_email, user.mobile_no]
   );
@@ -379,15 +395,22 @@ async function verifyLoginOtp(identifier, otp) {
   const user = await findActiveUserByIdentifier(identifier);
   if (!user) return { ok: false, reason: 'USER_NOT_FOUND' };
 
-  // Match the same (email, mobile, otp_type) tuple createLoginOtp wrote
-  // against. AND-ing both columns ensures legacy partial rows (rows that
-  // had only email or only mobile) never get returned here — they simply
-  // can't satisfy the predicate. Single-row-per-tuple model means LIMIT 1
-  // is redundant in the happy path but kept as a safety net.
+  /*
+   * The same tuple createLoginOtp wrote, matched the same null-safe way — see
+   * the comment there for why `=` locked out every user with a NULL mobile.
+   *
+   * ORDER BY is not decoration. While the bug was live, each request appended
+   * another row, so affected users now hold a PILE of crm_login rows. LIMIT 1
+   * with no ordering lets MySQL return any of them: fixing only the match
+   * would have swapped "no active OTP" for an equally unloggable
+   * OTP_MISMATCH against a stale code. Newest wins, deterministically, and
+   * that stays correct once the backlog is cleaned up.
+   */
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired
        FROM otp_details
-      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'crm_login'
+      WHERE user_email <=> ? AND user_mobile_no <=> ? AND otp_type = 'crm_login'
+      ORDER BY generated_on DESC, id DESC
       LIMIT 1`,
     [user.official_email, user.mobile_no]
   );
