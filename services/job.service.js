@@ -369,6 +369,35 @@ function jobOfferability(jobRow) {
   return { offerable: true, reason: null, releasesOwner: owned, claimableNow: !owned };
 }
 
+/*
+ * ─── ASSIGNABILITY IS A DIFFERENT QUESTION ─────────────────────────────────
+ *
+ * A sibling of jobOfferability, deliberately NOT the same function, because
+ * /offer and /assign refuse different sets and one flag cannot serve both.
+ * Offering requires BOOKED. Direct assignment refuses only the CLOSED states
+ * (NON_ASSIGNABLE_STATES = completed / completed-alt / cancelled) — assign()
+ * happily moves a SCHEDULED or IN_PROGRESS job to another technician.
+ *
+ * Reusing `offerable` for the Assign / Reassign modal would have BROKEN
+ * reassign outright: reassign operates on a SCHEDULED job, and `offerable` is
+ * false for every status but BOOKED.
+ *
+ * Scope: this answers the SERVER's refusal only. The Assign / Reassign modal
+ * additionally narrows to exactly BOOKED (assign) or exactly SCHEDULED
+ * (reassign) — a product rule about which entry point applies, stricter than
+ * the server and deliberately so (deep-link hardening). That narrowing stays
+ * in the modal; what belongs here is the refusal the modal cannot know about.
+ */
+function jobAssignability(jobRow) {
+  // Same NaN-for-absence discipline as jobOfferability: Number(null) is 0, and
+  // 0 is a real status, so a missing row must not be scored as a live one.
+  const raw = jobRow == null ? null : jobRow.job_status;
+  const status = raw == null ? NaN : Number(raw);
+  if (!Number.isFinite(status)) return { assignable: false, reason: 'unknown_status' };
+  if (NON_ASSIGNABLE_STATES.has(status)) return { assignable: false, reason: 'job_closed' };
+  return { assignable: true, reason: null };
+}
+
 // ─── Job Age ────────────────────────────────────────────────────────
 /*
  * JOB AGE — elapsed time from ticket creation to the job's TERMINAL event, or
@@ -5623,7 +5652,9 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
       err.code = 'JOB_ASSIGNMENT_CHANGED';
       throw err;
     }
-    if (NON_ASSIGNABLE_STATES.has(Number(lockedJob.job_status))) {
+    // Same predicate GET /:id/candidates answers with, so the Assign /
+    // Reassign modal's button and this guard cannot disagree.
+    if (!jobAssignability(lockedJob).assignable) {
       const err = new Error('completed or cancelled jobs cannot be assigned');
       err.status = 409;
       err.code = 'JOB_NOT_ASSIGNABLE';
@@ -6860,6 +6891,10 @@ module.exports = {
   // The ONE offerability predicate. Exported so GET /:id/candidates answers
   // with the same rule offerToTechnicians enforces — see its comment.
   jobOfferability,
+  // Its sibling for /assign, which refuses a DIFFERENT set. Two predicates, not
+  // one flag: see jobAssignability's comment for why merging them breaks
+  // reassign.
+  jobAssignability,
   // The 30-min offer window. Exported so the offer-REMINDER cron can bound its
   // re-push window by the same constant instead of re-declaring it and drifting.
   OFFER_TTL_MINUTES,

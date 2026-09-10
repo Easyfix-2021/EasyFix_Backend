@@ -269,12 +269,22 @@ router.get('/:id/candidates',
        * already issues for the header.
        */
       const offerability = job.jobOfferability(req.scopedJob);
+      /*
+       * ASSIGNABILITY too, from its own predicate. The Assign / Reassign modal
+       * reads the same /candidates payload, and /assign refuses a DIFFERENT set
+       * from /offer — only the closed states, so a SCHEDULED job is assignable
+       * while never being offerable. One flag for both would have made every
+       * reassign look refused.
+       */
+      const assignability = job.jobAssignability(req.scopedJob);
       logger.info('Returning ' + (result?.candidates?.length || 0) + ' ranked candidates · jobId=' + req.params.id + ' offerFlow=' + offerFlowEnabled + ' offerable=' + offerability.offerable + (result?.note ? ' note=' + result.note : ''));
       modernOk(res, {
         ...result,
         offerFlowEnabled,
         offerable: offerability.offerable,
         offerBlockReason: offerability.reason,
+        assignable: assignability.assignable,
+        assignBlockReason: assignability.reason,
       });
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);

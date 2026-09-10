@@ -1,7 +1,7 @@
 'use strict';
 /*
- * ONE offerability predicate — job.jobOfferability — read by both the offer
- * guard and GET /admin/jobs/:id/candidates.
+ * TWO predicates, not one flag — job.jobOfferability and job.jobAssignability —
+ * each read by its own guard and both answered on GET /admin/jobs/:id/candidates.
  *
  * ─── WHY THIS EXISTS (2026-09-10) ──────────────────────────────────────────
  *
@@ -195,9 +195,98 @@ test('RUNTIME: GET /:id/candidates answers with the helper, for both verdicts', 
     const completed = await call({ job_id: 7, job_status: 3, fk_easyfixter_id: 8455 });
     assert.equal(completed.offerable, false, 'the negative verdict must reach the body too');
     assert.equal(completed.offerBlockReason, 'not_booked');
+
+    /*
+     * BOTH verdicts, and they must not track each other. A SCHEDULED job is the
+     * cell that separates them: not offerable, but assignable — which is what
+     * the Assign / Reassign modal reads. One payload, two independent answers.
+     */
+    assert.equal(booked.assignable, true);
+    assert.equal(booked.assignBlockReason, null);
+    const scheduled = await call({ job_id: 7, job_status: 1, fk_easyfixter_id: 8455 });
+    assert.equal(scheduled.offerable, false, 'SCHEDULED is not offerable');
+    assert.equal(scheduled.assignable, true, 'yet it IS assignable — every reassign depends on it');
+    assert.equal(completed.assignable, false, 'a closed job is neither');
+    assert.equal(completed.assignBlockReason, 'job_closed');
   } finally {
     ranking.rankCandidatesForJob = realRank;
     job.expireStaleOffers = realExpire;
     job.isOfferFlowActive = realActive;
   }
+});
+
+/* ─── ASSIGNABILITY: the sibling predicate, and why it is not the same one ── */
+
+/*
+ * NON_ASSIGNABLE_STATES is not exported, so the expected set is composed from
+ * the exported STATUS constants the production code composes it from — an
+ * independent derivation, not a restatement of 3/5/6.
+ */
+const CLOSED = new Set([job.STATUS.COMPLETED, job.STATUS.COMPLETED_ALT, job.STATUS.CANCELLED]);
+
+test('THE POINT: a SCHEDULED job is assignable and NOT offerable', () => {
+  /*
+   * The load-bearing test of the whole split. /offer requires BOOKED; /assign
+   * refuses only the closed states. Every REASSIGN operates on a SCHEDULED job,
+   * so serving the Assign / Reassign modal from `offerable` — which was the
+   * obvious-looking migration — would have made every reassign read as refused
+   * while the server was perfectly willing.
+   */
+  const scheduled = { job_status: job.STATUS.SCHEDULED, fk_easyfixter_id: 8455 };
+  assert.equal(job.jobOfferability(scheduled).offerable, false,
+    'a SCHEDULED job is not offerable — assign() owns that reassign, with its reschedule reason');
+  assert.equal(job.jobAssignability(scheduled).assignable, true,
+    'but it IS assignable; collapsing the two flags breaks every reassign');
+});
+
+test('EQUIVALENCE: !assignable is exactly the closed-state set the guard refused', () => {
+  const statuses = [...job.ALL_STATUS_VALUES];
+  assert.ok(statuses.length >= 8, `expected the declared status set, got ${statuses.length}`);
+  let refused = 0;
+  let allowed = 0;
+  for (const job_status of statuses) {
+    for (const fk_easyfixter_id of [null, 8455]) {
+      const wouldRefuse = CLOSED.has(Number(job_status));
+      const doesRefuse = !job.jobAssignability({ job_status, fk_easyfixter_id }).assignable;
+      assert.equal(doesRefuse, wouldRefuse,
+        `status ${job_status}: guard used to ${wouldRefuse ? 'REFUSE' : 'ALLOW'}, predicate now `
+        + `${doesRefuse ? 'REFUSES' : 'ALLOWS'}`);
+      if (doesRefuse) refused += 1; else allowed += 1;
+    }
+  }
+  // Positive control on the matrix itself.
+  assert.ok(refused > 0 && allowed > 0,
+    `the matrix must exercise both outcomes; got ${refused} refused / ${allowed} allowed`);
+});
+
+test('assignability ignores ownership entirely', () => {
+  // Unlike offerability, an owner is irrelevant here: assign() replaces one.
+  // A predicate that refused an owned job would break reassign a second way.
+  for (const fk_easyfixter_id of [null, 0, 8455]) {
+    assert.equal(job.jobAssignability({ job_status: 0, fk_easyfixter_id }).assignable, true);
+    assert.equal(job.jobAssignability({ job_status: 1, fk_easyfixter_id }).assignable, true);
+  }
+});
+
+test('a closed job is refused with a machine-readable reason, and a missing row fails CLOSED', () => {
+  for (const s of CLOSED) {
+    const a = job.jobAssignability({ job_status: s, fk_easyfixter_id: 8455 });
+    assert.equal(a.assignable, false, `status ${s} must be refused`);
+    assert.equal(a.reason, 'job_closed', 'the CRM renders copy off this code');
+  }
+  for (const bad of [null, undefined, {}, { job_status: null }, { job_status: 'DONE' }]) {
+    const a = job.jobAssignability(bad);
+    assert.equal(a.assignable, false, `${JSON.stringify(bad)} must fail closed`);
+    assert.equal(a.reason, 'unknown_status');
+  }
+});
+
+test('the ASSIGN guard calls the helper and no longer carries its own condition', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'services/job.service.js'), 'utf8');
+  assert.match(src, /if \(!jobAssignability\(lockedJob\)\.assignable\) \{\s*\n\s*const err = new Error\('completed or cancelled jobs cannot be assigned/,
+    'the JOB_NOT_ASSIGNABLE guard must be computed from jobAssignability(...)');
+  assert.ok(
+    !/NON_ASSIGNABLE_STATES\.has\(Number\(lockedJob\.job_status\)\)/.test(src),
+    'the old inline condition must be GONE — two copies is the bug both predicates exist to remove',
+  );
 });
