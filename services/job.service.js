@@ -631,11 +631,17 @@ const LIST_COLUMNS = `
    * COALESCE picks whichever ask is live. A job that has been both at
    * different times resolves the CANCEL reason first because a cancel ask is
    * the one that stops work.
+   *
+   * cancel_date_time and reschedule_at_app are the per-ask raise stamps, and
+   * are deliberately NOT coalesced into one column: the row is labelled with
+   * the moment the ask being SHOWN was raised, so a job rescheduled last month
+   * and cancel-asked today cannot be dated to last month.
    */
   (COALESCE(j.is_cancelled_by_app, 0) = 1)   AS is_cancelled_by_app,
   (COALESCE(j.is_rescheduled_by_app, 0) = 1) AS is_rescheduled_by_app,
   j.reschedule_date_time_app,
   j.cancel_date_time,
+  j.reschedule_at_app,
   COALESCE(
     (SELECT atr.action_desc FROM action_taken_reason atr
       WHERE COALESCE(j.is_cancelled_by_app, 0) = 1
