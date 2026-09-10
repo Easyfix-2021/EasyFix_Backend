@@ -436,6 +436,10 @@ test('RBAC scope alone can never lift a guard', () => {
  */
 const SAMPLE = {
   q: 'ravi',
+  // A CSV, not a bare id: the validator accepts both and normalises to
+  // number[], and the CSV shape is the one that would break a predicate built
+  // with `= ?` instead of `IN (…)`.
+  jobIds: '500043,500044',
   status: 3,
   statuses: '3,5',
   assigned: 'false',

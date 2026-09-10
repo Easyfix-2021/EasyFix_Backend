@@ -623,6 +623,7 @@ const FILTER_COVERAGE = Object.freeze({
   statuses:         ['filter',   'J.job_status IN (…); wins over status, as in list()'],
   assigned:         ['filter',   'J.fk_easyfixter_id IS [NOT] NULL'],
   noServices:       ['filter',   'job_status = 0 + NOT EXISTS an active tbl_job_services row'],
+  jobIds:           ['filter',   'J.job_id IN (…) — csvIds, normalised to number[] by the validator'],
   clientId:         ['filter',   'J.fk_client_id IN (…) — csvIds, single id OR CSV'],
   cityId:           ['filter',   'A.city_id IN (…) — csvIds; the ADDRESS column, as in list()'],
   projectManagerId: ['filter',   'EXISTS tbl_vertical_mapping with user_type = 1'],
@@ -793,7 +794,7 @@ function buildClauses(filters = {}) {
     // ── Shared names: identical meaning in both vocabularies ────────────────
     easyfixerId, ownerId, cityId, stateId, zonalId, rating,
     // ── CRM UI / listQuery vocabulary (see FILTER_COVERAGE) ─────────────────
-    q, statuses, assigned, noServices, clientId, projectManagerId, zonalManagerId,
+    q, statuses, assigned, noServices, jobIds, clientId, projectManagerId, zonalManagerId,
     customerId, customerQ, clientRef, efrMobile, pin, categoryId, verticalId,
     sourceType, reopen, dueTo, startDate, endDate, quotationStatus, requestedBefore,
     // ── RBAC, attached by the route ─────────────────────────────────────────
@@ -1029,6 +1030,20 @@ function buildClauses(filters = {}) {
   }
 
   // ── Dimension filters: they narrow, they do not bound ─────────────────────
+  /*
+   * jobIds — Manage Jobs' Job Id box, the same param its LIST sends.
+   *
+   * Wired here as well as in list() because the export is reached from that
+   * same filter bar: filtering to one job and pressing Export would otherwise
+   * ignore the filter and hand back every row, which is a far worse answer than
+   * an error. The legacy `jobsId` above stays — it is a different param, takes
+   * a single value and understands REF ids.
+   */
+  const jobIdList = toIdArray(jobIds);
+  if (jobIdList.length) {
+    push(`J.job_id IN (${jobIdList.map(() => '?').join(',')})`, ...jobIdList);
+  }
+
   // clientId (csvIds: single id OR CSV) and the legacy single-id form. Both
   // land on J.fk_client_id, and both narrow WITHIN the clients scope above.
   const clientIdList = toIdArray(clientId);

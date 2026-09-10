@@ -108,6 +108,26 @@ const listQuery = Joi.object({
   offerState: Joi.string().valid(...OFFER_STATE_VALUES).allow('').optional(),
   // clientId / cityId — single id OR CSV list (Pending-to-Start multi-select
   // Clients / Cities filters). csvIds keeps a lone id valid for back-compat.
+  /*
+   * jobIds — Manage Jobs' "Job Id" box (2026-09-10, per ops).
+   *
+   * That page's Quick Search used to go out as `q`, which matches eleven
+   * columns, so typing a job id returned the job PLUS every row whose customer,
+   * mobile, client or technician happened to contain those digits. Ops wanted
+   * the id to mean the id.
+   *
+   * `q` is NOT narrowed: My Orders sends it from two places and relies on the
+   * multi-field behaviour. This is a separate param, so one page changes and
+   * the other is untouched.
+   *
+   * NORMALISED TO number[] HERE, not in the service. services/job.service.js
+   * already builds `j.job_id IN (...)` from a jobIds array — the capability
+   * existed and was simply never exposed on this endpoint — but it guards on
+   * Array.isArray, so a bare int or CSV string would be silently ignored and
+   * the filter would appear to do nothing. Converting at the edge means the
+   * service needs no change at all.
+   */
+  jobIds: csvIds.optional().custom((value) => String(value).split(',').map(Number)),
   clientId: csvIds.optional(),
   cityId: csvIds.optional(),
   // projectManagerId — the client's mapped PM in tbl_vertical_mapping
