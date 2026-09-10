@@ -37,14 +37,30 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 const SRC = fs.readFileSync(path.join(ROOT, 'services/job.service.js'), 'utf8');
 
-/** Evaluate one of the module's pure SQL-fragment builders in isolation. */
+/*
+ * Evaluate one of the module's pure SQL-fragment builders in isolation.
+ *
+ * The module-scope constants a fragment interpolates have to be injected, or
+ * the sandbox throws ReferenceError — which is how this helper failed the
+ * moment manageJoin started reading JOB_OPEN_REASON_PICK. Read out of the
+ * source rather than retyped, so the value under test is the shipped one.
+ */
+const MODULE_CONSTS = {
+  JOB_OPEN_REASON_PICK: (SRC.match(/const JOB_OPEN_REASON_PICK = `([\s\S]*?)`;/) || [])[1],
+};
+
 function fragment(name, ...args) {
   const m = SRC.match(new RegExp(`function ${name}\\(([^)]*)\\) \\{[\\s\\S]*?\\n\\}`));
   assert.ok(m, `${name} must exist in services/job.service.js`);
   const params = m[1].split(',').map((p) => p.trim().split('=')[0].trim()).filter(Boolean);
   const body = m[0].replace(new RegExp(`^function ${name}\\([^)]*\\) \\{`), '').replace(/\n\}$/, '');
+  const constNames = Object.keys(MODULE_CONSTS);
+  for (const c of constNames) {
+    assert.ok(MODULE_CONSTS[c], `${c} must be readable from the source — the sandbox needs it`);
+  }
   // eslint-disable-next-line no-new-func
-  return new Function(...params, body)(...args);
+  return new Function(...constNames, ...params, body)(
+    ...constNames.map((c) => MODULE_CONSTS[c]), ...args);
 }
 
 const aliases = (sql) => (sql.match(/AS ([a-z_]+)/g) || []).map((a) => a.slice(3));
@@ -222,4 +238,96 @@ test('the two newly-rendered sortable columns are whitelisted', () => {
   assert.equal(SORTABLE_COLUMNS.ticket_created_date_time, 'j.ticket_created_date_time');
   assert.equal(SORTABLE_COLUMNS.service_category, 'sc.service_catg_name');
   assert.ok(SORTABLE_COLUMNS.age, 'and Age, the default sort, must still be there');
+});
+
+/* ─── the dueTo FILTER and the Open Due to COLUMN are one axis ──────────── */
+
+test('the filter and the column read the SAME reason pick', () => {
+  /*
+   * They were two different rules until 2026-09-10. The column read
+   * user_type.type through a reason FK; the filter matched PROSE in j.remarks
+   * ("Due To: Client", or a loose "due to client"). An operator filtered one
+   * population and read another — and not marginally: measured on the shared
+   * database (481,048 jobs) the filter matched 17 rows across all four parties
+   * while the column's axis resolved for 269,206.
+   *
+   * One interpolated constant with two readers is what makes them agree by
+   * construction rather than by review.
+   */
+  assert.match(SRC, /const JOB_OPEN_REASON_PICK = `/, 'the pick must be one constant');
+  const readers = [...SRC.matchAll(/\$\{JOB_OPEN_REASON_PICK\}/g)];
+  assert.equal(readers.length, 2,
+    `the pick has ${readers.length} readers; expected exactly 2 — the column's join and the filter`);
+  /*
+   * Against the SOURCE, not the evaluated fragment: fragment() injects the
+   * constant, so the returned SQL carries the expanded IF(...) rather than the
+   * ${...} reference. Asserting on the evaluated string would have been
+   * checking my own sandbox, not the code.
+   */
+  assert.match(SRC, /LEFT JOIN action_taken_reason atr ON atr\.id = \$\{JOB_OPEN_REASON_PICK\}/,
+    'the column must read it');
+  const dueToBlock = SRC.slice(SRC.indexOf('  if (dueTo) {'));
+  assert.match(dueToBlock.slice(0, dueToBlock.indexOf('\n  }')), /\$\{JOB_OPEN_REASON_PICK\}/,
+    'and so must the filter');
+});
+
+test('the filter no longer matches PROSE', () => {
+  // The structured "[… Pending Due To: X …]" prefix was dropped from the
+  // writer on 2026-06-04, so that arm could only ever match rows older than
+  // that — six of them. Its loose sibling matched "due to customer issue" for
+  // dueTo=customer.
+  const dueToBlock = SRC.slice(SRC.indexOf('  if (dueTo) {'));
+  const block = dueToBlock.slice(0, dueToBlock.indexOf('\n  }'));
+  assert.doesNotMatch(block, /j\.remarks LIKE/,
+    'j.remarks is a mirror, a serialisation format and a filter index at once — not an axis');
+  assert.doesNotMatch(block, /Due To: /, 'the structured-tag arm must be gone');
+});
+
+test('the filter is an EXISTS, so the COUNT query cannot 500', () => {
+  /*
+   * The COUNT query's joins are built by SNIFFING the WHERE string for table
+   * aliases, and there is no branch for atr./ut. — a bare join alias in the
+   * WHERE would take the endpoint down. The two other filters over off-alias
+   * tables (rating, isEscalated) are self-contained EXISTS for exactly this
+   * reason.
+   */
+  const dueToBlock = SRC.slice(SRC.indexOf('  if (dueTo) {'));
+  const block = dueToBlock.slice(0, dueToBlock.indexOf('\n  }'));
+  assert.match(block, /EXISTS \(/, 'it must be a subquery');
+  // Its own aliases must be suffixed so they cannot collide with the
+  // projection's atr/ut when both are present on a view=manage request.
+  assert.match(block, /action_taken_reason atr_f/);
+  assert.match(block, /user_type ut_f/);
+});
+
+test('the party map covers the validator vocabulary exactly', () => {
+  /*
+   * Denominator, both ways. A value the validator accepts but the map lacks
+   * silently applies NO filter — the grid returns everything and looks like the
+   * filter is broken. A value in the map the validator rejects is dead code.
+   *
+   * user_type also holds two rows the filter deliberately cannot reach
+   * ("InretnalUser", "Easyfixer"); the four here are the parties ops use.
+   */
+  /*
+   * Read from the validator's own `.valid(...)` literal rather than Joi's
+   * describe() shape, which differs across Joi versions and would make this
+   * assertion pass or fail for reasons unrelated to the vocabulary.
+   */
+  const vSrc = fs.readFileSync(path.join(ROOT, 'validators/job.validator.js'), 'utf8');
+  const validLine = vSrc.match(/dueTo:\s*Joi\.string\(\)\.valid\(([^)]*)\)/);
+  assert.ok(validLine, 'the dueTo validator must still declare its vocabulary inline');
+  const allowed = [...validLine[1].matchAll(/'([^']+)'/g)].map((m) => m[1]).sort();
+  const mapMatch = SRC.match(/const DUE_TO_TYPE = \{([^}]+)\}/);
+  assert.ok(mapMatch, 'the party map must still be an inline literal');
+  const mapped = mapMatch[1]
+    .split(',').map((e) => e.split(':')[0].trim()).filter(Boolean).sort();
+  assert.equal(allowed.length, 4, `expected the four parties, parsed ${allowed.join(',')}`);
+  assert.deepEqual(mapped, allowed,
+    `map keys ${mapped.join(',')} vs validator ${allowed.join(',')}`);
+  // And the DB's own spelling, which is "Easyfix" — not the "EasyFix" the old
+  // title-casing produced. Correct only by MySQL's case-insensitive collation,
+  // which is one server config away from matching nothing.
+  assert.match(SRC, /easyfix: 'Easyfix'/,
+    'the mapped value must be the spelling user_type actually stores');
 });

@@ -786,6 +786,24 @@ const LIST_JOIN = `
  * first.
  */
 /*
+ * WHICH REASON ROW IS "THE OPEN REASON" — legacy's own rule (JobDaoImpl:263-268):
+ * whichever of cancel_reason_id / enum_reason_id was written more recently,
+ * decided by comparing the two timestamps, and NULL when neither is set.
+ *
+ * ONE constant because it has TWO readers that must not disagree: the Open Due
+ * to COLUMN (manageJoin, below) and the dueTo FILTER. They were two different
+ * rules until 2026-09-10 — the filter matched prose in j.remarks while the
+ * column read this FK — so an operator filtered one population and read
+ * another. Interpolated, not bound: pure column arithmetic with no
+ * placeholders, so it is safe in a JOIN, a WHERE or a subquery.
+ */
+const JOB_OPEN_REASON_PICK = `
+    IF(j.cancel_date_time IS NOT NULL AND j.remarks_date_time IS NOT NULL,
+       IF(TIMEDIFF(j.cancel_date_time, j.remarks_date_time) > 0, j.cancel_reason_id, j.enum_reason_id),
+       IF(j.cancel_date_time IS NOT NULL AND j.remarks_date_time IS NULL, j.cancel_reason_id,
+          IF(j.remarks_date_time IS NOT NULL AND j.cancel_date_time IS NULL, j.enum_reason_id, NULL)))`;
+
+/*
  * ─── MANAGE JOBS VIEW (2026-09-10) ─────────────────────────────────────────
  *
  * The /jobs grid was rebuilt to the 20 columns the legacy CRM's Manage Jobs
@@ -896,11 +914,7 @@ function manageJoin(want) {
   return `
   LEFT JOIN tbl_user uo ON uo.user_id = j.job_client_owner
   LEFT JOIN tbl_client_contacts contact ON contact.id = j.reporting_contact_id
-  LEFT JOIN action_taken_reason atr ON atr.id =
-    IF(j.cancel_date_time IS NOT NULL AND j.remarks_date_time IS NOT NULL,
-       IF(TIMEDIFF(j.cancel_date_time, j.remarks_date_time) > 0, j.cancel_reason_id, j.enum_reason_id),
-       IF(j.cancel_date_time IS NOT NULL AND j.remarks_date_time IS NULL, j.cancel_reason_id,
-          IF(j.remarks_date_time IS NOT NULL AND j.cancel_date_time IS NULL, j.enum_reason_id, NULL)))
+  LEFT JOIN action_taken_reason atr ON atr.id = ${JOB_OPEN_REASON_PICK}
   LEFT JOIN user_type ut ON ut.id = atr.user_type`;
 }
 
@@ -2479,24 +2493,57 @@ async function list({
     clauses.push('j.requested_date_time IS NOT NULL AND j.requested_date_time < ?');
     params.push(requestedBefore);
   }
-  // Open Due To — accepts both shapes of remark:
-  //   (a) Structured tag from the AddRemarks dialog:
-  //       "[Unreachable · Pending Due To: Client · Reason: …] free text"
-  //   (b) Loose legacy free-text: "… due to client said no …"
-  // MySQL default collation is case-insensitive, so the LIKE comparison
-  // matches "Due to Client" / "DUE TO CLIENT" / "due to client" alike.
-  // The loose-match arm risks false positives ("due to customer issue"
-  // for dueTo=customer) — acceptable given the legacy data has no
-  // structured tag yet; tightening to brackets-only would zero-out the
-  // filter entirely until the AddRemarks-dialog data lands.
+  /*
+   * ─── OPEN DUE TO — RECONCILED WITH THE COLUMN (2026-09-10) ────────────────
+   *
+   * This filter used to match PROSE in j.remarks, in two arms: a structured
+   * "[… Pending Due To: Client · Reason: …]" tag, and a loose "… due to client
+   * …". The Manage Jobs grid's Open Due to COLUMN reads a foreign key instead —
+   * user_type.type, through the reason row. So an operator filtered one
+   * population and read another.
+   *
+   * It was not a near miss. Measured on the shared database, 481,048 jobs:
+   *
+   *     structured tag present            6        (the writer dropped the
+   *                                                 prefix on 2026-06-04)
+   *     loose prose present           1,607
+   *     the filter's actual matches       17        across all four parties
+   *     the COLUMN's axis resolves  269,206
+   *
+   * So the filter was answering with 17 rows where 269,206 have the axis
+   * recorded. Moving it onto the column's own source loses 24 rows (prose
+   * present, no resolvable FK) and gains 267,617.
+   *
+   * The FK is genuinely current, which is why this is safe: job-comment
+   * service's addComment stamps tbl_job.enum_reason_id whenever the caller
+   * sends a reason, alongside the remarks mirror — so every AddRemarks save
+   * keeps the axis up to date even though it stopped writing the prose.
+   *
+   * ⚠ EXISTS, NOT A JOIN. The COUNT query's joins are built by sniffing this
+   * WHERE string for table aliases, and it has no branch for atr./ut. — a new
+   * alias here would 500 the endpoint. The two other filters over off-alias
+   * tables (rating, isEscalated) are self-contained EXISTS for the same
+   * reason. Everything outside the subquery is `j.`, which COUNT always has.
+   */
   if (dueTo) {
-    const lower = String(dueTo).toLowerCase();
-    const label = lower === 'easyfix' ? 'EasyFix'
-      : lower.charAt(0).toUpperCase() + lower.slice(1);
-    clauses.push('(j.remarks LIKE ? OR j.remarks LIKE ?)');
-    //   1st: structured tag exact ("Due To: Client")
-    //   2nd: loose free-text ("due to client")
-    params.push(`%Due To: ${label}%`, `%due to ${lower}%`);
+    /*
+     * The DB spells it "Easyfix", not "EasyFix" — and carries two values the
+     * filter deliberately cannot reach ("InretnalUser", "Easyfixer"), because
+     * the validator's vocabulary is the four parties ops trained on. Mapped
+     * explicitly rather than title-cased: the comparison would survive on
+     * MySQL's case-insensitive default collation, but a filter that depends on
+     * collation is one server config away from silently matching nothing.
+     */
+    const DUE_TO_TYPE = { easyfix: 'Easyfix', customer: 'Customer', client: 'Client', technician: 'Technician' };
+    const party = DUE_TO_TYPE[String(dueTo).toLowerCase()];
+    if (party) {
+      clauses.push(`EXISTS (
+        SELECT 1 FROM action_taken_reason atr_f
+          JOIN user_type ut_f ON ut_f.id = atr_f.user_type
+         WHERE atr_f.id = ${JOB_OPEN_REASON_PICK}
+           AND ut_f.type = ?)`);
+      params.push(party);
+    }
   }
   /*
    * `isEscalated` — WIRED 2026-08-26. There is no j.is_escalated column (the
