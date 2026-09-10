@@ -33,7 +33,23 @@
 
 const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { installFakePool } = require('./helpers/fake-pool');
+
+/*
+ * Source-text reads strip comments first — this repo's comments name the very
+ * identifiers being asserted (issue.service.js:181 names screenshot_key in
+ * prose, correctly), so an unstripped match is satisfied by prose alone.
+ * Same helper as tests/job-share-delegation.test.js.
+ */
+const stripComments = (s) => s
+  .replace(/\/\*[\s\S]*?\*\//g, ' ')
+  .replace(/^\s*\/\/.*$/gm, ' ');
+
+const readSrc = (rel) => stripComments(
+  fs.readFileSync(path.join(__dirname, '..', rel), 'utf8'),
+);
 
 const REPORTER = 41;   // the user who raised issue 7
 const STRANGER = 88;   // another CRM user, holds no key
@@ -350,4 +366,34 @@ test('no screenshots issues NO image INSERT at all', async () => {
     title: 'x', description: 'y', pagePath: '/jobs', screenshotKeys: [], userId: REPORTER,
   });
   assert.equal(fake.calls.filter((c) => /INSERT INTO tbl_crm_issue_image/.test(c.sql)).length, 0);
+});
+
+/*
+ * tbl_crm_issue.screenshot_key IS FROZEN, NOT DROPPED.
+ *
+ * migrations/executed/2026-09-10-crm-issue-reporter-v2.sql backfilled every
+ * non-null value into tbl_crm_issue_image and deliberately left the column in
+ * place: scripts/migration-status.js extracts no artifact from a DROP COLUMN
+ * (artifactsOf matches CREATE TABLE / ADD COLUMN / CHANGE / RENAME / index /
+ * seed and nothing else), so such a file reports UNKNOWN forever and UNKNOWN
+ * never fails the run. A drop would also be unrunnable in the current ordering:
+ * v2 is applied on Production but NOT on QA, while already sitting in
+ * migrations/executed/ where verify:migrations does not look.
+ *
+ * The two assertions above are incidental — they cover the list SELECT and the
+ * parent INSERT, 2 of the 5 statements in issue.service.js that name
+ * tbl_crm_issue, and only for the code paths those tests happen to exercise.
+ * This one covers the whole file, so the detail SELECT, the count SELECT and
+ * the close UPDATE cannot quietly start reading it.
+ *
+ * MUTATION-VERIFIED, not merely watched to pass: this same stripped matcher
+ * finds 7 hits in the pre-v2 source (ce5c57a^:services/issue.service.js), which
+ * genuinely wrote the column, and 0 today.
+ */
+test('the frozen legacy column is named nowhere in the issue code', () => {
+  for (const rel of ['services/issue.service.js', 'routes/admin/issues.js']) {
+    assert.doesNotMatch(readSrc(rel), /screenshot_key/,
+      `${rel} names tbl_crm_issue.screenshot_key — it is frozen; the keys live in `
+      + 'tbl_crm_issue_image (see migrations/executed/2026-09-10-crm-issue-reporter-v2.sql)');
+  }
 });
