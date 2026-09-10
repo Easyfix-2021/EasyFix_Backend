@@ -1749,6 +1749,21 @@ function toIdArray(v) {
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
   /*
+   * `delegatedToEfrId` (2026-09-10) — OR-widens `easyfixerId` with the jobs
+   * this technician holds a live DELEGATION on (tbl_job_share_link). A
+   * delegated job never moves on tbl_job.fk_easyfixter_id, so the delegate
+   * would otherwise not see the job he has been asked to do.
+   *
+   * Deliberately a SEPARATE parameter rather than a change to `easyfixerId`:
+   * that filter is shared with the CRM's Manage Job / export "technician"
+   * filter, where it must keep meaning "assigned to". Passed only by
+   * GET /api/mobile/jobs. Ignored unless `easyfixerId` is also supplied —
+   * on its own it would be a filter nobody asked for, and combining the two
+   * into one OR clause keeps the existing `j`-alias-only shape, so the COUNT
+   * query needs no extra join.
+   */
+  delegatedToEfrId,
+  /*
    * `readyForBilling` (2026-08-26) — the client portal's "In-Warranty Orders"
    * tab. Two predicates, always together: ready_for_billing = 'Yes' AND
    * sub_job_id IS NULL. They travel as ONE filter because the second is not a
@@ -1980,7 +1995,34 @@ async function list({
     clauses.push(`j.fk_client_id IN (${clientIdList.map(() => '?').join(',')})`);
     params.push(...clientIdList);
   }
-  if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
+  if (easyfixerId != null) {
+    if (delegatedToEfrId != null) {
+      // "assigned to me OR delegated to me" — see the parameter's note above.
+      // EXISTS over the (delegate_efr_id, status) index; correlated on j.job_id
+      // so no join is added and the COUNT query stays alias-compatible.
+      //
+      // PENDING IS IN THE SET, and leaving it out breaks the whole feature.
+      // Accept and Reject are reachable only by OPENING the job, and the app's
+      // only route to a job is this list — it cannot manufacture a link to one
+      // the list omits. A pending share the delegate cannot see is a share he
+      // can never answer, so every technician delegation would have sat until
+      // the TTL swept it to `expired`, with nobody able to say why.
+      //
+      // It is also the whole LIVE set, which is the set the lock uses, so the
+      // two cannot drift: if a share is live enough to take the job away from
+      // its owner, it is live enough for the delegate to see it.
+      clauses.push(`(j.fk_easyfixter_id = ? OR EXISTS (
+        SELECT 1 FROM tbl_job_share_link s
+         WHERE s.job_id = j.job_id
+           AND s.delegate_efr_id = ?
+           AND s.status IN ('pending', 'accepted', 'started')
+      ))`);
+      params.push(easyfixerId, delegatedToEfrId);
+    } else {
+      clauses.push('j.fk_easyfixter_id = ?');
+      params.push(easyfixerId);
+    }
+  }
   if (ownerId != null)     { clauses.push('j.job_client_owner = ?');        params.push(ownerId); }
   if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
     clauses.push(`j.job_client_owner IN (${clientOwnerIds.map(() => '?').join(',')})`);

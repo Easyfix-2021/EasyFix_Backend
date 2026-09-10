@@ -12,7 +12,7 @@
  *   1. GET only — POST /mobile/device runs a single-active-session sweep that
  *      logs the technician's real phone out mid-job.
  *   2. An anchored path allowlist — a prefix list would admit
- *      GET /jobs/:id/share-link, which mints a public link.
+ *      GET /jobs/:id/share, which exposes who a job was delegated to.
  *   3. The minted token stays in the process.
  *
  * Plus the scope gate, which must answer identically for "no such technician"
@@ -158,11 +158,15 @@ test('a path off the allowlist is 404 — and mints no token', async () => {
   assert.equal(mintedTokens.length, 0, 'the allowlist must be checked before a token exists');
 });
 
-test('GET /jobs/:id/share-link is off the allowlist — the reason it is anchored, not a prefix', async () => {
-  // A `/jobs` PREFIX would admit this. It mints a public share link and
-  // records the technician as its sharer: a write dressed as a GET.
+test('GET /jobs/:id/share is off the allowlist — the reason it is anchored, not a prefix', async () => {
+  // A `/jobs` PREFIX would admit this. It is a LIVE GET on the mobile router
+  // (routes/mobile/job-share.js), refused because it is not on the list — so
+  // this stays a real positive control rather than asserting a 404 that a
+  // deleted route would give anyway. It was GET /jobs/:id/share-link until
+  // 2026-09-10; that route is retired, and a test pointed at a route that no
+  // longer exists cannot fail.
   scopeForRequest = allow(EFR_CITY);
-  const { status } = await mirror(EFR_ID, '/jobs/12/share-link');
+  const { status } = await mirror(EFR_ID, '/jobs/12/share');
   assert.equal(status, 404);
   assert.equal(mintedTokens.length, 0);
 });
