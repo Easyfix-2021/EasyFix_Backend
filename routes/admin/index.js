@@ -187,6 +187,19 @@ router.use('/lms',               require('./lms-action'));
 router.use('/certificates',      require('./certificates'));
 // Rewards (added 2026-08-13) — shop catalogue, claims queue, points ledger.
 router.use('/rewards',           require('./rewards'));
+/*
+ * In-app issue reporter (2026-09-10). Every CRM user may FILE and read their
+ * own; isIssueManage gates reading everyone's, closing, and scope=all — the
+ * rule lives in services/issue.service.js and is enforced on the row actually
+ * fetched, never inferred from the query.
+ *
+ * Mounting is what makes it live: the module shipped unmounted so the code
+ * could be durable before the migration ran. The migration
+ * (2026-09-10-crm-issue-reporter.sql) MUST be applied first — without its
+ * tables every route 500s, and without its menu_action seed nobody holds
+ * isIssueManage, so the admin queue would be invisible rather than empty.
+ */
+router.use('/issues',            require('./issues'));
 // router.use('/clients',        require('./clients'));     // later
 // router.use('/users',          require('./users'));       // later
 

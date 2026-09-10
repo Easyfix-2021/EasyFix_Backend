@@ -125,7 +125,14 @@ function canRead(issue, actor) {
  */
 async function loadIssueForActor(issueId, actor) {
   const [rows] = await pool.query(
-    'SELECT id, title, description, page_path, screenshot_key, status, reported_by, created_on, closed_by, closed_on, close_note FROM tbl_crm_issue WHERE id = ?',
+    `SELECT i.id, i.title, i.description, i.page_path, i.screenshot_key, i.status,
+            i.reported_by, i.created_on, i.closed_by, i.closed_on, i.close_note,
+            ru.user_name AS reported_by_name,
+            cu.user_name AS closed_by_name
+       FROM tbl_crm_issue i
+       LEFT JOIN tbl_user ru ON ru.user_id = i.reported_by
+       LEFT JOIN tbl_user cu ON cu.user_id = i.closed_by
+      WHERE i.id = ?`,
     [issueId],
   );
   if (!rows.length) throw badRequest('Issue not found', 404);
@@ -182,10 +189,25 @@ async function listIssues({ scope, status, limit, offset }, actor) {
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
   const [rows] = await pool.query(
+    /*
+     * reported_by_name is joined, not left to the caller (2026-09-10).
+     *
+     * Without it a triage queue lists tickets with no indication of WHO filed
+     * them — you cannot chase a reporter for detail, and in the comment thread
+     * you cannot tell your own reply from theirs. The id alone is not an
+     * answer to "who", and no amount of frontend work can supply a name the
+     * API never sent.
+     *
+     * LEFT JOIN, matching services/job-comment.service.js:80: a deleted or
+     * unresolvable user must yield NULL and a row that still renders, never
+     * drop the ticket out of the queue.
+     */
     `SELECT i.id, i.title, i.page_path, i.status, i.reported_by, i.created_on, i.closed_on,
+            ru.user_name AS reported_by_name,
             (i.screenshot_key IS NOT NULL) AS has_screenshot,
             (SELECT COUNT(*) FROM tbl_crm_issue_comment c WHERE c.issue_id = i.id) AS comment_count
        FROM tbl_crm_issue i
+       LEFT JOIN tbl_user ru ON ru.user_id = i.reported_by
        ${clause}
       ORDER BY i.id DESC
       LIMIT ?, ?`,
@@ -218,7 +240,11 @@ async function getIssueDetail(issueId, actor) {
   const issue = await loadIssueForActor(issueId, actor);
 
   const [comments] = await pool.query(
-    'SELECT id, comment_text, commented_by, created_on FROM tbl_crm_issue_comment WHERE issue_id = ? ORDER BY id ASC',
+    `SELECT c.id, c.comment_text, c.commented_by, c.created_on,
+            u.user_name AS commented_by_name
+       FROM tbl_crm_issue_comment c
+       LEFT JOIN tbl_user u ON u.user_id = c.commented_by
+      WHERE c.issue_id = ? ORDER BY c.id ASC`,
     [issueId],
   );
 

@@ -68,7 +68,15 @@ function issueRow() {
  */
 const routes = [
   [/COUNT\(\*\) AS total FROM tbl_crm_issue i/, () => [{ total: 1 }]],
-  [/FROM tbl_crm_issue i\s/, () => [{
+  /*
+   * Pinned on comment_count, which ONLY the list query computes. It used to be
+   * /FROM tbl_crm_issue i\s/, and once the DETAIL query gained a LEFT JOIN it
+   * began with the same words — so detail matched this route first, received a
+   * list-shaped row with no screenshot_key, and the failure surfaced as "the
+   * detail response never carries the raw S3 key". A stub returning the WRONG
+   * row reads exactly like the code being wrong.
+   */
+  [/comment_count[\s\S]*FROM tbl_crm_issue i\b/, () => [{
     id: 7,
     title: 'Jobs list crashes on page 2',
     page_path: '/jobs',
@@ -79,8 +87,16 @@ const routes = [
     has_screenshot: 1,       // MySQL returns 1/0 for `(col IS NOT NULL)`
     comment_count: 2,
   }]],
-  [/FROM tbl_crm_issue WHERE id = \?/, () => [issueRow()]],
-  [/FROM tbl_crm_issue_comment WHERE issue_id = \?/, () => [
+  /*
+   * Matched on the TABLE + the id predicate, not on the column list or on
+   * FROM sitting immediately before WHERE. The detail query gained
+   * `LEFT JOIN tbl_user` for reporter/closer names, which pushed WHERE away
+   * from FROM and broke the old pattern — the fixture then returned nothing
+   * and the service 404'd, which reads as a logic bug rather than a stale
+   * fixture. Pin what cannot change without the query MEANING something else.
+   */
+  [/FROM tbl_crm_issue i\b[\s\S]*WHERE i\.id = \?/, () => [issueRow()]],
+  [/FROM tbl_crm_issue_comment c\b[\s\S]*WHERE c\.issue_id = \?/, () => [
     { id: 1, comment_text: 'Looking at it.', commented_by: MANAGER, created_on: '2026-09-10 11:30:00' },
   ]],
   [/INSERT INTO tbl_crm_issue_comment/, () => ({ insertId: 501 })],
