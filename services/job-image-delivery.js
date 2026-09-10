@@ -60,6 +60,50 @@ async function legacyUrlHasImage(url) {
   }
 }
 
+/*
+ * STRICT variant, for PROBING candidate paths rather than validating a stored one.
+ *
+ * The defaults are deliberately opposite. legacyUrlHasImage() above answers
+ * "usable" when it cannot tell, because refusing a stored URL on a network blip
+ * would hide a file that is really there. Here we are guessing at directories,
+ * so an unverifiable answer must NOT be accepted — otherwise a timeout on the
+ * first candidate sends the browser to a URL nobody confirmed, and for a job
+ * whose file lives in the second directory that is a redirect to a 404.
+ */
+async function probeHasFile(url) {
+  try {
+    const head = await fetch(url, {
+      method: 'HEAD',
+      redirect: 'follow',
+      signal: AbortSignal.timeout(Number(process.env.LEGACY_FILE_HEAD_TIMEOUT_MS || 2500)),
+    });
+    if (!head.ok) return false;
+    const ctype = String(head.headers.get('content-type') || '').toLowerCase();
+    return ctype.startsWith('image/') || ctype.startsWith('application/pdf');
+  } catch {
+    return false;
+  }
+}
+
+/*
+ * Where a BARE FILENAME lives on the legacy file host.
+ *
+ * Images sit under <base>/upload_jobs/, feedback PDFs under
+ * <base>/feedback_jobs/ — measured 2026-09-10 on job 530707, whose seven rows
+ * split across BOTH: six .jpg in upload_jobs and feedback530707.pdf in
+ * feedback_jobs. One hardcoded directory would have restored six tiles and
+ * left the seventh broken, which is the kind of fix that looks complete.
+ *
+ * `feedback*` is tried first for names that look like one — a hint that saves a
+ * round trip, never a rule: both directories are always tried.
+ */
+function legacyDirsFor(name) {
+  const dirs = (process.env.LEGACY_FILE_DIRS || 'upload_jobs,feedback_jobs')
+    .split(',').map((d) => d.trim().replace(/^\/+|\/+$/g, '')).filter(Boolean);
+  if (/^feedback/i.test(name)) return dirs.slice().sort((a, b) => (a.includes('feedback') ? -1 : b.includes('feedback') ? 1 : 0));
+  return dirs;
+}
+
 async function resolve(storedRaw, { logger } = {}) {
   const stored = String(storedRaw || '').trim();
   if (!stored) return { kind: 'none', reason: 'empty stored value' };
@@ -131,7 +175,40 @@ async function resolve(storedRaw, { logger } = {}) {
     return { kind: 'base-url', url };
   }
 
+  /*
+   * (5) BARE FILENAME still served by the legacy file host.
+   *
+   * The gap that made job 530707 show seven "Image not found" tiles while every
+   * file was present and returning 200. Rows written by the legacy uploader
+   * store a plain name — `530707_checkin_20260822144344.jpg` — not a URL, so
+   * branch (3) never fires; and production sets FILE_BASE_URL to the RELATIVE
+   * `/easydoc`, so branch (4) correctly refuses it (redirecting there would
+   * bounce back to this backend, which serves no static files). Nothing looked
+   * on the host where the file actually was.
+   *
+   * LAST, not earlier: an absolute FILE_BASE_URL is a CONFIGURED location and
+   * must win over probing directories. Placing this before (4) broke two
+   * existing tests, correctly — configuration beats inference.
+   *
+   * Each candidate is PROBED before use, so this can only ever redirect to a
+   * URL confirmed to hold an image or a PDF.
+   */
+  if (!stored.includes('/') && LEGACY_HOSTS().length) {
+    const base = String(process.env.FILE_BASE_URL || '/easydoc').replace(/^https?:\/\/[^/]+/i, '').replace(/^\/+|\/+$/g, '') || 'easydoc';
+    for (const host of LEGACY_HOSTS()) {
+      for (const dir of legacyDirsFor(stored)) {
+        const url = `https://${host}/${base}/${dir}/${encodeURIComponent(stored)}`;
+        // eslint-disable-next-line no-await-in-loop
+        if (await probeHasFile(url)) {
+          return { kind: 'legacy', url, verdict: `bare filename found in ${dir}` };
+        }
+      }
+    }
+    if (logger) logger.warn({ stored }, 'bare filename not found in any legacy directory');
+  }
+
+
   return { kind: 'none', reason: 'not in S3, no local file, no absolute FILE_BASE_URL' };
 }
 
-module.exports = { resolve, legacyUrlHasImage, _LEGACY_HOSTS: LEGACY_HOSTS };
+module.exports = { resolve, legacyUrlHasImage, probeHasFile, legacyDirsFor, _LEGACY_HOSTS: LEGACY_HOSTS };

@@ -31,6 +31,15 @@ const realFetch = global.fetch;
 function stubFetch(impl) { global.fetch = impl; }
 test.after(() => { global.fetch = realFetch; });
 
+function fetchByPath(okPaths) {
+  return (url) => {
+    const hit = okPaths.some((p) => String(url).includes(p));
+    return Promise.resolve(hit
+      ? { ok: true, status: 200, headers: new Map([['content-type', 'image/jpeg']]) }
+      : { ok: false, status: 404, headers: new Map([['content-type', 'text/html']]) });
+  };
+}
+
 const HTML_404 = () => Promise.resolve({ ok: false, status: 404, headers: new Map([['content-type', 'text/html; charset=iso-8859-1']]) });
 const IMAGE_200 = () => Promise.resolve({ ok: true, status: 200, headers: new Map([['content-type', 'image/jpeg']]) });
 // `new Map()` has .get, which is all legacyUrlHasImage uses.
@@ -76,10 +85,25 @@ test('an absolute FILE_BASE_URL is used for a bare filename', async () => {
   delete process.env.FILE_BASE_URL;
 });
 
-test('a RELATIVE FILE_BASE_URL is not used — it would bounce back to this backend', async () => {
+test('a RELATIVE FILE_BASE_URL is never used as a redirect base', async () => {
+  // It would bounce back to this backend, which serves no static files.
+  // Asserted TWO ways, because "kind is not base-url" is the real claim and a
+  // bare `=== none` hid it: with the legacy fallback finding nothing the answer
+  // is none, and with it finding the file the answer is legacy — never
+  // base-url either way. This test previously passed only because it inherited
+  // another test's fetch stub.
+  process.env.LEGACY_FILE_HOSTS = 'core.easyfix.in';
   process.env.FILE_BASE_URL = '/easydoc';
-  const r = await delivery.resolve('somefile.jpg');
-  assert.equal(r.kind, 'none');
+
+  stubFetch(fetchByPath([]));            // nothing on the legacy host
+  const missing = await delivery.resolve('somefile.jpg');
+  assert.equal(missing.kind, 'none');
+
+  stubFetch(fetchByPath(['/upload_jobs/']));   // the file IS on the legacy host
+  const found = await delivery.resolve('somefile.jpg');
+  assert.equal(found.kind, 'legacy', 'the fallback should serve it');
+  assert.ok(!found.url.startsWith('/easydoc'), 'a relative base must never become the redirect target');
+
   delete process.env.FILE_BASE_URL;
 });
 
@@ -93,4 +117,52 @@ test('positive control: the resolver CAN return legacy, so the refusals above ar
   stubFetch(IMAGE_200);
   const r = await delivery.resolve('https://core.easyfix.in/easydoc/upload_jobs/ok.jpg');
   assert.equal(r.kind, 'legacy', 'if this failed, every assertion above would pass for the wrong reason');
+});
+
+// ── Bare filename on the legacy host ────────────────────────────────
+// The gap behind job 530707: seven tiles reading "Image not found" while every
+// file was present and returning 200. Rows store a plain name, not a URL, and
+// production's FILE_BASE_URL is the RELATIVE "/easydoc", so neither
+// absolute-URL branch fired and nothing looked on the host holding the file.
+
+test('a bare filename is found in upload_jobs', async () => {
+  process.env.LEGACY_FILE_HOSTS = 'core.easyfix.in';
+  process.env.FILE_BASE_URL = '/easydoc';
+  stubFetch(fetchByPath(['/upload_jobs/']));
+  const r = await delivery.resolve('530707_checkin_20260822144344.jpg');
+  assert.equal(r.kind, 'legacy');
+  assert.match(r.url, /\/easydoc\/upload_jobs\/530707_checkin_20260822144344\.jpg$/);
+  delete process.env.FILE_BASE_URL;
+});
+
+test('a file present ONLY in feedback_jobs is still found — both directories are tried', async () => {
+  process.env.LEGACY_FILE_HOSTS = 'core.easyfix.in';
+  process.env.FILE_BASE_URL = '/easydoc';
+  stubFetch(fetchByPath(['/feedback_jobs/']));
+  const r = await delivery.resolve('feedback530707.pdf');
+  assert.equal(r.kind, 'legacy', 'one hardcoded directory would restore the images and leave the PDF broken');
+  assert.match(r.url, /\/feedback_jobs\/feedback530707\.pdf$/);
+  delete process.env.FILE_BASE_URL;
+});
+
+test('a bare filename in NO legacy directory resolves to nothing', async () => {
+  process.env.LEGACY_FILE_HOSTS = 'core.easyfix.in';
+  process.env.FILE_BASE_URL = '/easydoc';
+  stubFetch(fetchByPath([]));
+  const r = await delivery.resolve('530707_never_existed.jpg');
+  assert.equal(r.kind, 'none');
+  delete process.env.FILE_BASE_URL;
+});
+
+test('PROBING is strict: an unverifiable candidate is NOT accepted', async () => {
+  // Opposite default to legacyUrlHasImage, deliberately. When VALIDATING a
+  // stored URL a network fault must not hide a real file; when GUESSING a
+  // directory it must not manufacture one — otherwise a timeout on the first
+  // candidate redirects the browser to a URL nobody confirmed.
+  process.env.LEGACY_FILE_HOSTS = 'core.easyfix.in';
+  process.env.FILE_BASE_URL = '/easydoc';
+  stubFetch(() => Promise.reject(Object.assign(new Error('down'), { name: 'TimeoutError' })));
+  const r = await delivery.resolve('530707_checkin_x.jpg');
+  assert.equal(r.kind, 'none', 'an unreachable host must not yield a redirect to an unconfirmed URL');
+  delete process.env.FILE_BASE_URL;
 });
