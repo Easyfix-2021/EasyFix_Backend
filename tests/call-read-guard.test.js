@@ -63,6 +63,15 @@ const CALLS = {
  * test run as Admin short-circuits every arm below and proves nothing. */
 const ROLE = { role_id: 12, role_name: 'Zonal Field Team', role_status: 1, menu_ids: '' };
 const ADMIN_ROLE = { role_id: 2, role_name: 'Admin', role_status: 1, menu_ids: '' };
+/*
+ * Finance is in SCOPE_BYPASS_ROLES and is deliberately NOT a bypass here — see
+ * RECORDING_BYPASS_ROLES in routes/admin/calls.js. Pinned because the change
+ * that narrowed it broke no test: the guard had gone from an Admin-only inline
+ * check to bypassesScope(), silently handing Finance every customer
+ * conversation, and nothing went red either way. A behaviour no test can
+ * distinguish is a behaviour nobody chose.
+ */
+const FINANCE_ROLE = { role_id: 7, role_name: 'Finance', role_status: 1, menu_ids: '' };
 
 /* ⚠ ORDER MATTERS: /FROM tbl_job/ would also match tbl_job_caller_info, so the
  * caller-info route has to come first. */
@@ -185,6 +194,35 @@ test('a colleague who could open the call\'s job hears it', async () => {
   const { status, body } = await recording(CALL_OUT);
   assert.equal(status, 200, JSON.stringify(body));
   assert.equal(body.data.url, REC_URL);
+});
+
+test('FINANCE does NOT bypass — recording bypass is Admin-only, unlike scope generally', async () => {
+  /*
+   * SCOPE_BYPASS_ROLES is {Admin, Finance}, and reusing bypassesScope() here
+   * would have handed Finance every customer conversation. The check the guard
+   * replaced was `user_role === 2` — Admin alone — so borrowing the helper
+   * would have widened a second axis nobody asked about, as a side effect of
+   * reuse. Finance is therefore scoped like anyone else.
+   *
+   * This test exists because narrowing it broke NOTHING: 15 tests passed with
+   * Finance bypassing and 15 passed with it not. A behaviour no test can
+   * distinguish is a behaviour nobody chose.
+   */
+  as(COLLEAGUE_ID, { role: FINANCE_ROLE, scope: scope(allowClients(4242)) });
+  const refused = await recording(CALL_OUT);
+  assert.equal(refused.status, 403, JSON.stringify(refused.body));
+
+  // Control: the SAME Finance user hears it once the job is genuinely in scope,
+  // proving the 403 above is the scope arm and not a blanket ban on the role.
+  as(COLLEAGUE_ID, { role: FINANCE_ROLE, scope: scope(allowClients(JOB_CLIENT)) });
+  const allowed = await recording(CALL_OUT);
+  assert.equal(allowed.status, 200, JSON.stringify(allowed.body));
+});
+
+test('ADMIN still bypasses, on a job it could not otherwise reach', async () => {
+  as(COLLEAGUE_ID, { role: ADMIN_ROLE, scope: scope(allowClients(4242)) });
+  const { status } = await recording(CALL_OUT);
+  assert.equal(status, 200, 'Admin bypass is the one this change deliberately KEPT');
 });
 
 test('a colleague scoped to ANOTHER client is refused', async () => {

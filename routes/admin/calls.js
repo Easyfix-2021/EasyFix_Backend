@@ -3,7 +3,7 @@ const { pool } = require('../../db');
 const logger = require('../../logger');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
-const { assertEntityInScope, buildRequestScope, bypassesScope } = require('../../lib/scope');
+const { assertEntityInScope, buildRequestScope } = require('../../lib/scope');
 const kaleyra = require('../../services/kaleyra.service');
 const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
@@ -105,12 +105,24 @@ function isCallOwner(req, row) {
  *     job) and the legacy writer stores a 0 sentinel — so the job-less row is
  *     the LEAST scoped, and would have been the most readable.
  *
- * Bypass roles (Admin / Finance) short-circuit both, exactly as they do
- * everywhere else scope is enforced.
+ * BYPASS IS ADMIN ONLY HERE, deliberately narrower than bypassesScope().
+ *
+ * That helper covers {Admin, Finance}, and using it would have handed Finance
+ * access to every customer conversation — the previous inline check was
+ * `user_role === 2`, Admin alone. Nobody asked for Finance, and the owner chose
+ * the NARROW variant of this rule when the same question arose for wildcard
+ * client scopes; widening a second axis by borrowing a helper is not what
+ * "reuse the existing model" is meant to buy.
+ *
+ * To include Finance later, swap the check for
+ *   bypassesScope(req.userRole?.role_name)
+ * — one line, and a deliberate decision rather than a side effect.
  */
+const RECORDING_BYPASS_ROLES = Object.freeze(['admin']);
+
 async function callReadGuard(req, row) {
   if (isCallOwner(req, row)) return { ok: true };
-  if (bypassesScope(req.userRole?.role_name)) return { ok: true };
+  if (RECORDING_BYPASS_ROLES.includes(String(req.userRole?.role_name || '').toLowerCase())) return { ok: true };
 
   const scope = buildRequestScope(req);
   const clientsDim = scope && (scope.entityClients || scope.clients);
@@ -131,6 +143,28 @@ async function callReadGuard(req, row) {
     [jobId]
   );
   if (!jf) return { ok: false, reason: 'job not found' };
+
+  /*
+   * THE JOB'S CLIENT IS ASSERTED HERE, not left to assertEntityInScope alone.
+   *
+   * That helper short-circuits for SCOPE_BYPASS_ROLES = {Admin, Finance}
+   * (lib/scope.js:461) BEFORE it reads any dimension, so delegating outright
+   * would hand Finance every customer conversation — while the check this guard
+   * replaced was `user_role === 2`, Admin alone. Reusing an access model means
+   * inheriting its exemptions, and this is one we do not want on call audio.
+   *
+   * So the client dimension is asserted explicitly against clientsDim, which is
+   * already in hand for the wildcard check above; city and vertical still go to
+   * the helper. That is ONE assertion the helper deliberately skips — not a
+   * second copy of the scope rules, which is the thing to avoid.
+   *
+   * Admin is exempted earlier, by RECORDING_BYPASS_ROLES.
+   */
+  const jobClientId = jf.client_id == null ? null : Number(jf.client_id);
+  if (jobClientId != null && Array.isArray(clientsDim.ids) && !clientsDim.ids.includes(jobClientId)) {
+    return { ok: false, reason: 'job client is outside the caller\'s client scope' };
+  }
+
   return assertEntityInScope(req, jf);
 }
 
