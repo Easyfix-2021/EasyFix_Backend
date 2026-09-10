@@ -86,6 +86,23 @@ const EXPECTED = {
     // by name and 500s on every environment the moment one moves.
     'original_scheduling_date_time', 'billing_checkout_date_time',
     'custom_property', 'reschedule_reason_id',
+    /*
+     * The technician-app REQUEST model (2026-09-10 — see THE REQUEST MODEL in
+     * services/mobile-job-lifecycle.service.js). The cancel/reschedule request
+     * writes name every one of these with NO column probe, deliberately: they
+     * are long-standing production columns and a probe would turn a genuinely
+     * broken deploy into a request that silently records nothing. Listing them
+     * here is what makes that safe — a missing column fails the boot gate
+     * instead of dropping a technician's ask on the floor at runtime.
+     *
+     * job_vertical_manager is the job's Project Manager snapshot (int FK →
+     * tbl_user), the recipient of the reschedule-request WhatsApp. It is the
+     * one this list was actually missing; verifyExpectedIsComplete found it.
+     */
+    'is_cancelled_by_app', 'is_rescheduled_by_app',
+    'job_cancel_reason_id_by_easyfixer', 'reschedule_date_time_app',
+    'reschedule_remarks', 'reschedule_at_app', 'resch_job_count',
+    'job_vertical_manager',
   ],
   tbl_job_services: [
     'job_service_id', 'job_id', 'service_id', 'service_type_id', 'service_category_id',

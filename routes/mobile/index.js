@@ -17,6 +17,10 @@ const jobCommentService = require('../../services/job-comment.service');
 const delegation = require('../../services/job-share-delegation.service');
 const voice = require('../../services/voice.service');
 const easyfixerLifecycle = require('../../services/easyfixer-lifecycle.service');
+// The technician-app order flow (cancel/reschedule REQUESTS, selfie, …). The
+// /jobs sub-router below owns most of it; the reschedule route in this file
+// predates that split and calls straight into the same service.
+const lifecycle = require('../../services/mobile-job-lifecycle.service');
 const { dailyBridgeCapReached, persistBridgeCall, CALL_FAILED_PUBLIC_MSG } = require('../public/_public-call');
 const { modernOk, modernError } = require('../../utils/response');
 const { rateLimit } = require('../../middleware/rate-limit');
@@ -1027,53 +1031,42 @@ router.post('/jobs/:id/checkout',
   }
 });
 
-// Reschedule (tech-initiated). Doesn't change job_status; just shifts
-// the appointment + stamps the reschedule audit columns. We call
-// setStatus with the EXISTING status (no transition) just to ride
-// through the extras-whitelist write path + emit the RescheduleTech
-// webhook via the same code path /admin/jobs/:id/reschedule uses.
-//
-// `resch_job_count` is incremented via a follow-up query because the
-// extras whitelist binds parameterised values — incrementing requires
-// `COALESCE(resch_job_count, 0) + 1` which is an expression, not a
-// bind. Done in a separate UPDATE; safe because both writes are on
-// the same row and idempotent if a retry lands.
+/*
+ * Reschedule REQUEST (tech-initiated). Records the technician's ASK; the
+ * appointment does NOT move — ops actions it from the CRM. Logic lives in
+ * services/mobile-job-lifecycle.service.js next to the cancel request, which
+ * shares its audit writes. See THE REQUEST MODEL there.
+ *
+ * WHAT THIS USED TO DO, AND WHY IT IS GONE: it called setStatus with the job's
+ * existing status purely to ride the extras allowlist, and used that to write
+ * `requested_date_time` — moving a customer's appointment on a technician's say
+ * so, with no approval anywhere, and firing a RescheduleTech webhook telling the
+ * client the visit had been re-scheduled. The webhook goes with it: nothing has
+ * changed for the client to be told about until ops accepts the ask.
+ *
+ * `newDate` is an IST WALL-CLOCK string, NOT Joi.date(). The app builds it from
+ * local getters ('YYYY-MM-DDTHH:mm:ss', no offset); Joi.date() would coerce it
+ * to a JS Date, which parses a bare local literal against the SERVER's zone —
+ * in a UTC container that is a silent +5:30 shift of the requested slot. Same
+ * rule and same pattern as validators/job.validator.js requestedDateTime.
+ */
 router.post('/jobs/:id/reschedule', validate(Joi.object({
-  newDate: Joi.date().iso().required(),
+  newDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/).max(40).required(),
   reasonId: Joi.number().integer().positive().required(),
-  remarks: Joi.string().max(500).optional(),
+  remarks: Joi.string().max(500).optional().allow('', null),
 })), async (req, res, next) => {
   try {
-    logger.info('Reschedule job · id=' + req.params.id + ' · reasonId=' + req.body.reasonId);
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    await jobService.setStatus(
-      job.job_id,
-      {
-        status: Number(job.job_status),       // no-op transition; just rides the extras path
-        extras: {
-          requested_date_time:   new Date(req.body.newDate),
-          reschedule_reason_id:  req.body.reasonId,
-          reschedule_remarks:    req.body.remarks || null,
-          reschedule_at_app:     new Date(),
-          is_rescheduled_by_app: 1,
-        },
-      },
-      { user_id: req.tech.efr_id, efr_id: req.tech.efr_id },
+    logger.info('Reschedule request · id=' + req.params.id + ' · reasonId=' + req.body.reasonId);
+    const out = await lifecycle.requestReschedule(
+      Number(req.params.id),
+      req.tech.efr_id,
+      { newDate: req.body.newDate, reasonId: req.body.reasonId, remarks: req.body.remarks || null },
     );
-    await pool.query(
-      `UPDATE tbl_job SET resch_job_count = COALESCE(resch_job_count, 0) + 1 WHERE job_id = ?`,
-      [job.job_id],
-    );
-    // RescheduleTech webhook isn't auto-fired by setStatus on a no-op
-    // transition — fire it explicitly here. (statusToEventName only
-    // maps actual transitions; rescheduling isn't a status change.)
-    jobService.fireWebhook('RescheduleTech', job.job_id);
-    logger.info('Job rescheduled · id=' + job.job_id);
-    modernOk(res, { rescheduled: true });
+    logger.info('Reschedule request recorded · id=' + req.params.id);
+    modernOk(res, out);
   } catch (e) {
     if (e.status) {
-      logger.warn('Reschedule job failed · id=' + req.params.id + ' · ' + e.message);
+      logger.warn('Reschedule request failed · id=' + req.params.id + ' · ' + e.message);
       return modernError(res, e.status, e.message);
     }
     next(e);

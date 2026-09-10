@@ -39,8 +39,13 @@ function handleErr(res, next, e) {
   return next(e);
 }
 
-// ─── Cancel (legacy actionType 27) ──────────────────────────────────
-// POST /jobs/:id/cancel { reason, reasonId } → job_status 6 + reason.
+// ─── Cancel REQUEST (legacy actionType 27) ──────────────────────────
+// POST /jobs/:id/cancel { reason, reasonId } → records the technician's ASK.
+// It does NOT cancel the job — ops actions it later from the CRM. See THE
+// REQUEST MODEL in services/mobile-job-lifecycle.service.js.
+//
+// `reasonId` comes from GET /shared/lookup/app-cancel-reasons
+// (action_taken_reason, action_type 27, user_type 4).
 router.post(
   '/:id/cancel',
   validate(idParam, 'params'),
@@ -50,15 +55,15 @@ router.post(
   })),
   async (req, res, next) => {
     try {
-      logger.info('Cancel job · jobId=' + req.params.id + ' · reasonId=' + req.body.reasonId);
+      logger.info('Cancel request · jobId=' + req.params.id + ' · reasonId=' + req.body.reasonId);
       const out = await lifecycle.cancel(
         Number(req.params.id),
         req.tech.efr_id,
         { reason: req.body.reason || null, reasonId: req.body.reasonId },
       );
-      logger.info('Job cancelled · id=' + req.params.id);
+      logger.info('Cancel request recorded · id=' + req.params.id);
       modernOk(res, out);
-    } catch (e) { logger.warn('Cancel job failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
+    } catch (e) { logger.warn('Cancel request failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 

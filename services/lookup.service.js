@@ -686,40 +686,89 @@ async function rejectReasons() {
 }
 
 /*
- * "Can't complete today" — why the technician cannot finish the job on this
- * visit. action_type 26, user_type 4 (Technician), the app-facing bucket:
- * "Site is not ready", "Customer not responding", "Product is not delivered",
- * "I Reached Late" and so on.
+ * ─── THE TECHNICIAN-APP REASON BUCKETS ──────────────────────────────────────
+ *
+ * Every reason the technician app offers lives in the unified
+ * `action_taken_reason` table, discriminated by action_type + user_type 4
+ * (Technician), with status = 1 AND is_new = 1 as the legacy "active" filter.
+ * The action_type is the ONLY thing that varies between them, so there is one
+ * query and one `action_type` bind — see appActionReasons() below.
+ *
+ * ⚠ THREE SURFACES, TWO BUCKETS, AND ONE OF THE BUCKETS IS SHARED.
+ *
+ *   26 → "Can't complete today"  AND  the app's Reschedule REQUEST
+ *   27 → the app's Cancel REQUEST
+ *
+ * 26 genuinely serves two screens: a technician who cannot finish today and a
+ * technician asking ops to move the appointment answer the same question
+ * ("why not now?"), and ops seeded one list for both. They still get their own
+ * ENDPOINT NAME. Serving /cannot-complete-reasons to the Reschedule screen
+ * would tie the two surfaces together permanently: the day ops splits the
+ * buckets (or renames one), the change would silently land on the screen
+ * nobody was thinking about. A name per surface makes that a one-line edit
+ * here instead of a production surprise.
  *
  * NOT `rescheduleReasons()` above, which serves action_type 8 — a bucket that
  * deliberately mixes customer/tech/ops perspectives and is written from the
  * operator's chair ("SM is not available", "Postponed By EASYFix"). A
- * technician standing in a customer's flat cannot answer that list.
+ * technician standing in a customer's flat cannot answer that list. And NOT
+ * `cancelReasons()` above either: that is the CRM's own `tbl_cancel_reason`
+ * table, a different id space entirely. Both of those keep their names because
+ * the CRM's Schedule & Assign and Cancel dialogs already consume them.
  *
  * NOT `revisitReasons()` below either: that is a different four-row table
  * (revisit_reason_by_app) reached by tbl_job.revisit_reason_id.
  *
- * The id is stored on tbl_job.reschedule_reason_id, which already holds ids
- * from THIS bucket — 245 jobs carry 263 "Customer want a reschedule", 73 carry
- * 262, 23 carry 264 — so the destination is established and this endpoint only
- * closes the loop by letting the app offer the same list those rows came from.
+ * The ids land on tbl_job.reschedule_reason_id (26) and
+ * tbl_job.job_cancel_reason_id_by_easyfixer / enum_reason_id (27), which
+ * already hold ids from exactly these buckets in production.
  *
  * One caution for whoever reads reschedule_reason_id back: it is resolved
  * against action_taken_reason in some places and against reschedule_reason_app
  * in others (webhook.service.js:178), and those two id spaces OVERLAP at 1–4.
- * Every id this endpoint can return is >= 262, so nothing served here can land
- * in the ambiguous range.
+ * Every id these endpoints can return is >= 262, so nothing served here can
+ * land in the ambiguous range.
  */
-async function cannotCompleteReasons() {
-  logger.info('Lookup cannot-complete reasons');
+const APP_REASON_ACTION_TYPE = Object.freeze({
+  cannotComplete: 26,
+  reschedule:     26,
+  cancel:         27,
+});
+
+// user_type 4 = Technician. Pinned as a constant because it is the difference
+// between "the five reasons a tech may pick" and "every reason anyone may pick"
+// — a dropped user_type filter does not error, it just quietly widens the list.
+const APP_REASON_USER_TYPE = 4;
+
+async function appActionReasons(actionType) {
+  logger.info(`Lookup app action reasons · action_type=${actionType}`);
   const [rows] = await pool.query(
     `SELECT id, action_desc AS reason
        FROM action_taken_reason
-      WHERE action_type = 26 AND user_type = 4 AND status = 1 AND is_new = 1
-      ORDER BY action_desc ASC`
+      WHERE action_type = ? AND user_type = ? AND status = 1 AND is_new = 1
+      ORDER BY action_desc ASC`,
+    [actionType, APP_REASON_USER_TYPE],
   );
-  logger.info(`Found ${rows.length} cannot-complete reasons`);
+  logger.info(`Found ${rows.length} app action reasons · action_type=${actionType}`);
   return rows;
+}
+
+// "Can't complete today" — why the technician cannot finish on this visit.
+function cannotCompleteReasons() {
+  return appActionReasons(APP_REASON_ACTION_TYPE.cannotComplete);
+}
+
+// The app's Reschedule REQUEST screen. Same rows as cannotCompleteReasons
+// today (see the block above) — deliberately its own function so the two
+// surfaces can diverge without a second caller finding out by accident.
+function appRescheduleReasons() {
+  return appActionReasons(APP_REASON_ACTION_TYPE.reschedule);
+}
+
+// The app's Cancel REQUEST screen: "Self installed by customer", "Customer
+// want Cancellation", "Work done by another resource", …
+function appCancelReasons() {
+  return appActionReasons(APP_REASON_ACTION_TYPE.cancel);
 }
 
 // Checkout-flow reasons each live in their own thin (id, reason) table — no
@@ -799,6 +848,10 @@ module.exports = {
   rescheduleReasons,
   rejectReasons,
   cannotCompleteReasons,
+  appRescheduleReasons,
+  appCancelReasons,
+  APP_REASON_ACTION_TYPE,
+  APP_REASON_USER_TYPE,
   problemReasons,
   collectCashReasons,
   revisitReasons,

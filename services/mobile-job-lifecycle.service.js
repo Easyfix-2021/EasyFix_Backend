@@ -27,7 +27,8 @@ const CLOSING_PIN_TEMPLATE = String(
  * Mobile Job Lifecycle — the technician-app order flow that sits on top
  * of the shared jobService transitions:
  *
- *   cancel        → job_status 6  (CANCELLED)
+ *   cancel        → a cancel REQUEST for ops (job_status 1, flag set)
+ *   reschedule    → a reschedule REQUEST for ops (job_status 1, flag set)
  *   checkin-sms   → (re)send the customer the check-in PIN SMS
  *   selfie        → store the reached-location selfie ref on the job
  *   search        → find the tech's job by id (dashboard search)
@@ -46,11 +47,14 @@ const CLOSING_PIN_TEMPLATE = String(
  * Schema notes (verified against EasyFix_CRM JobDaoImpl.java mapper +
  * the legacy mobile API contract /tmp/deepskill-src/lib/src/api/app_api.dart):
  *   - fk_easyfixter_id            legacy typo, preserved.
- *   - cancel_reason_id / cancel_comment / cancel_by / cancel_date_time
- *                                 CANCELLED stamps (also stamped by
- *                                 jobService.setStatus — we route cancel
- *                                 through it so the CancelJob webhook +
- *                                 customer SMS fire from one place).
+ *   - is_cancelled_by_app /       BIT — "the technician has ASKED for this".
+ *     is_rescheduled_by_app       See THE REQUEST MODEL below.
+ *   - cancel_date_time /          Request stamps for the cancel ask. NOT the
+ *     cancel_comment /            same columns setStatus(6) writes for an
+ *     job_cancel_reason_id_by_easyfixer   actioned cancellation.
+ *   - reschedule_date_time_app    VARCHAR(255) — the REQUESTED appointment as
+ *                                 'yyyy-MM-dd HH:mm' TEXT. Deliberately not a
+ *                                 DATETIME: it is a proposal, not a schedule.
  *   - tx_selfie_id                FK to `document.id` for the reached-
  *                                 location selfie (JobDaoImpl.java:1874).
  *   - is_collected_cash_by_app    BIT — cash collected on this visit.
@@ -64,7 +68,58 @@ const CLOSING_PIN_TEMPLATE = String(
  * degrades gracefully (skips the missing column, never 500s).
  */
 
-const STATUS_CANCELLED = 6;
+/*
+ * ═══════════════════ THE REQUEST MODEL ═══════════════════════════════
+ *
+ * A technician does NOT cancel or reschedule a job. They ASK, and ops
+ * actions the ask. This is what the Flutter app did and what the CRM has
+ * always been built to read; the Node port briefly made both endpoints
+ * act directly, which is what this restores.
+ *
+ * A request is: job_status = STATUS_REQUEST_PENDING (1, "Scheduled" —
+ * unchanged for a job about to start) plus is_cancelled_by_app = 1 or
+ * is_rescheduled_by_app = 1, plus the ask's own stamps. The job does not
+ * move. Production carries 19 jobs sitting at exactly that state right
+ * now; rows at job_status 6 with is_cancelled_by_app = 1 are the ones ops
+ * later actioned into a real cancellation.
+ *
+ * TWO CONSEQUENCES THAT ARE EASY TO GET WRONG:
+ *
+ *  1. NO setStatus. Not setStatus(6) for cancel (that IS the cancellation
+ *     — webhook, customer SMS, cancel_by, the lot), and not setStatus with
+ *     the current status for reschedule either: the no-op-transition trick
+ *     the old reschedule route used rode the extras allowlist straight
+ *     into `requested_date_time`, i.e. it MOVED THE REAL APPOINTMENT. A
+ *     request must leave requested_date_time alone; only ops writes it.
+ *
+ *  2. NO WhatsApp on cancel. The legacy implementation had its cancel
+ *     WhatsApp commented out and shipped that way for years, so a customer
+ *     has never been told "your technician asked to cancel" — which is
+ *     correct, because at request time nothing has been decided yet.
+ *     Its absence here is deliberate; do not "restore" it. Reschedule DOES
+ *     notify, but the Project Manager, not the customer — the person who
+ *     has to action the ask.
+ */
+const STATUS_REQUEST_PENDING = 1;
+
+/*
+ * tbl_job_comment.comment_on for the two asks — legacy wire codes, verified
+ * against ~50k live rows (comment_on 9) and ~2.4k (comment_on 8), all with
+ * source_type 'API_App'. Exported so nothing re-types the digit.
+ */
+const COMMENT_ON_RESCHEDULE_BY_APP = 8;
+const COMMENT_ON_CANCEL_BY_APP     = 9;
+
+/*
+ * bit(1) comes back from mysql2 as a Buffer, not a number, and EVERY
+ * Buffer is truthy — including the one holding 0. `if (row.is_cancelled_by_app)`
+ * therefore reports every job as having a pending request. Always read a
+ * BIT through here.
+ */
+function bitTrue(v) {
+  if (Buffer.isBuffer(v)) return v[0] === 1;
+  return Number(v) === 1;
+}
 
 // ─── Column-existence probes (cached per-process) ───────────────────
 /*
@@ -88,9 +143,8 @@ async function hasJobColumn(colName) {
     return _colCache[colName];
   } catch (e) {
     /*
-     * Soft-fail to false is right for two of the three callers — cancel()
-     * only mirrors an optional reason/flag for legacy reports, and the status
-     * transition has already committed. It is wrong to make that PERMANENT.
+     * Soft-fail to false is right for an optional column, but it is wrong to
+     * make that answer PERMANENT.
      *
      * The old bare `catch { _colCache[colName] = false; }` did exactly that:
      * the memo guard is `!= null`, and `false != null`, so one transient
@@ -132,64 +186,293 @@ async function getOwnedJob(jobId, efrId) {
   return row;
 }
 
-// ─── Cancel (legacy actionType 27) ──────────────────────────────────
+// ─── Request audit rows (shared by cancel + reschedule) ─────────────
+/*
+ * The two audit trails every app request leaves, both best-effort.
+ *
+ * BEST-EFFORT IS THE POINT: the tbl_job UPDATE above them has already
+ * committed, so the technician's ask exists whether or not the CRM's
+ * history tables took the row. Failing the request here would show the
+ * technician an error for an ask that landed — and they would send it
+ * again, producing two.
+ *
+ *  - tbl_easyfixer_call_record: the legacy TECHNICIAN-side action feed the
+ *    CRM's Call Info modal reads. `action` and `source` are ENUMs
+ *    ('accepted','rejected','cancelled') / ('app','website','crm'), so
+ *    only those literals are storable — a typo here inserts a silent NULL,
+ *    not an error. Reschedule has no enum member of its own and legacy
+ *    never wrote one, so it does NOT get a call record.
+ *  - tbl_job_comment: comment_on 9 = cancel-by-app, 8 = reschedule-by-app.
+ *    Verified against ~53k live rows of exactly this shape.
+ *
+ * `commented_by` is left NULL on purpose. It is a tbl_user FK and its
+ * reader (job-comment.service listComments) joins it to tbl_user for the
+ * display name; the legacy app wrote an efr id into it, so those rows
+ * render whichever OPERATOR happens to hold that user_id. The technician's
+ * identity goes in tbl_job_comment.efr_id, the column that actually types
+ * it — same choice the checkout remark path already makes.
+ */
+async function recordRequestCallRecord(jobId, efrId, { action, reasonId, comment }) {
+  try {
+    await pool.query(
+      `INSERT INTO tbl_easyfixer_call_record
+         (efr_id, job_id, action, reason_id, comment, source, insert_date_time)
+       VALUES (?, ?, ?, ?, ?, 'app', ?)`,
+      [efrId, jobId, action, reasonId ?? null, comment || null, new Date()],
+    );
+  } catch (e) {
+    logger.warn('Request call-record failed (request still recorded) · jobId=' + jobId
+      + ' · action=' + action + ' · ' + e.message);
+  }
+}
+
+async function recordRequestComment(jobId, efrId, { commentOn, reasonId, comment, requestedDateTime }) {
+  try {
+    await pool.query(
+      `INSERT INTO tbl_job_comment
+         (job_id, comments, comment_on, enum_reason_id, efr_id,
+          requested_date_time, source_type, job_stage)
+       VALUES (?, ?, ?, ?, ?, ?, 'API_App', ?)`,
+      [
+        jobId,
+        // '' rather than NULL for a reason-only ask: the row must exist even
+        // with nothing typed, because the ask itself is the history entry.
+        // Legacy wrote a single space here for the same reason.
+        comment || '',
+        commentOn,
+        reasonId ?? null,
+        efrId,
+        requestedDateTime || null,
+        STATUS_REQUEST_PENDING,
+      ],
+    );
+  } catch (e) {
+    logger.warn('Request job-comment failed (request still recorded) · jobId=' + jobId
+      + ' · comment_on=' + commentOn + ' · ' + e.message);
+  }
+}
+
+// ─── Cancel REQUEST (legacy actionType 27) ──────────────────────────
 /*
  * POST /jobs/:id/cancel { reason, reasonId }
  *
- * Routes through jobService.setStatus(CANCELLED) so the shared path owns
- * the cancel_* stamps + the CancelJob webhook + the customer SMS. The
- * legacy mobile endpoint was `easyfixer-call-record/cancel` with
- * actionType=27; the cancel-by-app reason id maps to cancel_reason_id
- * and the free-text comment to cancel_comment.
+ * Records the technician's ASK to cancel. It does not cancel: see THE
+ * REQUEST MODEL above for why setStatus(6) is wrong here.
  *
- * `reasonId` is the FK into the app's cancel-reason list
- * (job_cancel_reason_by_easyfixer_app). We ALSO mirror it onto the
- * legacy app-specific column job_cancel_reason_id_by_easyfixer (probe-
- * gated) so the CRM "cancelled by app" reporting keeps working.
+ * `reasonId` is an `action_taken_reason` id — action_type 27, user_type 4
+ * (lookup.service.appCancelReasons, served at
+ * /shared/lookup/app-cancel-reasons). It is NOT the
+ * `job_cancel_reason_by_easyfixer_app` table this comment used to name;
+ * that claim was wrong, and joining the live ids (267–271) against
+ * action_taken_reason is what disproved it. Written to
+ * job_cancel_reason_id_by_easyfixer (the app-specific slot the CRM's
+ * "cancelled by app" reporting reads) and mirrored onto enum_reason_id
+ * (the generic slot the Remarks history resolves).
+ *
+ * cancel_reason_id / cancel_by are deliberately NOT written: those belong
+ * to an actioned cancellation and setting them now would make a pending
+ * ask indistinguishable from a decision ops never made.
  */
 async function cancel(jobId, efrId, { reason, reasonId }) {
-  logger.info('Cancel job · jobId=' + jobId + ' reasonId=' + (reasonId ?? '-'));
+  logger.info('Cancel request from app · jobId=' + jobId + ' reasonId=' + (reasonId ?? '-'));
   await getOwnedJob(jobId, efrId);
 
-  await jobService.setStatus(
-    jobId,
-    { status: STATUS_CANCELLED, reasonId: reasonId || null, comment: reason || null },
-    // `efr_id` names the namespace `user_id` is carrying. Legacy columns
-    // (cancel_by, fk_checkout_by, commented_by) read user_id and keep storing an
-    // efr id in a tbl_user slot — a live defect this does not change. What it
-    // does is stop that ambiguity reaching tbl_job_logs.changed_by, where
-    // services/job-log.service.js uses efr_id to keep a technician out of a
-    // column that must only ever hold a tbl_user id.
-    { user_id: efrId, efr_id: efrId },
+  const now = new Date();
+  const comment = reason == null ? null : String(reason).trim() || null;
+  /*
+   * One UPDATE, not a transition. `fk_easyfixter_id = ?` is the second
+   * ownership guard every write in this file carries (the route already
+   * checked) — a request can only ever be raised against the technician's
+   * own job, even if the route check is bypassed one day.
+   */
+  const [res] = await pool.query(
+    `UPDATE tbl_job
+        SET job_status = ?,
+            is_cancelled_by_app = 1,
+            cancel_date_time = ?,
+            cancel_comment = ?,
+            job_cancel_reason_id_by_easyfixer = ?,
+            enum_reason_id = ?,
+            remarks = ?,
+            remarks_date_time = ?
+      WHERE job_id = ? AND fk_easyfixter_id = ?`,
+    [
+      STATUS_REQUEST_PENDING, now, comment,
+      reasonId ?? null, reasonId ?? null,
+      comment, now,
+      jobId, efrId,
+    ],
   );
-
-  // Mirror the app-specific cancel reason + flag for legacy CRM reports.
-  // Soft-fail: the status transition already committed via setStatus;
-  // this mirror is a reporting convenience, not a correctness gate.
-  try {
-    const sets = [];
-    const vals = [];
-    if (reasonId != null && await hasJobColumn('job_cancel_reason_id_by_easyfixer')) {
-      sets.push('job_cancel_reason_id_by_easyfixer = ?');
-      vals.push(Number(reasonId));
-    }
-    if (await hasJobColumn('is_cancelled_by_app')) {
-      sets.push('is_cancelled_by_app = 1');
-    }
-    if (sets.length) {
-      vals.push(jobId, efrId);
-      await pool.query(
-        `UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ? AND fk_easyfixter_id = ?`,
-        vals,
-      );
-    }
-  } catch (mirrorErr) {
-    logger.warn('Cancel app-reason mirror failed (job already cancelled) · jobId=' + jobId + ' · ' + mirrorErr.message);
-    logger.warn({ err: mirrorErr.message, jobId, efrId }, 'cancel: app-reason mirror failed (job already cancelled)');
+  if (!res || res.affectedRows === 0) {
+    // getOwnedJob passed a moment ago, so zero rows means the job was
+    // reassigned underneath us. Same 404 the ownership guard gives.
+    const e = new Error('job not found'); e.status = 404; throw e;
   }
 
-  logger.info('Job cancelled · jobId=' + jobId);
-  return { cancelled: true };
+  await recordRequestCallRecord(jobId, efrId, { action: 'cancelled', reasonId, comment });
+  await recordRequestComment(jobId, efrId, {
+    commentOn: COMMENT_ON_CANCEL_BY_APP, reasonId, comment,
+  });
+
+  // NO WhatsApp here — see THE REQUEST MODEL. Nothing has been decided yet.
+  logger.info('Cancel request recorded · jobId=' + jobId);
+  return { requested: true, requestType: 'cancel' };
+}
+
+// ─── Reschedule REQUEST (legacy actionType 26) ──────────────────────
+/*
+ * POST /jobs/:id/reschedule { newDate, reasonId, remarks? }
+ *
+ * Records the technician's ASK to move the appointment. The APPOINTMENT
+ * DOES NOT MOVE: `requested_date_time` is untouched and the proposal lands
+ * in `reschedule_date_time_app` instead. The previous implementation wrote
+ * requested_date_time through setStatus's extras allowlist, so a
+ * technician could silently re-schedule a customer's visit with nobody
+ * approving it — and, because it parsed the app's wall-clock string with
+ * `new Date()` in a UTC container, usually to the wrong hour as well.
+ *
+ * `newDate` is an IST WALL-CLOCK string ('YYYY-MM-DDTHH:mm[:ss]' — the app
+ * builds it from local getters, never toISOString). It is sliced, never
+ * parsed: reschedule_date_time_app is VARCHAR and the value must survive
+ * verbatim. See the assignBody note in validators/job.validator.js for why
+ * Joi.date() is banned on every one of these fields.
+ */
+async function requestReschedule(jobId, efrId, { newDate, reasonId, remarks }) {
+  logger.info('Reschedule request from app · jobId=' + jobId + ' reasonId=' + (reasonId ?? '-'));
+  await getOwnedJob(jobId, efrId);
+
+  const now = new Date();
+  // 'YYYY-MM-DDTHH:mm:ss' → 'YYYY-MM-DD HH:mm'. Minute precision is what the
+  // column holds in production and what the CRM renders.
+  const requestedText = String(newDate).replace('T', ' ').slice(0, 16);
+  const comment = remarks == null ? null : String(remarks).trim() || null;
+
+  const sets = [
+    'job_status = ?',
+    'is_rescheduled_by_app = 1',
+    'reschedule_date_time_app = ?',
+    'enum_reason_id = ?',
+    'remarks = ?',
+    'remarks_date_time = ?',
+    // Kept from the previous implementation: ops counts how many times a job
+    // has been pushed, and the ask is the thing being counted.
+    'resch_job_count = COALESCE(resch_job_count, 0) + 1',
+  ];
+  const vals = [STATUS_REQUEST_PENDING, requestedText, reasonId ?? null, comment, now];
+
+  /*
+   * reschedule_reason_id and the two reschedule_* comment columns are
+   * CONDITIONAL, matching legacy. A 0 reasonId is the app's "nothing
+   * picked" sentinel, not reason #0, and writing it would point the CRM's
+   * reason join at a row that does not exist. Likewise reschedule_remarks /
+   * reschedule_at_app are only stamped when a comment actually came with
+   * the ask — blank-stamping them erases the remark from a PREVIOUS ask
+   * that ops has not looked at yet.
+   */
+  if (reasonId != null && Number(reasonId) !== 0) {
+    sets.push('reschedule_reason_id = ?');
+    vals.push(Number(reasonId));
+  }
+  if (comment) {
+    sets.push('reschedule_remarks = ?', 'reschedule_at_app = ?');
+    vals.push(comment, now);
+  }
+
+  vals.push(jobId, efrId);
+  const [res] = await pool.query(
+    `UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ? AND fk_easyfixter_id = ?`,
+    vals,
+  );
+  if (!res || res.affectedRows === 0) {
+    const e = new Error('job not found'); e.status = 404; throw e;
+  }
+
+  await recordRequestComment(jobId, efrId, {
+    commentOn: COMMENT_ON_RESCHEDULE_BY_APP,
+    reasonId,
+    comment,
+    requestedDateTime: requestedText,
+  });
+
+  // Fire-and-forget: the PM is who ACTIONS this, so they are told. Awaited so
+  // failures are logged in request context, but never rethrown — a WhatsApp
+  // outage must not lose a request that is already committed.
+  await notifyPmOfRescheduleRequest(jobId, requestedText, reasonId);
+
+  logger.info('Reschedule request recorded · jobId=' + jobId + ' · requested=' + requestedText);
+  return { requested: true, requestType: 'reschedule', requestedDateTime: requestedText };
+}
+
+/*
+ * Gallabox WhatsApp to the job's Project Manager.
+ *
+ * Recipient: tbl_job.job_vertical_manager → tbl_user. That column is the
+ * job's own PM snapshot (populated on ~2/3 of recent jobs; where it
+ * resolves it resolves to a real user with a mobile 100% of the time). It
+ * is used rather than re-deriving the PM from tbl_vertical_mapping so the
+ * message reaches whoever owned the job, not whoever owns the vertical
+ * today.
+ *
+ * Template name is a DEFAULT, not a literal, for the same reason
+ * CLOSING_PIN_TEMPLATE is: Gallabox answers 200 for a template name it does
+ * not recognise and the handset simply never receives anything, so a wrong
+ * name is a SILENT non-delivery no delivery check can catch. Setting the
+ * env var to an empty string disables the send with a loud log line.
+ */
+const RESCHEDULE_REQUEST_TEMPLATE = String(
+  process.env.GALLABOX_RESCHEDULE_REQUEST_TEMPLATE ?? 'pm_reschedule_request',
+).trim();
+
+async function notifyPmOfRescheduleRequest(jobId, requestedText, reasonId) {
+  if (!RESCHEDULE_REQUEST_TEMPLATE) {
+    logger.warn('PM reschedule WhatsApp disabled (GALLABOX_RESCHEDULE_REQUEST_TEMPLATE empty) · jobId=' + jobId);
+    return;
+  }
+  try {
+    const [[row]] = await pool.query(
+      `SELECT pm.user_name AS pm_name, pm.mobile_no AS pm_mobile,
+              ef.efr_name AS technician_name,
+              COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+              (SELECT atr.action_desc FROM action_taken_reason atr
+                WHERE atr.id = ? LIMIT 1) AS reason_desc
+         FROM tbl_job j
+         LEFT JOIN tbl_user      pm ON pm.user_id = j.job_vertical_manager
+         LEFT JOIN tbl_easyfixer ef ON ef.efr_id  = j.fk_easyfixter_id
+         LEFT JOIN tbl_customer  cu ON cu.customer_id = j.fk_customer_id
+        WHERE j.job_id = ? LIMIT 1`,
+      [reasonId ?? null, jobId],
+    );
+    if (!row || !row.pm_mobile) {
+      // A third of jobs carry no vertical manager. Not an error — there is
+      // nobody to tell, and the request is still visible in the CRM list.
+      logger.warn('PM reschedule WhatsApp skipped · no project manager on job · jobId=' + jobId);
+      return;
+    }
+    await gallabox.sendTemplate({
+      to: row.pm_mobile,
+      recipientName: row.pm_name || '',
+      templateName: RESCHEDULE_REQUEST_TEMPLATE,
+      /*
+       * Positional binding — the shape every template in this backend except
+       * the two enquiry ones uses. Positional keys against a NAMED template
+       * bind to nothing and deliver "Hello []", so this must match how the
+       * template was registered.
+       *   {{1}} technician  {{2}} job id  {{3}} customer
+       *   {{4}} requested slot  {{5}} reason
+       */
+      bodyValues: {
+        1: row.technician_name || 'A technician',
+        2: String(jobId),
+        3: row.customer_name || 'the customer',
+        4: requestedText,
+        // Never send an empty template variable — some BSPs reject the whole
+        // template rather than the one field.
+        5: (row.reason_desc || '').trim() || 'Not specified',
+      },
+    });
+  } catch (e) {
+    logger.warn('PM reschedule WhatsApp failed (request still recorded) · jobId=' + jobId + ' · ' + e.message);
+  }
 }
 
 // ─── Check-in PIN SMS ────────────────────────────────────────────────
@@ -722,14 +1005,11 @@ async function getWorkProgress(jobId, efrId) {
   if (!r || Number(r.fk_easyfixter_id) !== Number(efrId)) {
     const e = new Error('job not found'); e.status = 404; throw e;
   }
-  const cashBit = Buffer.isBuffer(r.is_collected_cash_by_app)
-    ? r.is_collected_cash_by_app[0] === 1
-    : Number(r.is_collected_cash_by_app) === 1;
   return {
     jobId:           r.job_id,
     haveProblem:     Number(r.problem_reason_id) > 0,
     problemReasonId: r.problem_reason_id || undefined,
-    isCashCollected: cashBit,
+    isCashCollected: bitTrue(r.is_collected_cash_by_app),
     collectedAmount: r.material_charge || undefined,
     cashReasonId:    r.collect_cash_reason_id || undefined,
     isNextVisit:     Number(r.job_status) === 10,
@@ -741,6 +1021,7 @@ async function getWorkProgress(jobId, efrId) {
 
 module.exports = {
   cancel,
+  requestReschedule,
   sendCheckinSms,
   saveSelfie,
   searchByJobId,
@@ -748,4 +1029,10 @@ module.exports = {
   getQuestionnaire,
   submitQuestionnaire,
   getWorkProgress,
+  // The request model's wire constants — exported so callers and tests read
+  // the one definition instead of re-typing a legacy code.
+  STATUS_REQUEST_PENDING,
+  COMMENT_ON_CANCEL_BY_APP,
+  COMMENT_ON_RESCHEDULE_BY_APP,
+  bitTrue,
 };

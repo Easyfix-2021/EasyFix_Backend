@@ -603,7 +603,47 @@ const LIST_COLUMNS = `
         AND LOWER(TRIM(REPLACE(ccp.c_prop_name, '_', ' '))) = LOWER('Auto Process Unconfirmed Order')
         AND LOWER(TRIM(ccp.c_prop_values)) = 'true'
         AND ccp.status = 1
-   )) AS client_opted_in
+   )) AS client_opted_in,
+  /*
+   * ── APP REQUESTS (2026-09-10) ────────────────────────────────────────────
+   * The technician app's cancel / reschedule endpoints record a REQUEST for
+   * ops rather than performing the action (services/mobile-job-lifecycle
+   * .service.js, THE REQUEST MODEL). These five fields are what the CRM
+   * buckets and renders it from:
+   *
+   *   pending request  ⇔  job_status = 1 AND (is_cancelled_by_app = 1
+   *                                            OR is_rescheduled_by_app = 1)
+   *
+   * Every column is long-standing on tbl_job, so unlike the offer / customer-
+   * request blocks below there is nothing to existence-probe — they go
+   * straight on the base projection.
+   *
+   * THE "= 1" WRAPPERS ARE NOT DECORATION. Both flags are bit(1), which mysql2
+   * hands back as a Buffer — and every Buffer is truthy in JS, including the
+   * one holding 0. Projected raw, the CRM would show a pending-cancel banner
+   * on every job in the list AND serialise {"type":"Buffer"} into the API
+   * payload. COALESCE keeps a NULL flag out of the result as 0 rather than
+   * NULL, so the FE only ever sees 0 or 1.
+   *
+   * app_request_reason — the ask's reason text. One reason_id column per ask
+   * (cancel writes job_cancel_reason_id_by_easyfixer, reschedule writes
+   * reschedule_reason_id) both resolving against action_taken_reason; the
+   * COALESCE picks whichever ask is live. A job that has been both at
+   * different times resolves the CANCEL reason first because a cancel ask is
+   * the one that stops work.
+   */
+  (COALESCE(j.is_cancelled_by_app, 0) = 1)   AS is_cancelled_by_app,
+  (COALESCE(j.is_rescheduled_by_app, 0) = 1) AS is_rescheduled_by_app,
+  j.reschedule_date_time_app,
+  j.cancel_date_time,
+  COALESCE(
+    (SELECT atr.action_desc FROM action_taken_reason atr
+      WHERE COALESCE(j.is_cancelled_by_app, 0) = 1
+        AND atr.id = j.job_cancel_reason_id_by_easyfixer LIMIT 1),
+    (SELECT atr.action_desc FROM action_taken_reason atr
+      WHERE COALESCE(j.is_rescheduled_by_app, 0) = 1
+        AND atr.id = j.reschedule_reason_id LIMIT 1)
+  ) AS app_request_reason
 `;
 
 /*
@@ -2574,6 +2614,14 @@ async function getByIdCore(jobId) {
             cr.user_name AS created_by_name,
             (SELECT u2.user_name FROM tbl_user u2 WHERE u2.user_id = j.cancel_by LIMIT 1) AS cancelled_by_name,
             (SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name,
+            /* The two app-REQUEST reason texts (see buildAppRequest below).
+               Separate aliases, not one COALESCE like the LIST's
+               app_request_reason: the detail payload picks the live ask in JS,
+               where the flag it depends on is already decoded. */
+            (SELECT atr.action_desc FROM action_taken_reason atr
+              WHERE atr.id = j.job_cancel_reason_id_by_easyfixer LIMIT 1) AS app_cancel_reason_name,
+            (SELECT atr.action_desc FROM action_taken_reason atr
+              WHERE atr.id = j.reschedule_reason_id LIMIT 1) AS app_reschedule_reason_name,
             /* From Production: enquiry reason, NULL-aliased on deploys that
                predate the enquiry columns (hasEnquiryColumns probe above). */
             ${enquiryReasonSelect}
@@ -2620,7 +2668,71 @@ async function getByIdCore(jobId) {
    * payload gains the key too and ignores it — additive.
    */
   job.geofence = jobLocation.buildGeofence(job.gps_location);
+  /*
+   * appRequest (2026-09-10) — { type, requestedDateTime, reasonId, reason,
+   * requestedAt } | null. The technician app renders a "waiting for ops"
+   * banner from it and, crucially, HIDES its Cancel / Reschedule buttons
+   * while it is non-null: without that, a technician whose ask has not been
+   * actioned yet sends it again, and ops gets a queue of duplicates with no
+   * way to tell which one the tech meant.
+   *
+   * Derived here rather than in the mobile route for the same reason geofence
+   * is: one definition feeds every detail consumer, and the CRM gaining a key
+   * it ignores is additive.
+   */
+  job.appRequest = buildAppRequest(job);
   return job;
+}
+
+/*
+ * bit(1) → boolean. mysql2 returns a BIT column as a Buffer, never a number.
+ * A local copy rather than an import: mobile-job-lifecycle.service.js already
+ * requires THIS module, so reaching the other way would close a require cycle
+ * — and a dozen services in this repo each carry the same two lines.
+ */
+function bitTrue(v) {
+  if (Buffer.isBuffer(v)) return v[0] === 1;
+  return Number(v) === 1;
+}
+
+/*
+ * Which ask, if any, is in flight on this job row.
+ *
+ * The flags are bit(1) → Buffer, and every Buffer is truthy, so reading them
+ * with a bare `if` reports a pending request on EVERY job. `bitTrue` is the
+ * only correct read.
+ *
+ * Cancel wins when both flags are set: it is the ask that stops work, and ops
+ * answering it makes the reschedule moot. Deliberately does NOT require
+ * job_status = 1 the way the CRM's list bucket does — the app must keep
+ * showing the banner if ops moves the job while the ask is still open, and
+ * hiding it would put the request buttons back.
+ */
+function buildAppRequest(job) {
+  if (!job) return null;
+  const cancelPending = bitTrue(job.is_cancelled_by_app);
+  const reschedulePending = bitTrue(job.is_rescheduled_by_app);
+  if (!cancelPending && !reschedulePending) return null;
+  if (cancelPending) {
+    return {
+      type: 'cancel',
+      // A cancel ask proposes no new slot — the field exists so the app reads
+      // one shape for both asks rather than branching on presence.
+      requestedDateTime: null,
+      reasonId: job.job_cancel_reason_id_by_easyfixer ?? null,
+      reason: job.app_cancel_reason_name ?? null,
+      requestedAt: job.cancel_date_time ?? null,
+    };
+  }
+  return {
+    type: 'reschedule',
+    // VARCHAR 'yyyy-MM-dd HH:mm' IST wall-clock — passed through verbatim.
+    // Never new Date() it: that re-reads an IST literal in the server's zone.
+    requestedDateTime: job.reschedule_date_time_app ?? null,
+    reasonId: job.reschedule_reason_id ?? null,
+    reason: job.app_reschedule_reason_name ?? null,
+    requestedAt: job.reschedule_at_app ?? null,
+  };
 }
 
 async function getById(jobId) {
@@ -4456,8 +4568,16 @@ function statusToEventName(prevStatus, newStatus) {
  *                                  checkin_pincode, fk_checkin_by
  *   - Mobile /jobs/:id/checkout  → app_checkout_date_time
  *   - Mobile /jobs/:id/eta       → eta_status, eta_requested_time
- *   - Mobile /jobs/:id/reschedule → reschedule_reason_id, reschedule_remarks,
- *                                  reschedule_at_app, is_rescheduled_by_app
+ *
+ * ⚠ NO CURRENT CALLER passes the reschedule_* / is_rescheduled_by_app /
+ * resch_job_count entries below (2026-09-10). They were the mobile
+ * /jobs/:id/reschedule route's, which rode a no-op status transition purely to
+ * reach this allowlist — and used it to write `requested_date_time`, moving a
+ * customer's appointment on a technician's say-so. That route now records a
+ * REQUEST with its own UPDATE (services/mobile-job-lifecycle.service.js) and
+ * the ops-side reschedule writes its columns directly. The entries are left in
+ * place because this is a GUARD, not a writer: a name here permits nothing on
+ * its own, and removing one is only ever a tightening to prove separately.
  */
 const STATUS_EXTRAS_ALLOWLIST = new Set([
   // Check-in stamps (mobile /checkin path)
@@ -6719,6 +6839,14 @@ module.exports = {
    * rather than a comment.
    */
   OFFER_STATE_VALUES, offerStateClause, offerColumns,
+  /*
+   * The app-REQUEST pair, exported for the same reason offerColumns is: the
+   * LIST projection and the DETAIL decode are two answers to one question
+   * ("is a technician waiting on ops for this job?"), and the tests pin that
+   * they agree — including the bit(1)/Buffer trap, where a bare projection or
+   * a bare `if` silently reports EVERY job as having a pending request.
+   */
+  LIST_COLUMNS, buildAppRequest,
   /*
    * `job.offer_expiry.enabled` — exported so the tests can pin BOTH regimes
    * (expiry on ⇒ a stale OFFERED row reads Expired; expiry off ⇒ it stays

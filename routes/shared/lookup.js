@@ -158,6 +158,27 @@ router.get('/reschedule-reasons', async (_req, res, next) => {
 router.get('/cannot-complete-reasons', async (_req, res, next) => {
   try { logger.info('Lookup cannot-complete-reasons'); modernOk(res, await cached('lookup:cannot-complete-reasons', TTL_STATIC, () => lookup.cannotCompleteReasons())); } catch (e) { next(e); }
 });
+
+/*
+ * The technician app's cancel/reschedule REQUEST screens.
+ *
+ * Named apart from /cancel-reasons and /reschedule-reasons above, which are the
+ * CRM's own lists off different sources (tbl_cancel_reason; action_type 8) and
+ * are already consumed by the Schedule & Assign and Cancel dialogs — repointing
+ * either would change what an operator sees, which is not what this is for.
+ *
+ * /app-reschedule-reasons currently returns the same rows as
+ * /cannot-complete-reasons (both are action_type 26 — see the block above
+ * lookup.service.appActionReasons). Own name, own cache key, one query.
+ */
+router.get('/app-cancel-reasons', async (_req, res, next) => {
+  try { logger.info('Lookup app-cancel-reasons'); modernOk(res, await cached('lookup:app-cancel-reasons', TTL_STATIC, () => lookup.appCancelReasons())); } catch (e) { next(e); }
+});
+
+router.get('/app-reschedule-reasons', async (_req, res, next) => {
+  try { logger.info('Lookup app-reschedule-reasons'); modernOk(res, await cached('lookup:app-reschedule-reasons', TTL_STATIC, () => lookup.appRescheduleReasons())); } catch (e) { next(e); }
+});
+
 router.get('/reject-reasons',     async (_req, res, next) => {
   try { logger.info('Lookup reject-reasons'); modernOk(res, await cached('lookup:reject-reasons', TTL_STATIC, () => lookup.rejectReasons())); } catch (e) { next(e); }
 });
