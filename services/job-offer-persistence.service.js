@@ -1,4 +1,5 @@
 const { OFFER_STATUS } = require('./offer-status');
+const { OFFER_CLOSED_REASON, closedReasonSet } = require('./offer-closed-reason');
 
 const MAX_OFFER_RECIPIENTS = 50;
 
@@ -132,15 +133,24 @@ async function persistJobOfferBatch(conn, {
     );
 
     const existingIdPlaceholders = existingIds.map(() => '?').join(', ');
+    /*
+     * These rows are being SUPERSEDED by the round above, not timed out. Job
+     * 538177 is the case in point: two offers read EXPIRED after 22 hours with
+     * the timeout switched off, closed here six seconds before the new offer
+     * went out. Recording the cause is what stops that reading as "the
+     * technician ignored it" — see services/offer-closed-reason.js.
+     */
+    const crReoffer = await closedReasonSet(OFFER_CLOSED_REASON.REOFFERED);
     await conn.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ?, responded_at = NOW()
+          SET offer_status = ?, responded_at = NOW()${crReoffer.sql}
         WHERE job_id = ?
           AND fk_easyfixter_id IN (${existingIdPlaceholders})
           AND offer_status = ?
           AND job_offer_id NOT IN (${offerIdPlaceholders})`,
       [
         OFFER_STATUS.EXPIRED,
+        ...crReoffer.params,
         normalized.jobId,
         ...existingIds,
         OFFER_STATUS.OFFERED,

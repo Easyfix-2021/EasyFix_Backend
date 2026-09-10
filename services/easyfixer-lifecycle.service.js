@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const { OFFER_STATUS } = require('./offer-status');
+const { OFFER_CLOSED_REASON, closedReasonSet } = require('./offer-closed-reason');
 // LMS completion feeds both the entrance to and the exit from TRAINING_PENDING.
 // lms.service requires only db + logger, so there is no cycle here.
 const lms = require('./lms.service');
@@ -1296,13 +1297,19 @@ async function postCommitSideEffects(efrId, result, input) {
  */
 async function expireOpenOffersForRestrictedLifecycle(conn, efrId) {
   try {
+    /*
+     * Per-TECHNICIAN, so this is the one cause an operator could never infer
+     * from the job: their offers close across EVERY job at once because they
+     * became unavailable. Recorded so the row does not read as a decline.
+     */
+    const crRestricted = await closedReasonSet(OFFER_CLOSED_REASON.TECHNICIAN_RESTRICTED);
     const [result] = await conn.query(
       `UPDATE tbl_job_offer
           SET offer_status = ?,
-              responded_at = COALESCE(responded_at, NOW())
+              responded_at = COALESCE(responded_at, NOW())${crRestricted.sql}
         WHERE fk_easyfixter_id = ?
           AND offer_status = ?`,
-      [OFFER_STATUS.EXPIRED, Number(efrId), OFFER_STATUS.OFFERED],
+      [OFFER_STATUS.EXPIRED, ...crRestricted.params, Number(efrId), OFFER_STATUS.OFFERED],
     );
     return Number(result?.affectedRows) || 0;
   } catch (error) {

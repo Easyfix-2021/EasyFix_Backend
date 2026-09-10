@@ -123,6 +123,13 @@ function offerExpiryEnabled() {
 // Named tbl_job_offer.offer_status codes (see services/offer-status.js) — every
 // query below interpolates ${OFFER_STATUS.X} instead of a bare 0/1/2/3.
 const { OFFER_STATUS } = require('./offer-status');
+/*
+ * WHY an offer closed, not just that it did. EXPIRED is written by eight paths
+ * and only one is the 30-minute timeout — see services/offer-closed-reason.js.
+ * Every EXPIRED write below records its cause; the SET fragment is empty until
+ * the column exists, so the code may ship before or after the migration.
+ */
+const { OFFER_CLOSED_REASON, closedReasonSet } = require('./offer-closed-reason');
 
 /*
  * Bulk-expire OPEN offers older than OFFER_TTL_MINUTES (offer_status 0 → 3
@@ -155,12 +162,13 @@ async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES, jobId = null
   const params = [maxAgeMinutes];
   let jobClause = '';
   if (jobId != null) { jobClause = ' AND job_id = ?'; params.push(Number(jobId)); }
+  const crTtl = await closedReasonSet(OFFER_CLOSED_REASON.TTL_ELAPSED);
   const [r] = await pool.query(
     `UPDATE tbl_job_offer
-        SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+        SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crTtl.sql}
       WHERE offer_status = ${OFFER_STATUS.OFFERED}
         AND offered_at < NOW() - INTERVAL ? MINUTE${jobClause}`,
-    params,
+    [...crTtl.params, ...params],
   );
   return { expired: r.affectedRows || 0 };
 }
@@ -203,11 +211,12 @@ async function withdrawOffersForClosedJob(jobId, status) {
   if (!OFFER_WITHDRAWAL_STATES.has(Number(status))) return { withdrawn: 0, skipped: true };
   try {
     if (!(await jobOfferTableExists())) return { withdrawn: 0, skipped: true };
+    const crClosed = await closedReasonSet(OFFER_CLOSED_REASON.JOB_CLOSED);
     const [r] = await pool.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crClosed.sql}
         WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [Number(jobId)],
+      [...crClosed.params, Number(jobId)],
     );
     const withdrawn = r.affectedRows || 0;
     if (withdrawn > 0) {
@@ -5157,11 +5166,12 @@ async function releaseOwnedJobForReoffer(jobId, preloadedJob, { reasonId, resche
      * applyUnassignLocked above, which rejects only the latest row for that
      * technician — this sweep covers everyone else.
      */
+    const crRelease = await closedReasonSet(OFFER_CLOSED_REASON.RELEASED_FOR_REOFFER);
     await conn.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crRelease.sql}
         WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [jobId],
+      [...crRelease.params, jobId],
     );
     await conn.commit();
     return releasedTechId;
@@ -5400,11 +5410,12 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
     // Close them while holding the job lock so flag changes and mixed-version
     // replicas cannot leave a stale decision that another technician can see.
     if (hasOfferTable) {
+      const crAssign = await closedReasonSet(OFFER_CLOSED_REASON.JOB_ASSIGNED);
       await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crAssign.sql}
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [jobId],
+        [...crAssign.params, jobId],
       );
     }
 
@@ -5767,10 +5778,11 @@ async function acceptOffer(jobId, efrId) {
         err.status = 409;
         throw err;
       }
+      const crWon = await closedReasonSet(OFFER_CLOSED_REASON.SIBLING_ACCEPTED);
       await conn.query(
-        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crWon.sql}
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [jobId],
+        [...crWon.params, jobId],
       );
       await conn.commit();
       committed = true;
@@ -5785,10 +5797,11 @@ async function acceptOffer(jobId, efrId) {
 
     // Lost the race (someone else won, or the job already moved on). Expire this
     // tech's own open offer, commit that, and flag a 409 to throw post-finally.
+    const crLost = await closedReasonSet(OFFER_CLOSED_REASON.SIBLING_ACCEPTED);
     await conn.query(
-      `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+      `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crLost.sql}
         WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [jobId, efrId],
+      [...crLost.params, jobId, efrId],
     );
     await conn.commit();
     committed = true;
@@ -6146,11 +6159,12 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
     // Open offers were extended for the OLD slot — expire them so no tech accepts
     // a stale appointment. Tolerant of a missing offer table (un-migrated deploys).
     if (await jobOfferTableExists()) {
+      const crResched = await closedReasonSet(OFFER_CLOSED_REASON.RESCHEDULED);
       await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crResched.sql}
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [jobId],
+        [...crResched.params, jobId],
       );
     }
     await conn.commit();
