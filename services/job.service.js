@@ -4902,6 +4902,58 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
   }
   const hasSlot = timeSlot !== undefined && timeSlot !== null && timeSlot !== '';
 
+  /*
+   * A BOOKED job that STILL CARRIES AN OWNER: release first, then offer.
+   *
+   * The locked guard below refuses an owned job (JOB_NOT_OFFERABLE) and that is
+   * right — offering a job someone already holds is a double-booking. But
+   * `job_status = 0 AND fk_easyfixter_id IS NOT NULL` is a REAL state that NO
+   * writer in this backend produces: assign() bumps 0 -> 1 in the same UPDATE,
+   * applyUnassignLocked clears status and owner together, acceptOffer sets both,
+   * and createJob never inserts fk_easyfixter_id at all. It arrives from the
+   * legacy Java CRM, whose assign wrote the owner and left the job BOOKED — its
+   * "Pending App Ack" bucket, which the reports still model by name
+   * (quicksight-priority-jobs.service.js: job_status = 0 AND fk IS NOT NULL ->
+   * 'Pending For Acknowledgment').
+   *
+   * Schedule & Assign gates only on job_status, so it opens for these rows and
+   * its one commit button then 409s every time. Production job 534947 — BOOKED,
+   * owned, and with ZERO tbl_job_offer rows — took 16 such attempts from two
+   * operators on 2026-09-10 before they gave up and left a comment. It was the
+   * only job in the whole log to hit it, so this is a stuck row, not a
+   * regression; the defect is that the UI's only exit from that row is a wall.
+   *
+   * assign() already knows the move when a job's owner has to be replaced:
+   * release the outgoing claim, then offer. Reuse it here instead of dead-ending
+   * the operator. The invariant is NOT weakened — the release commits first, so
+   * the locked guard below still sees an ownerless job, and anything that claims
+   * it in the gap makes this offer fail that guard rather than overwrite a live
+   * assignment. Deliberately BOOKED-only: a SCHEDULED reassign keeps going
+   * through assign(), which carries the reschedule reason.
+   */
+  if (Number(existing.job_status) === STATUS.BOOKED && existing.fk_easyfixter_id != null) {
+    // Eligibility BEFORE the release, exactly as assign() sequences it: an
+    // ineligible incoming technician must not leave the job ownerless as the
+    // side effect of a request that then 400s.
+    await assertTechniciansCanReceiveJobs(ids);
+    const releasedTechId = await releaseOwnedJobForReoffer(jobId, existing, {
+      reasonId: null,
+      // Not a technician rejection and not a reassign to one named person — the
+      // job is going back to the pool. Says so, or scheduling_history reads as
+      // an unexplained unassignment.
+      rescheduleReason: 'Released to the offer pool',
+    });
+    logger.info('Stale owner released before offer · id=' + jobId + ' · from=' + releasedTechId);
+    // The outgoing technician's app still shows the job, so tell it — fire and
+    // forget AFTER the release committed, the ordering assign() uses (a push
+    // that beat the commit would announce a removal a rollback then undid).
+    if (releasedTechId != null) {
+      require('./job-offer-push.service')
+        .sendJobRemovedPush(releasedTechId, { jobId, reassigned: true })
+        .catch(() => {});
+    }
+  }
+
   // Resolve the schema-dependent projection before opening the transaction;
   // the actual eligibility read happens under row locks below.
   const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
