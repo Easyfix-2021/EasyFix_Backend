@@ -67,6 +67,9 @@ const {
   buildExportWhere, fetchExportChunk, FILTER_COVERAGE, UNAPPLIED_FILTERS,
 } = require('../services/job-export.service');
 const { listQuery } = require('../validators/job.validator');
+// Source of truth for stage → visible statuses. Imported so the assertions
+// below track a realignment instead of snapshotting one moment of it.
+const { STAGES, STAGE_KEYS } = require('../lib/job-stages');
 
 const where = (filters) => buildExportWhere(filters).where;
 // Both halves, for assertions that need to see the bound VALUES too.
@@ -341,7 +344,32 @@ test('a stage grant INSIDE the terminal set still returns rows', () => {
    * audit team. Every stage test here used 'pending-close' (2, 20) or
    * 'unconfirmed' (9), which is why the suite was green.
    */
-  for (const [stages, expected] of [[['audit-complete'], [3, 5]], [['cancelled'], [6]]]) {
+  /*
+   * DERIVED from lib/job-stages.js, not hardcoded (2026-09-10). This used to
+   * read [['audit-complete'], [3, 5]] and went stale when the stage map was
+   * realigned: 'audit-complete' became [10] (Under Audit) while 3 and 5 moved
+   * to NEW stages 'pending-feedback' and 'completed'. Adding 10 to the old
+   * literal would have produced a test that passed and asserted the wrong set.
+   *
+   * The claim here was never "the set is [3, 5]". It is "a stage grant pins
+   * exactly that stage's visible set, and the terminal floor is NOT ANDed onto
+   * it" — the invariant that stops the audit team's export being permanently,
+   * silently empty. Deriving both the terminal set and the stages under test
+   * from the source of truth means the next realignment updates this test
+   * instead of breaking it.
+   */
+  const TERMINAL = DEFAULT_STATUS_FLOOR.match(/\d+/g).map(Number);
+  const terminalOnlyStages = STAGE_KEYS.filter((k) => {
+    const v = STAGES[k].visible || [];
+    return v.length > 0 && v.every((st) => TERMINAL.includes(st));
+  });
+  assert.ok(
+    terminalOnlyStages.length > 0,
+    'positive control: if NO stage sits entirely inside the terminal set, this test proves nothing — '
+    + 'the realignment moved something and the premise needs revisiting, not the assertions',
+  );
+  for (const stages of terminalOnlyStages.map((k) => [k])) {
+    const expected = STAGES[stages[0]].visible;
     const r = whereAndParams({ allowedStages: { mode: 'list', stages } });
     assert.ok(r.where.includes('J.job_status IN'), `${stages} must pin the status set`);
     assert.equal(
@@ -357,8 +385,25 @@ test('a stage grant INSIDE the terminal set still returns rows', () => {
 test('a MIXED stage grant keeps every status the operator can see on screen', () => {
   // The plausible-looking failure: the sheet renders, and silently omits the
   // Audit & Complete rows while keeping the Unconfirmed ones.
-  const r = whereAndParams({ allowedStages: { mode: 'list', stages: ['unconfirmed', 'audit-complete'] } });
-  for (const st of [9, 3, 5]) {
+  /*
+   * Stages derived, for the same reason as above: this named 'audit-complete'
+   * for its terminal half and expected [9, 3, 5]. After the realignment that
+   * grant yields [9, 10], and 3/5 live in stages this test never mentioned.
+   *
+   * What matters is the SHAPE — one non-terminal stage plus one that sits
+   * wholly inside the terminal floor — so pick them by that property.
+   */
+  const TERMINAL = DEFAULT_STATUS_FLOOR.match(/\d+/g).map(Number);
+  const isTerminalOnly = (k) => (STAGES[k].visible || []).length > 0
+    && STAGES[k].visible.every((st) => TERMINAL.includes(st));
+  const terminalStage = STAGE_KEYS.find(isTerminalOnly);
+  const openStage = STAGE_KEYS.find((k) => !isTerminalOnly(k) && (STAGES[k].visible || []).length > 0);
+  assert.ok(terminalStage && openStage, 'need one terminal-only and one open stage for a MIXED grant');
+
+  const stages = [openStage, terminalStage];
+  const expected = [...STAGES[openStage].visible, ...STAGES[terminalStage].visible];
+  const r = whereAndParams({ allowedStages: { mode: 'list', stages } });
+  for (const st of expected) {
     assert.ok(r.params.includes(st), `status ${st} is visible on screen and must be in the sheet`);
   }
   assert.equal(r.where.includes(DEFAULT_STATUS_FLOOR), false);
