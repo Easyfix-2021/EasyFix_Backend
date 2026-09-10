@@ -35,9 +35,9 @@
 -- rows updated, no error, nobody finds out until someone looks at the sidebar).
 -- Each of these urls was verified unique in the schema.
 --
--- Run once. There is no NOT EXISTS guard on the INSERT — running the file twice
--- would create a duplicate "Completed" row. Step 0 shows you the current state
--- so you can see whether it has already been applied.
+-- Re-runnable. The INSERT carries a NOT EXISTS guard and the grant is skipped
+-- for roles that already hold the id, so a second run is a no-op rather than a
+-- duplicate row or a doubled CSV entry. Step 0 still prints current state.
 
 -- ─── 0. Before ───────────────────────────────────────────────────────
 SELECT m.menu_id, m.menu_name, m.url, m.sequence FROM tbl_menu m WHERE m.parent_menu = (SELECT s.parent_menu FROM (SELECT parent_menu FROM tbl_menu WHERE url = 'dashboardChecking?enumDesc=PendingFeedback') s) ORDER BY m.sequence;
@@ -57,13 +57,31 @@ UPDATE tbl_menu SET sequence = 3.0009 WHERE url = 'dashboardChecking?enumDesc=Pe
 -- parent_menu / menu_depth / icons / action_name are copied from the Pending
 -- for Feedback row rather than written as literals, so this cannot drift from
 -- its siblings or depend on a hardcoded parent id.
-INSERT INTO tbl_menu (menu_name, parent_menu, menu_depth, has_child, url, menu_status, sequence, icons, action_name) SELECT 'Completed', s.parent_menu, s.menu_depth, 0, 'dashboardChecking?enumDesc=Completed', 1, 3.0008, s.icons, s.action_name FROM tbl_menu s WHERE s.url = 'dashboardChecking?enumDesc=PendingFeedback' LIMIT 1;
+INSERT INTO tbl_menu (menu_name, parent_menu, menu_depth, has_child, url, menu_status, sequence, icons, action_name) SELECT 'Completed', s.parent_menu, s.menu_depth, 0, 'dashboardChecking?enumDesc=Completed', 1, 3.0008, s.icons, s.action_name FROM (SELECT parent_menu, menu_depth, icons, action_name FROM tbl_menu WHERE url = 'dashboardChecking?enumDesc=PendingFeedback' LIMIT 1) s WHERE NOT EXISTS (SELECT 1 FROM (SELECT url FROM tbl_menu) g WHERE g.url = 'dashboardChecking?enumDesc=Completed');
+
+-- ─── 3b. GRANT it — a menu row nobody can see is not a menu ──────────
+-- ⚠ THE STEP THIS FILE ORIGINALLY MISSED, and it cost three rounds of manual
+-- SQL. Inserting into tbl_menu creates the row; VISIBILITY comes from
+-- tbl_role.menu_ids, a CSV of menu ids per role. Without this the row exists,
+-- step 4 below reports success, and not one user sees the menu.
+--
+-- The role set is DERIVED, not hardcoded: every role that can already see
+-- Pending for Feedback gets Completed too, because they are the same audience.
+-- The second FIND_IN_SET makes it idempotent — a role that already has the id
+-- is skipped, so re-running cannot produce "12,34,34".
+-- REPLACE(...,' ','') because these CSVs contain stray spaces; TRIM(TRAILING
+-- ',') because some rows end with one and CONCAT would give ",,".
+UPDATE tbl_role r SET r.menu_ids = CONCAT(TRIM(TRAILING ',' FROM REPLACE(r.menu_ids,' ','')), ',', (SELECT menu_id FROM tbl_menu WHERE url='dashboardChecking?enumDesc=Completed' LIMIT 1)) WHERE FIND_IN_SET((SELECT menu_id FROM tbl_menu WHERE url='dashboardChecking?enumDesc=PendingFeedback' LIMIT 1), REPLACE(r.menu_ids,' ','')) > 0 AND FIND_IN_SET((SELECT menu_id FROM tbl_menu WHERE url='dashboardChecking?enumDesc=Completed' LIMIT 1), REPLACE(r.menu_ids,' ','')) = 0;
 
 -- ─── 4. After — expect Under Audit / Pending for Feedback / Completed ─
 SELECT m.menu_id, m.menu_name, m.url, m.sequence, m.menu_status FROM tbl_menu m WHERE m.url IN ('dashboardChecking?enumDesc=PendingForCheckout', 'dashboardChecking?enumDesc=PendingFeedback', 'dashboardChecking?enumDesc=Completed', 'dashboardChecking?enumDesc=PendingForApproval') ORDER BY m.sequence;
 
--- ─── 5. Guard: exactly one Completed row ─────────────────────────────
-SELECT 'Completed rows (expect 1)' AS check_name, COUNT(*) AS n FROM tbl_menu WHERE url = 'dashboardChecking?enumDesc=Completed';
+-- ─── 5. Guards — the row AND the grant ───────────────────────────────
+-- Checking only the row is what made the first version of this file report
+-- success while the menu stayed invisible. Both numbers must be non-zero.
+SELECT 'Completed rows (expect exactly 1)' AS check_name, COUNT(*) AS n FROM tbl_menu WHERE url = 'dashboardChecking?enumDesc=Completed';
+SELECT 'roles granted Completed (expect = roles granted Pending for Feedback)' AS check_name, COUNT(*) AS n FROM tbl_role r WHERE FIND_IN_SET((SELECT menu_id FROM tbl_menu WHERE url='dashboardChecking?enumDesc=Completed' LIMIT 1), REPLACE(r.menu_ids,' ','')) > 0;
+SELECT 'roles granted Pending for Feedback (the benchmark)' AS check_name, COUNT(*) AS n FROM tbl_role r WHERE FIND_IN_SET((SELECT menu_id FROM tbl_menu WHERE url='dashboardChecking?enumDesc=PendingFeedback' LIMIT 1), REPLACE(r.menu_ids,' ','')) > 0;
 
 -- AFTER RUNNING: the menu list is cached in the session at login in the legacy
 -- CRM, and fetched per-session in the new CRM. Users already signed in keep the
