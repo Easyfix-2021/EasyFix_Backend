@@ -1402,6 +1402,31 @@ router.get('/profile/personal', async (req, res, next) => {
 // tbl_easyfixer.user_id (the role-19 ghost user — the bridge populated at
 // creation). Emergency contact lives on tbl_easyfixer.efr_alt_no (written by
 // personal-details), NOT here. Column-probed (tbl_address is shared/polymorphic).
+
+/*
+ * …except "one row" is what the MODEL says, not what the data holds.
+ *
+ * 6,787 of 6,788 technicians carry exactly THREE tbl_address rows, every one of
+ * them address_type NULL, and the newest is usually the empty one: 2,508 have a
+ * blank newest row while an older row holds a real address (measured on QA,
+ * 10.30.2.30/easyfix — the shape is legacy, so production is likely similar,
+ * but that number is a QA number). `ORDER BY address_id DESC LIMIT 1` therefore
+ * showed a blank Edit Profile to roughly a third of the technicians who HAVE an
+ * address stored, and offered them an empty form to re-enter it into.
+ *
+ * Prefer the newest row that actually carries a pin code; fall back to the
+ * newest row when none does, so a technician with no address at all behaves
+ * exactly as before and one with an address anywhere now sees it.
+ *
+ * ONE FRAGMENT, USED BY BOTH THE READ AND THE WRITE. They already agreed — by
+ * both spelling the same string — and that is the property that matters here,
+ * not the ordering itself: if the write landed on a row the read ignores, every
+ * address edit would look like it silently reverted, which is the exact failure
+ * this endpoint exists to prevent. Two matching strings are an agreement nobody
+ * is enforcing; a shared constant is one that cannot drift.
+ */
+const ADDRESS_ROW_PICK =
+  "ORDER BY (TRIM(COALESCE(pin_code, '')) <> '') DESC, address_id DESC LIMIT 1";
 router.get('/profile/contact-info', async (req, res, next) => {
   try {
     logger.info('Load contact-info address');
@@ -1409,7 +1434,7 @@ router.get('/profile/contact-info', async (req, res, next) => {
     if (!ef || !ef.user_id) return modernOk(res, null);
     // SELECT * so a drifted/absent column never errors the read.
     const [[row]] = await pool.query(
-      'SELECT * FROM tbl_address WHERE user_id = ? ORDER BY address_id DESC LIMIT 1', [ef.user_id]);
+      `SELECT * FROM tbl_address WHERE user_id = ? ${ADDRESS_ROW_PICK}`, [ef.user_id]);
     if (!row) return modernOk(res, null);
     modernOk(res, {
       houseNo:        row.house_no ?? null,
@@ -1495,7 +1520,7 @@ router.post('/profile/contact-info', validate(Joi.object({
     }
 
     const [[existing]] = await pool.query(
-      'SELECT address_id FROM tbl_address WHERE user_id = ? ORDER BY address_id DESC LIMIT 1', [userId]);
+      `SELECT address_id FROM tbl_address WHERE user_id = ? ${ADDRESS_ROW_PICK}`, [userId]);
     if (existing) {
       const sets = present.map(([c]) => `${c} = ?`).join(', ');
       await pool.query(`UPDATE tbl_address SET ${sets} WHERE address_id = ?`,
