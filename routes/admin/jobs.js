@@ -2939,6 +2939,8 @@ router.post(
   }
 );
 
+const imageDelivery = require('../../services/job-image-delivery');
+
 router.get('/images/:imageId/file', async (req, res, next) => {
   try {
     const imageId = Number(req.params.imageId);
@@ -3027,165 +3029,93 @@ router.get('/images/:imageId/file', async (req, res, next) => {
      *   4. Else → 404 with a clear message instead of a redirect-to-
      *      nowhere that surfaces as a broken-image icon.
      */
-    const fs = require('fs');
-    const path = require('path');
-    const stored = String(row.image || '').trim();
-
-    // (1) S3 attempt — keep the existing presigned-URL behaviour.
-    if (s3Storage.isEnabled()) {
-      const candidates = [stored];
-      if (!stored.startsWith('Job_Images/') && !stored.startsWith('JobSupportings/')) {
-        candidates.push(`JobSupportings/${path.basename(stored)}`);
-        candidates.push(`Job_Images/${path.basename(stored)}`);
-      }
-      for (const key of candidates) {
-        try {
-          if (await s3Storage.exists(key)) {
-            const url = await s3Storage.getPresignedUrl(key);
-            return res.redirect(url);
-          }
-        } catch (e) {
-          uploadLogger.warn({ key, err: e?.message }, 's3 lookup failed during image redirect — falling through to local');
-          break;
-        }
-      }
-    }
-
-    // (2) Local-file streaming — covers writeBuffer-fallback uploads
-    // and pre-S3 legacy files. Try the configured job-files dir AND a
-    // few common siblings so older rows (some written to `general` /
-    // `easyfixer_documents`) still resolve.
-    const rootCandidates = [
-      process.env.UPLOAD_JOB_FILES,
-      process.env.UPLOAD_ROOT_PATH,
-      './uploads/upload_jobs',
-      './uploads',
-    ].filter(Boolean);
-    // If the stored value contains a slash it's already a sub-path
-    // (e.g. `upload_jobs/foo.jpg`); try it under each root verbatim
-    // before falling back to basename-only resolution.
-    const relForms = [stored, path.basename(stored)];
-    for (const root of rootCandidates) {
-      const absRoot = path.resolve(root);
-      for (const rel of relForms) {
-        const candidate = path.resolve(absRoot, rel.replace(/^\/+/, ''));
-        // Path-traversal guard: candidate MUST sit inside absRoot.
-        if (!candidate.startsWith(absRoot + path.sep) && candidate !== absRoot) continue;
-        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-          return res.sendFile(candidate);
-        }
-      }
-    }
-
     /*
-     * (2.5) The stored value is ITSELF an absolute URL on a host we own.
-     *
-     * Found 2026-09-09 from the Production log for job 538390: ten images and
-     * a feedback PDF, all uploaded that afternoon, all 404. Every row held
-     *   http://core.easyfix.in/easydoc/upload_jobs/538390_checkin_<stamp>.jpg
-     * — a full URL written by the legacy service, which this resolver had no
-     * branch for. S3 missed, local disk missed, and branch (3) below could
-     * never fire either: it PREPENDS FILE_BASE_URL to `stored`, so an already
-     * absolute value would have produced `https://base/http://core...`.
-     * Setting FILE_BASE_URL — the obvious ops fix — would not have worked.
-     *
-     * The file is there. Measured: GET https://core.easyfix.in/easydoc/... →
-     * 200, 66 kB, image/jpeg. Only the resolution was missing.
-     *
-     * HTTPS-UPGRADED. The rows store `http://`, the CRM is served over https,
-     * and a browser blocks an http image on an https page — the redirect would
-     * "work" and the image would still not appear. The host 301s http→https
-     * anyway, so upgrading costs nothing and removes a hop.
-     *
-     * HOST-ALLOWLISTED. This redirects the browser to a URL taken from a
-     * database column; without a check that is an open redirect. The column is
-     * written by our own services, but "trusted writer" is an assumption about
-     * today. LEGACY_FILE_HOSTS keeps it an assertion.
+     * Resolution moved to services/job-image-delivery.js on 2026-09-10 so the
+     * new /url route below resolves IDENTICALLY. Two copies of a four-branch
+     * fallback chain would have drifted the first time one was touched.
      */
-    const LEGACY_FILE_HOSTS = (process.env.LEGACY_FILE_HOSTS || 'core.easyfix.in')
-      .split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
-    if (/^https?:\/\//i.test(stored)) {
-      let parsed = null;
-      try { parsed = new URL(stored); } catch { parsed = null; }
-      if (parsed && LEGACY_FILE_HOSTS.includes(parsed.hostname.toLowerCase())) {
-        parsed.protocol = 'https:';
-
-        /*
-         * VERIFY THE TARGET BEFORE HANDING IT TO THE BROWSER.
-         *
-         * A redirect that cannot fail is not a resolution — the same defect as
-         * presigning an S3 key without checking the object exists (fixed on the
-         * selfie tile, 2026-09-09). This branch used to redirect on the strength
-         * of the stored string alone.
-         *
-         * When the file is NOT on the legacy host, that host answers with a
-         * 236-byte `text/html` error page (measured: 404 text/html for a missing
-         * name, 403 text/html for a directory). The browser is fetching this as
-         * an <img> no-cors subresource, so Chrome's Opaque Response Blocking
-         * refuses the HTML and reports `net::ERR_BLOCKED_BY_ORB` with no status
-         * and zero bytes — an opaque browser error where the operator should
-         * have seen our own "Image not found · Re-upload to restore" state.
-         *
-         * REFUSE ONLY ON POSITIVE EVIDENCE. A HEAD that errors, times out, or
-         * answers anything other than a definite non-image still redirects, so a
-         * transient network blip cannot hide a file that is really there. Only a
-         * clear "this is not an image" downgrades to the 404 path below.
-         */
-        let legacyVerdict = 'assumed-ok';
-        try {
-          const head = await fetch(parsed.toString(), {
-            method: 'HEAD',
-            redirect: 'follow',
-            signal: AbortSignal.timeout(Number(process.env.LEGACY_FILE_HEAD_TIMEOUT_MS || 2500)),
-          });
-          const ctype = String(head.headers.get('content-type') || '').toLowerCase();
-          if (!head.ok || (ctype && !ctype.startsWith('image/') && !ctype.startsWith('application/pdf'))) {
-            legacyVerdict = `not-an-image (status ${head.status}, content-type ${ctype || 'none'})`;
-          } else {
-            legacyVerdict = 'ok';
-          }
-        } catch (err) {
-          // Network/timeout — NOT evidence of absence. Fall through and redirect.
-          legacyVerdict = `unverified (${err && err.name ? err.name : 'error'})`;
-        }
-
-        if (legacyVerdict.startsWith('not-an-image')) {
-          uploadLogger.warn(
-            { imageId, jobId: row.job_id, host: parsed.hostname, stored, verdict: legacyVerdict },
-            'legacy file host has no image at this URL — 404ing instead of redirecting to an HTML error page',
-          );
-        } else {
-          uploadLogger.info(
-            { imageId, jobId: row.job_id, host: parsed.hostname, verdict: legacyVerdict },
-            'job image served from the legacy file host',
-          );
-          return res.redirect(parsed.toString());
-        }
-      }
-      uploadLogger.warn(
-        { imageId, jobId: row.job_id, stored, host: parsed && parsed.hostname },
-        'job image stores an absolute URL on a host that is NOT allowlisted — refusing to redirect',
-      );
+    const delivery = await imageDelivery.resolve(row.image, { logger: uploadLogger });
+    switch (delivery.kind) {
+      case 's3':
+      case 'base-url':
+        return res.redirect(delivery.url);
+      case 'legacy':
+        uploadLogger.info(
+          { imageId, jobId: row.job_id, verdict: delivery.verdict },
+          'job image served from the legacy file host',
+        );
+        return res.redirect(delivery.url);
+      case 'local':
+        return res.sendFile(delivery.path);
+      default:
+        uploadLogger.warn(
+          { imageId, jobId: row.job_id, stored: String(row.image || ''), reason: delivery.reason },
+          'job image unresolvable',
+        );
+        return modernError(res, 404, 'image file not found in S3 or on local disk');
     }
+  } catch (e) { next(e); }
+});
 
-    // (3) Absolute FILE_BASE_URL (prod Nginx) — only redirect when the
-    // base is absolute, never to a relative `/easydoc` that bounces
-    // back to this BE.
-    const fileBase = process.env.FILE_BASE_URL || '';
-    if (/^https?:\/\//i.test(fileBase)) {
-      const url = stored.includes('/')
-        ? `${fileBase.replace(/\/+$/, '')}/${stored.replace(/^\/+/, '')}`
-        : `${fileBase.replace(/\/+$/, '')}/upload_jobs/${stored}`;
-      return res.redirect(url);
+/*
+ * GET /api/admin/jobs/images/:imageId/url
+ *
+ * The same resolution as /file, returned as JSON instead of a redirect, so the
+ * CRM can stop putting the session JWT in an image URL.
+ *
+ * An <img src> sends no Authorization header, so /file accepts `?token=<jwt>` —
+ * which writes a LIVE SESSION TOKEN into browser history, the Referer header,
+ * and every proxy and access log along the way. Calling this endpoint with the
+ * header (where it belongs) and rendering <img src={url}> removes that.
+ *
+ * Why not fetch() the bytes and use a Blob instead: /file redirects to S3, and
+ * fetch() is a CORS request while <img> is not — a Blob approach would need a
+ * bucket CORS policy allowing the CRM origin, and would break every image if
+ * that policy is absent. Handing back a URL keeps <img>'s no-CORS behaviour.
+ *
+ * `url: null` means genuinely unresolvable, so the CRM renders its empty state
+ * from a JSON answer rather than from a failed image request — which is how
+ * ERR_BLOCKED_BY_ORB came to look like a mystery instead of a missing file.
+ *
+ * `local` is the one kind with no browser-reachable URL (the bytes only exist
+ * on this host), so it points back at /file. That path is the S3-write-failure
+ * fallback and is rare; it is the only case still carrying a token.
+ */
+router.get('/images/:imageId/url', async (req, res, next) => {
+  try {
+    const imageId = Number(req.params.imageId);
+    if (!Number.isInteger(imageId) || imageId <= 0) {
+      return modernError(res, 400, 'invalid imageId');
     }
-
-    // (4) Genuinely unresolvable. 404 instead of a redirect-to-nowhere
-    // so the FE renders the empty state instead of a broken-image icon.
-    uploadLogger.warn(
-      { imageId, jobId: row.job_id, stored, s3Enabled: s3Storage.isEnabled(), fileBase },
-      'job image unresolvable — not in S3, no local file, no absolute FILE_BASE_URL',
+    const [[row]] = await imagePool.query(
+      'SELECT image_id, job_id, image FROM tbl_job_image WHERE image_id = ? LIMIT 1',
+      [imageId]
     );
-    return modernError(res, 404, 'image file not found in S3 or on local disk');
+    if (!row || !row.image) return modernOk(res, { imageId, url: null, mode: 'missing' });
+
+    // Same scope assertion as /file — an out-of-scope id must look identical
+    // to an unknown one, or this endpoint becomes a job-existence oracle.
+    const j = await job.getById(row.job_id);
+    if (!j) return modernOk(res, { imageId, url: null, mode: 'missing' });
+    const guard = assertEntityInScope(req, {
+      client_id:   j.fk_client_id,
+      city_id:     j.city_id,
+      vertical_id: j.vertical_id,
+    });
+    if (!guard.ok) return modernOk(res, { imageId, url: null, mode: 'missing' });
+
+    const delivery = await imageDelivery.resolve(row.image, { logger: uploadLogger });
+    if (delivery.kind === 'local') {
+      return modernOk(res, { imageId, url: null, mode: 'stream' });
+    }
+    if (delivery.kind === 'none') {
+      uploadLogger.warn(
+        { imageId, jobId: row.job_id, stored: String(row.image || ''), reason: delivery.reason },
+        'job image unresolvable (url endpoint)',
+      );
+      return modernOk(res, { imageId, url: null, mode: 'missing' });
+    }
+    return modernOk(res, { imageId, url: delivery.url, mode: delivery.kind });
   } catch (e) { next(e); }
 });
 
