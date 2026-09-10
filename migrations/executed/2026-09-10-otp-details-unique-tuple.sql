@@ -45,7 +45,21 @@
 --   announcing. Section 4 is read-only.
 --
 -- APPLIED
---   QA: pending. Production: pending.
+--   Executed 2026-09-10 by Harshit; this file then moved to
+--   migrations/executed/ and is FROZEN.
+--
+--   ⚠ WHAT IS AND IS NOT NOW ENFORCED. The unique index is in place, so a
+--   duplicate (email, mobile, otp_type) with NO NULLs is rejected 1062. Rows
+--   where ANY of the three is NULL are STILL duplicable — InnoDB treats NULLs
+--   in a unique index as distinct, proven on a temp table before this shipped.
+--   The user who reported the outage (email set, mobile NULL) is in that
+--   uncovered set, so his protection is entirely the <=> lookup in
+--   services/auth.service.js — not this index. Do not read "unique index
+--   exists" as "duplicates are impossible".
+--
+--   To change that, the columns would need NOT NULL DEFAULT '' on a table five
+--   legacy services share. Still an open decision; it belongs in a NEW dated
+--   migration, never here.
 -- ─────────────────────────────────────────────────────────────────────
 
 
