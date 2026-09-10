@@ -6,7 +6,7 @@ const registrationProfile = require('./technician-registration-profile.service')
 const profileCompletion = require('./profile-completion.service');
 // One definition of "mandatory", shared with the mobile training list — two
 // copies of this SQL would drift the first time either was touched.
-const { mandatoryVideoIdsSql } = require('./lms.service');
+const { mandatoryVideoIdsSql, mandatoryNonVideoProgress } = require('./lms.service');
 
 /*
  * Mobile Registration gate machine — collapses three legacy polls
@@ -160,8 +160,25 @@ async function fetchTrainingCompletedTime(efrId) {
       // Three binds: the total subquery, the watcher filter, then the IN subquery.
       [efrId, efrId, efrId],
     );
-    const total = Number(row?.total || 0);
-    const done = Number(row?.done || 0);
+    /*
+     * THE OTHER HALF OF "MANDATORY": content that is not a video.
+     *
+     * A mandatory course holds lms_content of kind video, document or
+     * assessment, and the set above selects `lc.kind = 'video'`. A course whose
+     * only item is an assessment therefore contributed NOTHING here — the
+     * technician passed the gate without passing the assessment, while
+     * isTrainingComplete (the lifecycle predicate, which judges all three
+     * kinds) said the opposite about the same person. Two predicates, one
+     * question, different answers.
+     *
+     * Counted the same way as the video half and added to the SAME totals, so
+     * the rule the comment above states — both halves must use the same set —
+     * still holds with the set widened rather than replaced.
+     */
+    const other = await mandatoryNonVideoProgress(efrId);
+
+    const total = Number(row?.total || 0) + other.total;
+    const done = Number(row?.done || 0) + other.done;
     if (total === 0) {
       /*
        * Nothing is mandatory. Report NOT complete and say so loudly rather
@@ -172,7 +189,17 @@ async function fetchTrainingCompletedTime(efrId) {
       logger.warn({ efrId }, 'registration: mandatory training set is EMPTY — check training_videos.is_global');
       return null;
     }
-    return done >= total ? (row?.last_done || null) : null;
+    if (done < total) return null;
+
+    /*
+     * The LATEST of the two halves — training is finished when the last item
+     * is. The video value is returned VERBATIM when there is no non-video half,
+     * so the overwhelmingly common case keeps the exact value (and type) it
+     * always had rather than one round-tripped through a Date.
+     */
+    if (!other.lastDone) return row?.last_done || null;
+    if (!row?.last_done) return other.lastDone;
+    return new Date(row.last_done) >= new Date(other.lastDone) ? row.last_done : other.lastDone;
   } catch (e) {
     logger.info(
       { err: e.message, efrId },
@@ -853,6 +880,13 @@ module.exports = {
   finalizeGate1IfReady,
   finalizeGate1AfterSave,
   setLanguage,
+  /*
+   * Exposed for tests only. The onboarding gate now counts non-video mandatory
+   * content as well as videos, and the case worth pinning — a mandatory course
+   * whose only item is an assessment — cannot be reached through getStatus
+   * without standing up the whole registration payload.
+   */
+  fetchTrainingCompletedTime,
   // Exposed for tests only: deriveStatus decides which route group the app
   // mounts, so its precedence deserves direct assertions rather than being
   // reachable only through a full getStatus fake-pool fixture.

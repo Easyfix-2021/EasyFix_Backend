@@ -108,9 +108,33 @@ test('status overlays the request lifecycle and locks jobs without another overd
     trainingComplete: true,
   }, 'PAN remains visible as payout readiness without affecting the lifecycle lock');
 
-  assert.equal(fake.calls.length, 3, 'status keeps its existing bounded three-query budget');
-  assert.ok(!fake.calls.some(({ sql }) => /FROM easyfixer_courses/i.test(sql)),
-    'registration status must not perform a second overdue-training query');
+  /*
+   * FOUR since 2026-09-10, not three. The onboarding gate gained its second
+   * half: a mandatory course can hold a document or an assessment, which
+   * `mandatoryVideoIdsSql` (kind = 'video') cannot see, so a technician was
+   * reported training-complete without passing a mandatory assessment.
+   *
+   * The original assertion below forbade ANY easyfixer_courses read from this
+   * path. Its stated intent — the test's own name — is narrower: no second
+   * OVERDUE query, because overdue arrives on the authenticated lifecycle
+   * snapshot and re-deriving it here would be both slower and able to
+   * disagree with the value the caller was handed. That intent is preserved
+   * and made explicit, rather than the budget being quietly raised: exactly
+   * one courses read is allowed, it must be the completion half, and it must
+   * not touch the columns overdue is computed from.
+   */
+  assert.equal(fake.calls.length, 4,
+    'status keeps a bounded budget: three, plus the mandatory-content half of the gate');
+
+  const courseReads = fake.calls.filter(({ sql }) => /FROM easyfixer_courses/i.test(sql));
+  assert.equal(courseReads.length, 1,
+    'exactly one — a second would mean overdue is being re-derived here');
+  assert.match(courseReads[0].sql, /lc\.kind <> 'video'/,
+    'the one permitted courses read is the non-video half of the training gate');
+  assert.ok(!/due_date|completion_date/i.test(courseReads[0].sql),
+    'registration status must not perform a second overdue-training query — overdue\n'
+    + '  comes from the authenticated lifecycle snapshot, and a local re-derivation\n'
+    + '  can disagree with the value the caller was given');
 });
 
 test('verified technician with skills and training unlocks jobs without PAN', async () => {
@@ -137,6 +161,8 @@ test('verified technician with skills and training unlocks jobs without PAN', as
     hasSkills: true,
     trainingComplete: true,
   });
-  assert.equal(fake.calls.length - callsBefore, 3,
-    'removing the PAN job gate must not add status queries');
+  assert.equal(fake.calls.length - callsBefore, 4,
+    'removing the PAN job gate must not add status queries. The fourth is the\n'
+    + '  mandatory-content half of the training gate, added deliberately in\n'
+    + '  2026-09-10 — see the budget note above.');
 });

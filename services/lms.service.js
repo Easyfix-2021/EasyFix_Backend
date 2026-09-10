@@ -1967,6 +1967,66 @@ async function mandatoryVideoIdsSql() {
 }
 
 /*
+ * The mandatory items that are NOT videos, and how many of them are finished.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM mandatoryVideoIdsSql. The onboarding gate has
+ * always asked "has he watched every mandatory VIDEO", because when it was
+ * written mandatory content was videos. It is not any more: a mandatory course
+ * holds lms_content of kind video, document OR assessment, and
+ * mandatoryVideoIdsSql selects `lc.kind = 'video'`. So a course whose only item
+ * is an assessment contributed NOTHING to the gate — the technician was marked
+ * training-complete without passing it, while isTrainingComplete (the lifecycle
+ * predicate, which judges all three kinds) said the opposite about the same
+ * person. Production carries exactly that shape today: one mandatory course,
+ * one item, an assessment.
+ *
+ * Scoped to MANDATORY courses on purpose. isTrainingComplete covers every
+ * ASSIGNED course, which is the right question for the lifecycle and the wrong
+ * one for onboarding — reusing it here would make every optional course block
+ * job access.
+ *
+ * Returns counts rather than SQL because, unlike the video half, this arm binds
+ * its own parameter once and is never spliced into a caller's statement. The
+ * arity rule above therefore does not apply to it.
+ *
+ * entitlement-guard: job gating, not an entitlement read. Same reasoning as
+ * mandatoryVideoIdsSql above — retiring a course or an item must actually stop
+ * it blocking work, and no badge or certificate is served from here, so these
+ * status filters have nothing to revoke.
+ */
+async function mandatoryNonVideoProgress(efrId) {
+  const { courseMandatory } = await lmsFlagColumns();
+
+  const [[row]] = await pool.query(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(${itemCompleteSql('ec.easyfixer_id')}), 0) AS done,
+            MAX(CASE lc.kind
+                  WHEN 'assessment' THEN (SELECT MAX(aa.created_at)
+                                            FROM lms_assessment_attempt aa
+                                           WHERE aa.assessment_id = lc.ref_id
+                                             AND aa.easyfixer_id = ec.easyfixer_id
+                                             AND aa.passed = 1)
+                  WHEN 'document' THEN (SELECT MAX(da.acknowledged_at)
+                                          FROM lms_document_ack da
+                                         WHERE da.content_id = lc.id
+                                           AND da.easyfixer_id = ec.easyfixer_id)
+                  ELSE NULL
+                END) AS last_done
+       FROM easyfixer_courses ec
+       JOIN courses c ON c.id = ec.course_id AND c.status = 1
+                     AND ${courseMandatory ? 'c.is_mandatory = 1' : '1=0'}
+       JOIN lms_content lc ON lc.course_id = c.id AND lc.status = 1
+      WHERE ec.easyfixer_id = ? AND lc.kind <> 'video'`,
+    [Number(efrId)],
+  );
+  return {
+    total: Number(row?.total || 0),
+    done: Number(row?.done || 0),
+    lastDone: row?.last_done || null,
+  };
+}
+
+/*
  * What the technician may SEE: everything they must complete, plus the videos
  * of any course assigned to them (mandatory or not). Takes two `?` — the same
  * efr_id twice.
@@ -3058,6 +3118,7 @@ module.exports = {
   certificatePayload,
   certificateNumber,
   mandatoryVideoIdsSql,
+  mandatoryNonVideoProgress,
   visibleVideoIdsSql,
   lmsFlagColumns,
   invalidateLmsSchemaCache,
